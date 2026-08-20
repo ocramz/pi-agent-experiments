@@ -4,6 +4,7 @@ import type {
 	ExtensionContext,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
@@ -647,8 +648,6 @@ export default function (pi: ExtensionAPI) {
 			// First pass: ask for clarifications or a story breakdown
 			const systemPrompt = `You are a requirements assistant. The user wants to break down a high-level goal into user stories.\n\nFirst, determine if the goal is ambiguous or needs clarification. If so, respond with a short list of 1-3 clarifying questions, prefixed by ">>> CLARIFY:".\n\nIf the goal is clear enough, respond ONLY with a JSON array of user stories. Each story must have:\n- title (string)\n- sub_goal (string, 1-2 sentences)\n- proposed_changes (string, bullet or numbered list of concrete code/file changes)\n- depends_on (array of 0-based indices referencing earlier array items; optional)\n\nDo NOT include markdown code fences around the JSON. Keep it compact and valid JSON. If dependencies exist, ensure they reference earlier indices only.`;
 
-			ctx.ui.notify("Planning stories…", "info");
-
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			let storiesJson: Array<{ title: string; sub_goal: string; proposed_changes: string; depends_on?: number[] }> | null = null;
 			let clarifications: string[] | null = null;
@@ -656,33 +655,54 @@ export default function (pi: ExtensionAPI) {
 			const maxTurns = 3;
 
 			while (turn < maxTurns && !storiesJson) {
-				const contentText = storiesJson === null && clarifications === null
+				const contentText = turn === 0 && !clarifications
 					? goal
-					: (clarifications ? `Here are the clarifications:\n${clarifications.join("\n")}` : goal);
+					: `Goal: ${goal}\n\n${clarifications ? `Clarifications:\n${clarifications.join("\n")}` : ""}`;
 
-				const response = await ctx.modelRegistry.complete(
-					ctx.model,
-					{
-						systemPrompt,
-						messages: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: contentText }], timestamp: Date.now() },
-						],
-					},
-					{ cacheRetention: "none", sessionId: randomUUID() },
-				);
+				// Run model call with persistent loader so the user sees activity and can abort
+				const responseText = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+					const loader = new BorderedLoader(tui, theme, `Planning stories (turn ${turn + 1}/${maxTurns}) using ${ctx.model!.id}…`);
+					loader.onAbort = () => done(null);
 
-				const text = response.content
-					.filter((c): c is { type: "text"; text: string } => c.type === "text")
-					.map((c) => c.text)
-					.join("\n")
-					.trim();
+					const doPlan = async () => {
+						try {
+							const response = await ctx.modelRegistry.complete(
+								ctx.model!,
+								{
+									systemPrompt,
+									messages: [
+										{ role: "user" as const, content: [{ type: "text" as const, text: contentText }], timestamp: Date.now() },
+									],
+								},
+								{ cacheRetention: "none", sessionId: randomUUID(), signal: loader.signal },
+							);
+							if (response.stopReason === "aborted") return null;
+							return response.content
+								.filter((c): c is { type: "text"; text: string } => c.type === "text")
+								.map((c) => c.text)
+								.join("\n")
+								.trim();
+						} catch (err) {
+							console.error("plan-stories model call failed:", err);
+							return null;
+						}
+					};
 
-				if (text.includes(">>> CLARIFY")) {
-					const qs = text.split(">>> CLARIFY")[1]?.split("\n").filter((l) => l.trim().startsWith("-") || l.trim().match(/^\d+\./)) ?? [];
+					doPlan().then(done).catch(() => done(null));
+					return loader;
+				});
+
+				if (responseText === null) {
+					ctx.ui.notify("Planning cancelled or failed. Check logs for details.", "info");
+					return;
+				}
+
+				if (responseText.includes(">>> CLARIFY")) {
+					const qs = responseText.split(">>> CLARIFY")[1]?.split("\n").filter((l) => l.trim().startsWith("-") || l.trim().match(/^\d+\./)) ?? [];
 					if (qs.length === 0) {
 						// Unexpected format, treat as JSON attempt
 						try {
-							storiesJson = JSON.parse(text);
+							storiesJson = JSON.parse(responseText);
 						} catch {
 							ctx.ui.notify("Could not parse plan response. Aborting.", "error");
 							return;
@@ -703,7 +723,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				} else {
 					try {
-						storiesJson = JSON.parse(text);
+						storiesJson = JSON.parse(responseText);
 					} catch {
 						ctx.ui.notify("Could not parse JSON plan. Aborting.", "error");
 						return;
