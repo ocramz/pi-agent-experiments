@@ -1,33 +1,36 @@
-# Pi Issue Tracker Extension
+# Pi Issue Tracker
 
 An extension for **pi** that turns a high-level goal into a linked, tracked set of user stories stored in a project-local SQLite database.
 
 ## Features
 
-- **Plan from a goal** — `/plan <goal>` breaks down work into user stories using the active model.
+- **Plan from a goal** — `/plan-stories <goal>` breaks down work into user stories using the active model.
 - **Story tool** — The agent can create, update, delete, list, search, simplify, reorder, and mark stories done.
-- **Context injection** — Before every turn, the extension injects an auto-updated story board into the conversation so the agent always knows what’s open, in-progress, and next.
+- **Context injection** — Before every turn, the extension injects a focused story context into the conversation showing: (1) the next ready story to work on, (2) the top-level big-picture story, (3) the story just completed in the previous turn, and (4) other in-progress stories. This makes it always clear what the agent should be doing and why.
 - **Linked continuation** — When a story is marked done, the next linked story is automatically promoted to `ready` and highlighted for the agent.
 - **Dependency gating** — A story can’t be started or marked done if its dependencies aren’t finished.
 - **TUI board** — `/stories` opens an interactive kanban-like list. Navigate with `↑↓`, press `R` ready, `S` start, `D` done, `X` cancel.
 - **Export** — `/export-stories [path]` dumps all stories to human-readable Markdown (`stories.md` by default).
 
-## Files
+## Install
 
+```bash
+pi install npm:pi-issue-tracker
 ```
-.pi/extensions/issue-tracker/
-  index.ts      → Extension factory (tools, commands, lifecycle, context)
-  database.ts   → SQLite schema and CRUD helpers
-  types.ts      → Shared TypeScript interfaces
-  README.md     → This file
+
+Or via git:
+
+```bash
+pi install git:github.com/<user>/pi-issue-tracker@v1.0.0
 ```
 
 ## Commands
 
 | Command | Description |
 |--------|-------------|
-| `/plan <goal>` | Use the LLM to break down a goal into user stories. Automatically resolves `depends_on` and `next_id` chains. |
+| `/plan-stories <goal>` | Use the LLM to break down a goal into user stories. Automatically resolves `depends_on` and `next_id` chains. |
 | `/stories` | Open an interactive story board in the TUI (headless mode prints a plain list). |
+| `/top-story <id>` | Set the top-level story that provides big-picture context on every turn. |
 | `/export-stories [path]` | Write `stories.md` or the given path. |
 
 ## Story Tool Actions (agent-usable)
@@ -40,5 +43,6 @@ An extension for **pi** that turns a high-level goal into a linked, tracked set 
 - `mark_in_progress` — Move to `in_progress` (blocked by unmet dependencies).
 - `mark_done` — Close a story and auto-promote `next_id` to `ready`.
 - `get_next` — Return the top `ready` story with no unmet dependencies.
+- `set_top_level` — Designate a story as the big-picture context.
 - `reorder` — Rewrite priorities and `next_id` chain for a given ID order.
 - `simplify` — Merge multiple stories into a single one and archive the sources.

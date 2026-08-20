@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS stories (
 CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(status);
 CREATE INDEX IF NOT EXISTS idx_stories_priority ON stories(priority);
 
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 CREATE TABLE IF NOT EXISTS story_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   story_id INTEGER NOT NULL,
@@ -173,4 +178,17 @@ export function getHistory(db: DatabaseSync, storyId: number): StoryHistoryEntry
 		new_value: (row.new_value as string | null) ?? null,
 		timestamp: row.timestamp as number,
 	}));
+}
+
+export function getAppState(db: DatabaseSync, key: string): string | null {
+	const stmt = db.prepare("SELECT value FROM app_state WHERE key = ?");
+	const row = stmt.get(key) as { value: string } | undefined;
+	return row?.value ?? null;
+}
+
+export function setAppState(db: DatabaseSync, key: string, value: string): void {
+	const stmt = db.prepare(
+		"INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+	);
+	stmt.run(key, value);
 }

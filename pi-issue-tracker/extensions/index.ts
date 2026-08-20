@@ -12,15 +12,17 @@ import {
 	createStory,
 	deleteStories,
 	getAllStories,
+	getAppState,
 	getDb,
 	getHistory,
 	getStoriesByStatus,
 	getStoryById,
 	logHistory,
 	searchStories,
+	setAppState,
 	updateStory,
-} from "./database.ts";
-import type { Story } from "./types.ts";
+} from "../src/database.ts";
+import type { Story } from "../src/types.ts";
 
 // ─── State ──────────────────────────────────────────────────────────
 let dbPath: string | null = null;
@@ -64,7 +66,7 @@ function isDbReady() {
 
 // ─── Schema ─────────────────────────────────────────────────────────
 const StoryParams = Type.Object({
-	action: StringEnum(["create", "update", "delete", "list", "mark_done", "mark_in_progress", "reorder", "simplify", "get_next", "search"] as const),
+	action: StringEnum(["create", "update", "delete", "list", "mark_done", "mark_in_progress", "reorder", "simplify", "get_next", "search", "set_top_level"] as const),
 
 	title: Type.Optional(Type.String({ description: "Title (for create / update / simplify)" })),
 	sub_goal: Type.Optional(Type.String({ description: "Sub-goal (for create / update)" })),
@@ -103,37 +105,81 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Context injection ─────────────────────────────────────────────
-	pi.on("before_agent_start", async (_event, ctx) => {
+	pi.on("before_agent_start", async (_event, _ctx) => {
 		if (!isDbReady()) return;
 		const db = ensureDb();
-		const stories = getAllStories(db).filter(
+
+		const allOpen = getAllStories(db).filter(
 			(s) => s.status !== "done" && s.status !== "cancelled" && s.status !== "archived",
 		);
 
-		const inProgress = stories.find((s) => s.status === "in_progress") ?? null;
-		const topReady = stories.find((s) => s.status === "ready" && (s.depends_on?.length === 0 || s.depends_on.every((dep) => getStoryById(db, dep)?.status === "done"))) ?? null;
+		// 1. Ready story to work on now (topological: all deps done, then by priority/id)
+		const readyStories = getStoriesByStatus(db, "ready");
+		const readyToWork = readyStories
+			.filter((s) => s.depends_on.every((depId) => getStoryById(db, depId)?.status === "done"))
+			.sort((a, b) => a.priority - b.priority || a.id - b.id)[0] ?? null;
 
-		if (stories.length === 0 && inProgress === null) return;
+		// 2. Top-level story (big picture)
+		const topLevelIdRaw = getAppState(db, "top_level_story_id");
+		const topLevelStory = topLevelIdRaw ? getStoryById(db, Number(topLevelIdRaw)) : null;
 
-		const lines: string[] = [">>> STORY BOARD"];
-		for (const s of stories.slice(0, 20)) {
-			lines.push(`  ${s.status === "in_progress" ? "▶" : s.status === "ready" ? "○" : "•"} #${s.id}: ${s.title}`);
+		// 3. Story just closed in previous turn
+		const lastClosedIdRaw = getAppState(db, "last_closed_story_id");
+		const justClosed = lastClosedIdRaw ? getStoryById(db, Number(lastClosedIdRaw)) : null;
+		if (lastClosedIdRaw) {
+			setAppState(db, "last_closed_story_id", "");
 		}
-		if (stories.length > 20) {
-			lines.push(`  ... ${stories.length - 20} more`);
-		}
-		if (inProgress) {
-			lines.push(`\n>>> IN PROGRESS: #${inProgress.id} — ${inProgress.title}`);
-			lines.push(`Sub-goal: ${inProgress.sub_goal}`);
-			lines.push(`Changes: ${inProgress.proposed_changes}`);
-			if (inProgress.next_id) {
-				const next = getStoryById(db, inProgress.next_id);
-				if (next && next.status !== "done" && next.status !== "cancelled") {
-					lines.push(`\n>>> NEXT UP: #${next.id} — ${next.title}`);
-				}
+
+		// 4. Other in-progress stories
+		const inProgressStories = getStoriesByStatus(db, "in_progress").sort(
+			(a, b) => a.priority - b.priority || a.id - b.id,
+		);
+		const primaryFocus = readyToWork ?? inProgressStories[0] ?? null;
+		const otherInProgress = inProgressStories.filter((s) => s.id !== primaryFocus?.id);
+
+		const hasAnythingToShow = primaryFocus || topLevelStory || justClosed || otherInProgress.length > 0 || allOpen.length > 0;
+		if (!hasAnythingToShow) return;
+
+		const lines: string[] = [">>> STORY CONTEXT"];
+
+		if (readyToWork) {
+			lines.push(`\n>>> NEXT UP — work on this now`);
+			lines.push(`#${readyToWork.id}: ${readyToWork.title}`);
+			lines.push(`Sub-goal: ${readyToWork.sub_goal}`);
+			lines.push(`Changes: ${readyToWork.proposed_changes}`);
+			if (readyToWork.depends_on.length) {
+				lines.push(`Dependencies met: ${readyToWork.depends_on.map((id) => `#${id}`).join(", ")}`);
 			}
-		} else if (topReady) {
-			lines.push(`\n>>> TOP READY: #${topReady.id} — ${topReady.title}`);
+		} else if (inProgressStories.length > 0) {
+			const p = inProgressStories[0];
+			lines.push(`\n>>> IN PROGRESS — continue working on this`);
+			lines.push(`#${p.id}: ${p.title}`);
+			lines.push(`Sub-goal: ${p.sub_goal}`);
+			lines.push(`Changes: ${p.proposed_changes}`);
+		} else {
+			lines.push(`\n>>> NO ACTIVE WORK — no ready or in-progress stories`);
+		}
+
+		if (topLevelStory) {
+			lines.push(`\n>>> BIG PICTURE`);
+			lines.push(`#${topLevelStory.id}: ${topLevelStory.title}`);
+			lines.push(`${topLevelStory.sub_goal}`);
+		}
+
+		if (justClosed) {
+			lines.push(`\n>>> JUST COMPLETED (previous turn)`);
+			lines.push(`#${justClosed.id}: ${justClosed.title}`);
+		}
+
+		if (otherInProgress.length > 0) {
+			lines.push(`\n>>> ALSO IN PROGRESS`);
+			const selection = otherInProgress.slice(0, 5);
+			for (const s of selection) {
+				lines.push(`  ▶ #${s.id}: ${s.title} — ${s.sub_goal.slice(0, 60)}${s.sub_goal.length > 60 ? "…" : ""}`);
+			}
+			if (otherInProgress.length > 5) {
+				lines.push(`  ... ${otherInProgress.length - 5} more`);
+			}
 		}
 
 		return {
@@ -150,7 +196,7 @@ export default function (pi: ExtensionAPI) {
 		name: "story",
 		label: "Story",
 		description:
-			"Issue tracker for self-contained work chunks (user stories). Actions: create (title, sub_goal, proposed_changes, status, next_story_id, depends_on), update (story_id + fields), delete (story_id), list (status_filter), search (query), mark_in_progress (story_id), mark_done (story_id), get_next (fetch top ready), reorder (ordered_ids), simplify (source_ids + merged_title).",
+			"Issue tracker for self-contained work chunks (user stories). Actions: create (title, sub_goal, proposed_changes, status, next_story_id, depends_on), update (story_id + fields), delete (story_id), list (status_filter), search (query), mark_in_progress (story_id), mark_done (story_id), get_next (fetch top ready), reorder (ordered_ids), simplify (source_ids + merged_title), set_top_level (story_id).",
 		parameters: StoryParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -296,6 +342,7 @@ export default function (pi: ExtensionAPI) {
 				if (!updated) {
 					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
 				}
+				setAppState(db, "last_closed_story_id", String(updated.id));
 
 				// Promote next if ready and dependencies met
 				let nextMsg = "";
@@ -331,6 +378,22 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Next story to work on:\n${storyToText(topReady, false)}` }],
 					details: { action, story: topReady },
+				};
+			}
+
+			// ── set_top_level ────────────────────────────────────
+			if (action === "set_top_level") {
+				if (!params.story_id) {
+					return { content: [{ type: "text", text: "Error: story_id required for set_top_level" }], details: { action, error: "missing story_id" } };
+				}
+				const story = getStoryById(db, params.story_id);
+				if (!story) {
+					return { content: [{ type: "text", text: `Story #${params.story_id} not found` }], details: { action, error: "not found" } };
+				}
+				setAppState(db, "top_level_story_id", String(story.id));
+				return {
+					content: [{ type: "text", text: `Top-level story set to #${story.id}: ${story.title}` }],
+					details: { action, story },
 				};
 			}
 
@@ -516,7 +579,7 @@ export default function (pi: ExtensionAPI) {
 					lines.push(theme.fg("accent", "─".repeat(Math.max(0, width))));
 
 					if (all.length === 0) {
-						lines.push(`  ${theme.fg("dim", "No stories yet. Use /plan <goal> to create some.")}`);
+						lines.push(`  ${theme.fg("dim", "No stories yet. Use /plan-stories <goal> to create some.")}`);
 					}
 
 					for (let i = 0; i < all.length; i++) {
@@ -559,11 +622,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// /stories plan <goal>
-	pi.registerCommand("plan", {
+	pi.registerCommand("plan-stories", {
 		description: "Break down a high-level goal into user stories",
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
-				ctx.ui.notify("/plan requires interactive mode", "error");
+				ctx.ui.notify("/plan-stories requires interactive mode", "error");
 				return;
 			}
 			if (!isDbReady()) {
@@ -573,7 +636,7 @@ export default function (pi: ExtensionAPI) {
 			const db = ensureDb();
 			const goal = args.trim();
 			if (!goal) {
-				ctx.ui.notify("Usage: /plan <high-level goal>", "error");
+				ctx.ui.notify("Usage: /plan-stories <high-level goal>", "error");
 				return;
 			}
 			if (!ctx.model) {
@@ -681,6 +744,30 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			ctx.ui.notify(`Created ${createdIds.length} stories. Use /stories to view.`, "info");
+		},
+	});
+
+	// /top-story <id>
+	pi.registerCommand("top-story", {
+		description: "Set the top-level story for big-picture context",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) {
+				ctx.ui.notify("Story DB not ready", "error");
+				return;
+			}
+			const db = ensureDb();
+			const id = Number(args.trim());
+			if (!id || Number.isNaN(id)) {
+				ctx.ui.notify("Usage: /top-story <story_id>", "error");
+				return;
+			}
+			const story = getStoryById(db, id);
+			if (!story) {
+				ctx.ui.notify(`Story #${id} not found`, "error");
+				return;
+			}
+			setAppState(db, "top_level_story_id", String(story.id));
+			ctx.ui.notify(`Top-level story set to #${story.id}: ${story.title}`, "info");
 		},
 	});
 
