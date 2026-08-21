@@ -1,46 +1,41 @@
-# Pi Issue Tracker Extension
+# Pi Issue Tracker — internals
 
-An extension for **pi** that turns a high-level goal into a linked, tracked set of user stories stored in a project-local SQLite database.
-
-## Features
-
-- **Plan from a goal** — `/plan-stories <goal>` breaks down work into user stories using the active model.
-- **Story tool** — The agent can create, update, delete, list, search, simplify, reorder, and mark stories done.
-- **Context injection** — Before every turn, the extension injects a focused story context into the conversation showing: (1) the next ready story to work on, (2) the top-level big-picture story, (3) the story just completed in the previous turn, and (4) other in-progress stories. This makes it always clear what the agent should be doing and why.
-- **Linked continuation** — When a story is marked done, the next linked story is automatically promoted to `ready` and highlighted for the agent.
-- **Dependency gating** — A story can’t be started or marked done if its dependencies aren’t finished.
-- **TUI board** — `/stories` opens an interactive kanban-like list. Navigate with `↑↓`, press `R` ready, `S` start, `D` done, `X` cancel.
-- **Export** — `/export-stories [path]` dumps all stories to human-readable Markdown (`stories.md` by default).
+Implementation notes for the extension. User-facing docs are in the [top-level README](../README.md).
 
 ## Files
 
 ```
-.pi/extensions/issue-tracker/
-  index.ts      → Extension factory (tools, commands, lifecycle, context)
-  database.ts   → SQLite schema and CRUD helpers
-  types.ts      → Shared TypeScript interfaces
-  README.md     → This file
+pi-issue-tracker/
+  extensions/index.ts  → Extension factory (tool, commands, lifecycle, context injection, TUI)
+  src/database.ts      → SQLite schema and CRUD helpers
+  src/related.ts       → Pluggable relevance strategy (related stories, learnings)
+  src/types.ts         → Shared TypeScript interfaces
+  src/README.md        → This file
 ```
 
-## Commands
+## Data model
 
-| Command | Description |
-|--------|-------------|
-| `/plan-stories <goal>` | Use the LLM to break down a goal into user stories. Automatically resolves `depends_on` and `next_id` chains. |
-| `/stories` | Open an interactive story board in the TUI (headless mode prints a plain list). |
-| `/top-story <id>` | Set the top-level story that provides big-picture context on every turn. |
-| `/export-stories [path]` | Write `stories.md` or the given path. |
+One table, `stories`, plus `app_state` (key/value) and `story_history` (append-only audit log).
 
-## Story Tool Actions (agent-usable)
+Structure is carried by three independent fields:
 
-- `create` — Add a new story with optional linking.
-- `update` — Edit fields by ID.
-- `delete` — Remove a story.
-- `list` — Filter by status or show all.
-- `search` — Find stories by title, sub-goal, or proposed changes.
-- `mark_in_progress` — Move to `in_progress` (blocked by unmet dependencies).
-- `mark_done` — Close a story and auto-promote `next_id` to `ready`.
-- `get_next` — Return the top `ready` story with no unmet dependencies.
-- `set_top_level` — Designate a story as the big-picture context.
-- `reorder` — Rewrite priorities and `next_id` chain for a given ID order.
-- `simplify` — Merge multiple stories into a single one and archive the sources.
+- `parent_id` — the tree. A story with children is an **epic**: excluded from `get_next` and from ready-selection, and closed automatically by `rollUpEpics` when its last child closes. `/plan-stories` materialises the goal itself as the root epic, which is what makes `parent_id` non-null in practice.
+- `depends_on` — a DAG, stored as a JSON array (so it is not queryable in SQL). Gates `mark_in_progress` and `mark_done`.
+- `next_id` — a linear suggestion chain. Closing a story promotes its `next_id` to `ready`.
+
+Outcome fields are set when a story closes: `resolution` (enum, validated in TypeBox rather than by a SQL `CHECK` so the vocabulary can still change), `resolution_note`, and `learnings`.
+
+## Things worth knowing
+
+- **No migrations.** `INIT_SQL` is all `CREATE TABLE IF NOT EXISTS`, so it is a no-op against an existing database. Adding a column means deleting `.pi/stories.db`. `PRAGMA user_version` is unused and sits at 0.
+- **No foreign keys.** Referential integrity is enforced in TypeScript: `wouldCreateCycle` on reparenting, child reparenting on delete, dependency repointing on `simplify`.
+- **`getDb` caches a module-level singleton** keyed on nothing — the first `dbPath` wins for the process, so a session switch to another project keeps the first database.
+- **`updateStory` builds its SET clause by interpolating object keys.** Safe today because every call site passes an object literal with `Story` keys, but it is a `${}` into SQL — do not spread untrusted tool params into it.
+- **`story_history` is write-only.** Every create/update/delete logs a row and `getHistory` can read them, but nothing surfaces it yet.
+- **Relevance is pluggable.** `RelatedStoriesStrategy` has two methods — `findRelated` (open stories) and `findLearnings` (closed stories carrying a learning). `keywordStrategy` scores word overlap plus structural boosts; swapping in embeddings means implementing the same interface.
+
+## Token accounting
+
+`/plan-stories` is a *command*, not a tool. pi's footer counter sums `sessionManager.getEntries()` over assistant messages, tool results carrying `usage`, and compaction entries — a command's `modelRegistry.complete()` call appends none of those, and `ExtensionCommandContext` offers no way to report usage. So planning totals its own `response.usage` and renders it via `ui.setStatus`, which lands on the footer's extension-status line.
+
+A live per-token counter is not reachable from an extension: `ModelRegistry` exposes only `complete()` (internally `stream(...).result()`, which discards the per-event `partial.usage`), and `BorderedLoader`'s label is fixed at construction. Both would need SDK changes.

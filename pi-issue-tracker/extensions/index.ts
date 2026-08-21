@@ -1,37 +1,52 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	ExtensionCommandContext,
-} from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import {
 	closeDb,
 	createStory,
 	deleteStories,
 	getAllStories,
 	getAppState,
+	getChildren,
 	getDb,
-	getHistory,
+	getMaxPriority,
 	getStoriesByStatus,
 	getStoryById,
-	logHistory,
+	hasChildren,
 	searchStories,
 	setAppState,
+	transaction,
 	updateStory,
+	wouldCreateCycle,
 } from "../src/database.ts";
 import type { Story } from "../src/types.ts";
+import { STORY_RESOLUTIONS } from "../src/types.ts";
+import type { RelatedStoriesStrategy } from "../src/related.ts";
+import { keywordStrategy } from "../src/related.ts";
 
 // ─── State ──────────────────────────────────────────────────────────
 let dbPath: string | null = null;
+let relatedStrategy: RelatedStoriesStrategy = keywordStrategy;
 
 // ─── Helpers ────────────────────────────────────────────────────────
 function ensureDb() {
 	if (!dbPath) throw new Error("Database not initialized (session not started)");
 	return getDb(dbPath);
+}
+
+const CLOSED_STATUSES: Story["status"][] = ["done", "cancelled", "archived"];
+
+function isOpen(story: Story): boolean {
+	return !CLOSED_STATUSES.includes(story.status);
+}
+
+function truncate(text: string, max: number): string {
+	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 function storyToText(story: Story, compact = true): string {
@@ -44,14 +59,23 @@ function storyToText(story: Story, compact = true): string {
 		for (const line of story.proposed_changes.split("\n")) {
 			lines.push(`    ${line}`);
 		}
+		if (story.parent_id) {
+			lines.push(`  Parent: #${story.parent_id}`);
+		}
 		if (story.depends_on.length) {
 			lines.push(`  Depends on: ${story.depends_on.join(", ")}`);
 		}
 		if (story.next_id) {
 			lines.push(`  Next: #${story.next_id}`);
 		}
+		if (story.resolution) {
+			lines.push(`  Resolution: ${story.resolution}${story.resolution_note ? ` — ${story.resolution_note}` : ""}`);
+		}
+		if (story.learnings) {
+			lines.push(`  Learned: ${story.learnings}`);
+		}
 	} else {
-		lines[0] += ` — ${story.sub_goal.slice(0, 60)}${story.sub_goal.length > 60 ? "…" : ""}`;
+		lines[0] += ` — ${truncate(story.sub_goal, 60)}`;
 	}
 	return lines.join("\n");
 }
@@ -65,6 +89,195 @@ function isDbReady() {
 	}
 }
 
+/** Keep the footer's open-story count honest after stories change. */
+function refreshStatus(ctx: { hasUI: boolean; ui: { setStatus(key: string, text: string | undefined): void } }) {
+	if (!ctx.hasUI || !isDbReady()) return;
+	const open = getAllStories(ensureDb()).filter(isOpen).length;
+	ctx.ui.setStatus("issue-tracker", open > 0 ? `${open} open story(ies)` : undefined);
+}
+
+// ─── Usage accounting ───────────────────────────────────────────────
+// `/plan-stories` is a command, so its model calls never become session
+// entries and the built-in footer counter cannot see them. We total them
+// ourselves and render them onto footer line 3 via setStatus.
+
+interface PlanUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
+function emptyUsage(): PlanUsage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+}
+
+function addUsage(total: PlanUsage, u: Usage | undefined): void {
+	if (!u) return;
+	total.input += u.input ?? 0;
+	total.output += u.output ?? 0;
+	total.cacheRead += u.cacheRead ?? 0;
+	total.cacheWrite += u.cacheWrite ?? 0;
+	total.cost += u.cost?.total ?? 0;
+}
+
+function hasUsage(u: PlanUsage): boolean {
+	return u.input > 0 || u.output > 0 || u.cacheRead > 0 || u.cacheWrite > 0;
+}
+
+/** Same thresholds as the built-in footer's formatTokens. */
+function formatTokens(count: number): string {
+	if (count < 1000) return String(count);
+	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+	return `${Math.round(count / 1_000_000)}M`;
+}
+
+/** Mirrors the footer's `↑ ↓ R W $` idiom so both lines read as one display. */
+function formatUsage(u: PlanUsage): string {
+	const parts: string[] = [];
+	if (u.input) parts.push(`↑${formatTokens(u.input)}`);
+	if (u.output) parts.push(`↓${formatTokens(u.output)}`);
+	if (u.cacheRead) parts.push(`R${formatTokens(u.cacheRead)}`);
+	if (u.cacheWrite) parts.push(`W${formatTokens(u.cacheWrite)}`);
+	if (u.cost) parts.push(`$${u.cost.toFixed(3)}`);
+	return parts.join(" ");
+}
+
+// ─── Plan parsing ───────────────────────────────────────────────────
+
+interface PlanItem {
+	title: string;
+	sub_goal: string;
+	proposed_changes: string;
+	depends_on?: number[];
+	parent_index?: number | null;
+}
+
+/** Tolerate code fences and prose around the array, despite the prompt asking for neither. */
+function extractJsonArray(text: string): string {
+	const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+	const body = (fenced ? fenced[1] : text).trim();
+	const start = body.indexOf("[");
+	const end = body.lastIndexOf("]");
+	return start !== -1 && end > start ? body.slice(start, end + 1) : body;
+}
+
+/**
+ * JSON.parse guarantees nothing about shape. Without this, a well-formed but
+ * wrong-shaped response reaches createStory and trips a NOT NULL constraint
+ * partway through the insert loop.
+ */
+function coercePlanItems(parsed: unknown): PlanItem[] | null {
+	if (!Array.isArray(parsed) || parsed.length === 0) return null;
+	const items: PlanItem[] = [];
+	for (const raw of parsed) {
+		if (typeof raw !== "object" || raw === null) return null;
+		const r = raw as Record<string, unknown>;
+		if (typeof r.title !== "string" || !r.title.trim()) return null;
+		if (typeof r.sub_goal !== "string" || !r.sub_goal.trim()) return null;
+		items.push({
+			title: r.title.trim(),
+			sub_goal: r.sub_goal.trim(),
+			proposed_changes: typeof r.proposed_changes === "string" ? r.proposed_changes : "",
+			depends_on: Array.isArray(r.depends_on)
+				? r.depends_on.filter((d): d is number => typeof d === "number")
+				: [],
+			parent_index: typeof r.parent_index === "number" ? r.parent_index : null,
+		});
+	}
+	return items;
+}
+
+/**
+ * Repair out-of-range references instead of discarding the whole plan.
+ * A bad parent_index falls back to the goal epic; a bad dependency is dropped.
+ */
+function repairStoryGraph(items: PlanItem[]): { items: PlanItem[]; warnings: string[] } {
+	const warnings: string[] = [];
+	const repaired = items.map((item, i) => {
+		let parentIndex = item.parent_index ?? null;
+		if (parentIndex != null && (parentIndex >= i || parentIndex < 0)) {
+			warnings.push(`"${truncate(item.title, 40)}" had parent_index ${parentIndex}; re-parented to the goal.`);
+			parentIndex = null;
+		}
+		const dependsOn = (item.depends_on ?? []).filter((dep) => {
+			if (dep >= i || dep < 0) {
+				warnings.push(`"${truncate(item.title, 40)}" dropped out-of-range dependency ${dep}.`);
+				return false;
+			}
+			return true;
+		});
+		return { ...item, parent_index: parentIndex, depends_on: dependsOn };
+	});
+	return { items: repaired, warnings };
+}
+
+/**
+ * Close any ancestor epic whose children have all closed, walking upwards.
+ * Mirrors the existing next_id auto-promote: finishing work should move the
+ * board without a second round-trip.
+ */
+function rollUpEpics(db: DatabaseSync, fromStoryId: number): Story[] {
+	const closed: Story[] = [];
+	const seen = new Set<number>();
+	let cursor = getStoryById(db, fromStoryId)?.parent_id ?? null;
+
+	while (cursor !== null && !seen.has(cursor)) {
+		seen.add(cursor);
+		const epic = getStoryById(db, cursor);
+		if (!epic || !isOpen(epic)) break;
+		const children = getChildren(db, epic.id);
+		if (children.length === 0 || children.some(isOpen)) break;
+
+		const updated = updateStory(db, epic.id, {
+			status: "done",
+			resolution: "completed",
+			resolution_note: `All ${children.length} child stories closed.`,
+		});
+		if (!updated) break;
+		closed.push(updated);
+		cursor = updated.parent_id;
+	}
+	return closed;
+}
+
+/**
+ * Depth-first ordering, each epic followed by its children.
+ * Guards against cycles — nothing in the tool path prevents A→B→A.
+ */
+function treeOrder(stories: Story[]): { story: Story; depth: number }[] {
+	const ids = new Set(stories.map((s) => s.id));
+	const byParent = new Map<number | null, Story[]>();
+	for (const s of stories) {
+		// A parent outside this set is treated as a root so nothing is dropped.
+		const key = s.parent_id !== null && ids.has(s.parent_id) ? s.parent_id : null;
+		const bucket = byParent.get(key);
+		if (bucket) bucket.push(s);
+		else byParent.set(key, [s]);
+	}
+
+	const out: { story: Story; depth: number }[] = [];
+	const seen = new Set<number>();
+	const walk = (parent: number | null, depth: number) => {
+		for (const s of byParent.get(parent) ?? []) {
+			if (seen.has(s.id)) continue;
+			seen.add(s.id);
+			out.push({ story: s, depth });
+			walk(s.id, depth + 1);
+		}
+	};
+	walk(null, 0);
+
+	// Anything unreachable (i.e. inside a cycle) is appended flat.
+	for (const s of stories) {
+		if (!seen.has(s.id)) out.push({ story: s, depth: 0 });
+	}
+	return out;
+}
+
 // ─── Schema ─────────────────────────────────────────────────────────
 const StoryParams = Type.Object({
 	action: StringEnum(["create", "update", "delete", "list", "mark_done", "mark_in_progress", "reorder", "simplify", "get_next", "search", "set_top_level"] as const),
@@ -75,7 +288,22 @@ const StoryParams = Type.Object({
 	story_id: Type.Optional(Type.Number({ description: "Target story ID" })),
 	status: Type.Optional(StringEnum(["draft", "ready", "in_progress", "done", "cancelled", "archived"] as const)),
 	depends_on: Type.Optional(Type.Array(Type.Number(), { description: "Dependency story IDs (for create / update)" })),
-	next_story_id: Type.Optional(Type.Number({ description: "Next linked story ID (for create / update)" })),
+	next_story_id: Type.Optional(Type.Union([Type.Number(), Type.Null()], { description: "Next linked story ID (for create / update). Pass null to unlink." })),
+	parent_story_id: Type.Optional(Type.Union([Type.Number(), Type.Null()], { description: "Parent story ID (for create / update). Pass null to detach from its parent." })),
+
+	resolution: Type.Optional(
+		StringEnum(STORY_RESOLUTIONS, {
+			description:
+				"Why the story closed (required for mark_done): completed = built as planned; superseded = replaced by other work; obsolete = no longer needed; wontfix = decided against; duplicate = already covered elsewhere.",
+		}),
+	),
+	resolution_note: Type.Optional(Type.String({ description: "One line of detail on the resolution, e.g. 'Merged into #12'" })),
+	learnings: Type.Optional(
+		Type.String({
+			description:
+				"Only set this if something CONTRADICTED proposed_changes — an assumption that proved false, an API that behaved differently than expected, a hidden dependency. If the implementation matched the plan, omit this field. Most stories should have no learnings.",
+		}),
+	),
 
 	status_filter: Type.Optional(StringEnum(["draft", "ready", "in_progress", "done", "cancelled", "archived"] as const)),
 	query: Type.Optional(Type.String({ description: "Search query" })),
@@ -87,18 +315,14 @@ const StoryParams = Type.Object({
 // ─── Extension ──────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
 	// ── Session lifecycle ────────────────────────────────────────────
-	pi.on("session_start", async (event, ctx) => {
-		const cwd = event.cwd ?? process.cwd();
+	pi.on("session_start", async (_event, ctx) => {
+		// SessionStartEvent carries no cwd — the session's cwd is on the context.
+		// Reading it off the event silently resolved to undefined every time.
+		const cwd = ctx.cwd ?? process.cwd();
 		const base = cwd.startsWith("/tmp") ? process.cwd() : cwd;
 		dbPath = `${base}/.pi/stories.db`;
-		const db = ensureDb();
-
-		if (ctx.hasUI) {
-			const total = getAllStories(db).filter((s) => s.status !== "done" && s.status !== "cancelled" && s.status !== "archived").length;
-			if (total > 0) {
-				ctx.ui.setStatus("issue-tracker", `${total} open story(ies)`);
-			}
-		}
+		ensureDb();
+		refreshStatus(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -110,13 +334,13 @@ export default function (pi: ExtensionAPI) {
 		if (!isDbReady()) return;
 		const db = ensureDb();
 
-		const allOpen = getAllStories(db).filter(
-			(s) => s.status !== "done" && s.status !== "cancelled" && s.status !== "archived",
-		);
+		const allOpen = getAllStories(db).filter(isOpen);
 
-		// 1. Ready story to work on now (topological: all deps done, then by priority/id)
+		// 1. Ready story to work on now (topological: all deps done, then by priority/id).
+		//    Epics are containers, never units of work.
 		const readyStories = getStoriesByStatus(db, "ready");
 		const readyToWork = readyStories
+			.filter((s) => !hasChildren(db, s.id))
 			.filter((s) => s.depends_on.every((depId) => getStoryById(db, depId)?.status === "done"))
 			.sort((a, b) => a.priority - b.priority || a.id - b.id)[0] ?? null;
 
@@ -143,9 +367,17 @@ export default function (pi: ExtensionAPI) {
 
 		const lines: string[] = [">>> STORY CONTEXT"];
 
+		const epicLine = (s: Story): string | null => {
+			if (!s.parent_id) return null;
+			const parent = getStoryById(db, s.parent_id);
+			return parent ? `Part of: #${parent.id} ${parent.title}` : null;
+		};
+
 		if (readyToWork) {
 			lines.push(`\n>>> NEXT UP — work on this now`);
 			lines.push(`#${readyToWork.id}: ${readyToWork.title}`);
+			const epic = epicLine(readyToWork);
+			if (epic) lines.push(epic);
 			lines.push(`Sub-goal: ${readyToWork.sub_goal}`);
 			lines.push(`Changes: ${readyToWork.proposed_changes}`);
 			if (readyToWork.depends_on.length) {
@@ -155,6 +387,8 @@ export default function (pi: ExtensionAPI) {
 			const p = inProgressStories[0];
 			lines.push(`\n>>> IN PROGRESS — continue working on this`);
 			lines.push(`#${p.id}: ${p.title}`);
+			const epic = epicLine(p);
+			if (epic) lines.push(epic);
 			lines.push(`Sub-goal: ${p.sub_goal}`);
 			lines.push(`Changes: ${p.proposed_changes}`);
 		} else {
@@ -183,6 +417,26 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		if (primaryFocus) {
+			const related = relatedStrategy.findRelated(db, primaryFocus, 5);
+			if (related.length > 0) {
+				lines.push(`\n>>> RELATED STORIES`);
+				for (const s of related) {
+					lines.push(`  ◇ #${s.id}: ${s.title} — ${truncate(s.sub_goal, 60)}`);
+				}
+			}
+
+			// Things earlier work discovered that contradicted its plan. Capped and
+			// relevance-filtered — this rides on every turn's context.
+			const lessons = relatedStrategy.findLearnings(db, primaryFocus, 3);
+			if (lessons.length > 0) {
+				lines.push(`\n>>> LESSONS FROM COMPLETED WORK — these contradicted an earlier plan; check they don't apply here`);
+				for (const s of lessons) {
+					lines.push(`  ⚠ #${s.id} ${s.title}: ${truncate(s.learnings ?? "", 200)}`);
+				}
+			}
+		}
+
 		return {
 			message: {
 				customType: "story-context",
@@ -197,10 +451,10 @@ export default function (pi: ExtensionAPI) {
 		name: "story",
 		label: "Story",
 		description:
-			"Issue tracker for self-contained work chunks (user stories). Actions: create (title, sub_goal, proposed_changes, status, next_story_id, depends_on), update (story_id + fields), delete (story_id), list (status_filter), search (query), mark_in_progress (story_id), mark_done (story_id), get_next (fetch top ready), reorder (ordered_ids), simplify (source_ids + merged_title), set_top_level (story_id).",
+			"Issue tracker for self-contained work chunks (user stories). Actions: create (title, sub_goal, proposed_changes, status, next_story_id, depends_on, parent_story_id), update (story_id + fields), delete (story_id), list (status_filter), search (query), mark_in_progress (story_id), mark_done (story_id + REQUIRED resolution, optional resolution_note and learnings), get_next (fetch top ready), reorder (ordered_ids), simplify (source_ids + merged_title), set_top_level (story_id). Stories form a tree: a story with children is an epic and is never handed out as work.",
 		parameters: StoryParams,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const db = ensureDb();
 			const { action } = params;
 
@@ -209,16 +463,23 @@ export default function (pi: ExtensionAPI) {
 				if (!params.title || !params.sub_goal) {
 					return { content: [{ type: "text", text: "Error: title and sub_goal are required for create" }], details: { action, error: "missing fields" } };
 				}
+				if (typeof params.parent_story_id === "number") {
+					const parent = getStoryById(db, params.parent_story_id);
+					if (!parent) {
+						return { content: [{ type: "text", text: `Error: parent story #${params.parent_story_id} not found` }], details: { action, error: "parent not found" } };
+					}
+				}
 				const story = createStory(db, {
 					title: params.title,
 					sub_goal: params.sub_goal,
 					proposed_changes: params.proposed_changes ?? "",
 					status: params.status ?? "draft",
-					priority: 0,
-					parent_id: null,
+					priority: getMaxPriority(db) + 1,
+					parent_id: params.parent_story_id ?? null,
 					next_id: params.next_story_id ?? null,
 					depends_on: params.depends_on ?? [],
 				});
+				refreshStatus(ctx);
 				return {
 					content: [{ type: "text", text: `Created story #${story.id}: ${story.title}\n\n${storyToText(story, false)}` }],
 					details: { action, story },
@@ -230,6 +491,19 @@ export default function (pi: ExtensionAPI) {
 				if (!params.story_id) {
 					return { content: [{ type: "text", text: "Error: story_id required for update" }], details: { action, error: "missing story_id" } };
 				}
+				// null is meaningful here (detach), so check for a number specifically.
+				if (typeof params.parent_story_id === "number") {
+					const parent = getStoryById(db, params.parent_story_id);
+					if (!parent) {
+						return { content: [{ type: "text", text: `Error: parent story #${params.parent_story_id} not found` }], details: { action, error: "parent not found" } };
+					}
+					if (params.parent_story_id === params.story_id) {
+						return { content: [{ type: "text", text: "Error: a story cannot be its own parent" }], details: { action, error: "self parent" } };
+					}
+					if (wouldCreateCycle(db, params.story_id, params.parent_story_id)) {
+						return { content: [{ type: "text", text: `Error: parenting #${params.story_id} to #${params.parent_story_id} would create a cycle` }], details: { action, error: "cycle" } };
+					}
+				}
 				const story = updateStory(db, params.story_id, {
 					title: params.title,
 					sub_goal: params.sub_goal,
@@ -237,10 +511,15 @@ export default function (pi: ExtensionAPI) {
 					status: params.status,
 					next_id: params.next_story_id,
 					depends_on: params.depends_on,
+					parent_id: params.parent_story_id,
+					resolution: params.resolution,
+					resolution_note: params.resolution_note,
+					learnings: params.learnings,
 				});
 				if (!story) {
 					return { content: [{ type: "text", text: `Story #${params.story_id} not found` }], details: { action, error: "not found" } };
 				}
+				refreshStatus(ctx);
 				return {
 					content: [{ type: "text", text: `Updated story #${story.id}:\n${storyToText(story, false)}` }],
 					details: { action, story },
@@ -256,10 +535,19 @@ export default function (pi: ExtensionAPI) {
 				if (!story) {
 					return { content: [{ type: "text", text: `Story #${params.story_id} not found` }], details: { action, error: "not found" } };
 				}
+				// Detach children rather than leaving them pointing at a deleted row.
+				const orphans = getChildren(db, params.story_id);
+				for (const child of orphans) {
+					updateStory(db, child.id, { parent_id: story.parent_id });
+				}
 				deleteStories(db, [params.story_id]);
+				refreshStatus(ctx);
+				const reparented = orphans.length
+					? `\nReparented ${orphans.length} child story(ies) to ${story.parent_id ? `#${story.parent_id}` : "top level"}.`
+					: "";
 				return {
-					content: [{ type: "text", text: `Deleted story #${params.story_id}: ${story.title}` }],
-					details: { action, deleted: story },
+					content: [{ type: "text", text: `Deleted story #${params.story_id}: ${story.title}${reparented}` }],
+					details: { action, deleted: story, reparented: orphans.length },
 				};
 			}
 
@@ -271,6 +559,13 @@ export default function (pi: ExtensionAPI) {
 				const story = getStoryById(db, params.story_id);
 				if (!story) {
 					return { content: [{ type: "text", text: `Story #${params.story_id} not found` }], details: { action, error: "not found" } };
+				}
+				if (hasChildren(db, story.id)) {
+					const kids = getChildren(db, story.id).filter(isOpen);
+					return {
+						content: [{ type: "text", text: `Story #${story.id} is an epic, not a unit of work. Start one of its children instead: ${kids.map((s) => `#${s.id}`).join(", ") || "(none open)"}` }],
+						details: { action, error: "is an epic" },
+					};
 				}
 				// dependency check
 				const unmet = story.depends_on.filter((id) => getStoryById(db, id)?.status !== "done");
@@ -284,6 +579,7 @@ export default function (pi: ExtensionAPI) {
 				if (!updated) {
 					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
 				}
+				refreshStatus(ctx);
 				return {
 					content: [{ type: "text", text: `✓ Story #${updated.id} is now IN PROGRESS\n${storyToText(updated, false)}` }],
 					details: { action, story: updated },
@@ -331,6 +627,23 @@ export default function (pi: ExtensionAPI) {
 				if (!story) {
 					return { content: [{ type: "text", text: `Story #${params.story_id} not found` }], details: { action, error: "not found" } };
 				}
+				// Resolution gate — same shape as the dependency gate below. Optional
+				// fields get skipped by models, and an unrecorded outcome is the whole
+				// gap this closes, so require it explicitly.
+				if (!params.resolution) {
+					return {
+						content: [{
+							type: "text",
+							text:
+								`Cannot mark done: resolution required.\n` +
+								`Pass resolution (${STORY_RESOLUTIONS.join("|")}) and optionally resolution_note.\n` +
+								`Set learnings ONLY if something contradicted the proposed_changes for this story — ` +
+								`an assumption that proved false, an API that behaved differently, a hidden dependency. ` +
+								`If the work matched the plan, omit learnings.`,
+						}],
+						details: { action, error: "resolution required" },
+					};
+				}
 				// dependency check
 				const unmet = story.depends_on.filter((id) => getStoryById(db, id)?.status !== "done");
 				if (unmet.length > 0) {
@@ -339,7 +652,19 @@ export default function (pi: ExtensionAPI) {
 						details: { action, error: "unmet dependencies", unmet },
 					};
 				}
-				const updated = updateStory(db, params.story_id, { status: "done" });
+				const openKids = getChildren(db, story.id).filter(isOpen);
+				if (openKids.length > 0) {
+					return {
+						content: [{ type: "text", text: `Cannot mark done: epic #${story.id} still has open children — ${openKids.map((s) => `#${s.id}`).join(", ")}. They close it automatically when they are all done.` }],
+						details: { action, error: "open children", open: openKids.map((s) => s.id) },
+					};
+				}
+				const updated = updateStory(db, params.story_id, {
+					status: "done",
+					resolution: params.resolution,
+					resolution_note: params.resolution_note,
+					learnings: params.learnings,
+				});
 				if (!updated) {
 					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
 				}
@@ -360,16 +685,25 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
+				// Close any ancestor epic this completed
+				const rolledUp = rollUpEpics(db, updated.id);
+				const epicMsg = rolledUp.length
+					? `\n\n>>> EPIC COMPLETE: ${rolledUp.map((s) => `#${s.id} ${s.title}`).join(", ")}`
+					: "";
+
+				refreshStatus(ctx);
 				return {
-					content: [{ type: "text", text: `✓ Story #${updated.id} marked as DONE.${nextMsg}` }],
-					details: { action, story: updated, nextMessage: nextMsg },
+					content: [{ type: "text", text: `✓ Story #${updated.id} marked as DONE (${updated.resolution}).${epicMsg}${nextMsg}` }],
+					details: { action, story: updated, nextMessage: nextMsg, closedEpics: rolledUp },
 				};
 			}
 
 			// ── get_next ──────────────────────────────────────────
 			if (action === "get_next") {
 				const ready = getStoriesByStatus(db, "ready");
-				const topReady = ready.find((s) => s.depends_on.every((id) => getStoryById(db, id)?.status === "done"));
+				const topReady = ready
+					.filter((s) => !hasChildren(db, s.id))
+					.find((s) => s.depends_on.every((id) => getStoryById(db, id)?.status === "done"));
 				if (!topReady) {
 					return {
 						content: [{ type: "text", text: "No ready stories available right now." }],
@@ -435,20 +769,50 @@ export default function (pi: ExtensionAPI) {
 				const mergedSubGoal = sources.map((s) => s.sub_goal).join("\n");
 				const mergedChanges = sources.map((s) => s.proposed_changes).join("\n---\n");
 				const first = sources[0];
-				const merged = createStory(db, {
-					title: mergedTitle,
-					sub_goal: mergedSubGoal,
-					proposed_changes: mergedChanges,
-					status: first.status === "done" ? "done" : first.status === "in_progress" ? "in_progress" : "ready",
-					priority: first.priority,
-					parent_id: null,
-					next_id: first.next_id,
-					depends_on: [...new Set(sources.flatMap((s) => s.depends_on))],
+				const sourceIds = new Set(sources.map((s) => s.id));
+				// Keep the epic when every source sat under the same one.
+				const sharedParent = sources.every((s) => s.parent_id === first.parent_id) ? first.parent_id : null;
+
+				const merged = transaction(db, () => {
+					const created = createStory(db, {
+						title: mergedTitle,
+						sub_goal: mergedSubGoal,
+						proposed_changes: mergedChanges,
+						status: first.status === "done" ? "done" : first.status === "in_progress" ? "in_progress" : "ready",
+						priority: first.priority,
+						parent_id: sharedParent,
+						next_id: first.next_id,
+						// A merge must not depend on the parts it absorbed.
+						depends_on: [...new Set(sources.flatMap((s) => s.depends_on))].filter((id) => !sourceIds.has(id)),
+					});
+
+					for (const s of sources) {
+						// Adopt the sources' children so they aren't stranded on archived rows.
+						for (const child of getChildren(db, s.id)) {
+							if (child.id !== created.id) {
+								updateStory(db, child.id, { parent_id: created.id });
+							}
+						}
+						updateStory(db, s.id, {
+							status: "archived",
+							resolution: "superseded",
+							resolution_note: `Merged into #${created.id}`,
+						});
+					}
+
+					// Repoint anyone depending on a source; archived never becomes done,
+					// so those dependents would otherwise be blocked forever.
+					for (const other of getAllStories(db)) {
+						if (other.id === created.id || sourceIds.has(other.id)) continue;
+						if (!other.depends_on.some((id) => sourceIds.has(id))) continue;
+						const rewritten = [...new Set(other.depends_on.map((id) => (sourceIds.has(id) ? created.id : id)))];
+						updateStory(db, other.id, { depends_on: rewritten });
+					}
+
+					return created;
 				});
-				// Archive old ones
-				for (const s of sources) {
-					updateStory(db, s.id, { status: "archived" });
-				}
+
+				refreshStatus(ctx);
 				return {
 					content: [
 						{
@@ -512,7 +876,7 @@ export default function (pi: ExtensionAPI) {
 			const db = ensureDb();
 			const all = getAllStories(db);
 			if (ctx.mode !== "tui") {
-				const open = all.filter((s) => s.status !== "done" && s.status !== "cancelled" && s.status !== "archived");
+				const open = all.filter(isOpen);
 				const text = open.map((s) => storyToText(s, true)).join("\n") || "All stories are closed.";
 				if (ctx.hasUI) ctx.ui.notify(`${all.length} stories total, ${open.length} open:\n\n${text}`, "info");
 				return;
@@ -522,10 +886,25 @@ export default function (pi: ExtensionAPI) {
 				let selectedIndex = 0;
 				let cachedLines: string[] | undefined;
 				let widthCached = 0;
+				// Epics first, children indented beneath them.
+				const rows = treeOrder(all);
 
 				function refresh() {
 					cachedLines = undefined;
 					tui.requestRender();
+				}
+
+				/**
+				 * Board keys are human actions, so they don't hit the tool's resolution
+				 * gate — but a closed story with no resolution is exactly the hole this
+				 * work fills, so record a default.
+				 */
+				function setStatus(index: number, updates: Partial<Story>) {
+					const row = rows[index];
+					if (!row) return;
+					const updated = updateStory(db, row.story.id, updates);
+					if (updated) rows[index] = { ...row, story: updated };
+					refresh();
 				}
 
 				function handleInput(data: string) {
@@ -539,52 +918,53 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					if (matchesKey(data, "down")) {
-						selectedIndex = Math.min(all.length - 1, selectedIndex + 1);
+						selectedIndex = Math.min(rows.length - 1, selectedIndex + 1);
 						refresh();
 						return;
 					}
-					if (matchesKey(data, "r") && all[selectedIndex]) {
-						updateStory(db, all[selectedIndex].id, { status: "ready" });
-						all[selectedIndex] = { ...all[selectedIndex], status: "ready" };
-						refresh();
+					if (matchesKey(data, "r")) {
+						setStatus(selectedIndex, { status: "ready" });
 						return;
 					}
-					if (matchesKey(data, "s") && all[selectedIndex]) {
-						updateStory(db, all[selectedIndex].id, { status: "in_progress" });
-						all[selectedIndex] = { ...all[selectedIndex], status: "in_progress" };
-						refresh();
+					if (matchesKey(data, "s")) {
+						setStatus(selectedIndex, { status: "in_progress" });
 						return;
 					}
-					if (matchesKey(data, "d") && all[selectedIndex]) {
-						updateStory(db, all[selectedIndex].id, { status: "done" });
-						all[selectedIndex] = { ...all[selectedIndex], status: "done" };
-						refresh();
+					if (matchesKey(data, "d")) {
+						setStatus(selectedIndex, {
+							status: "done",
+							resolution: "completed",
+							resolution_note: "Closed from the story board.",
+						});
 						return;
 					}
-					if (matchesKey(data, "x") && all[selectedIndex]) {
-						updateStory(db, all[selectedIndex].id, { status: "cancelled" });
-						all[selectedIndex] = { ...all[selectedIndex], status: "cancelled" };
-						refresh();
+					if (matchesKey(data, "x")) {
+						setStatus(selectedIndex, {
+							status: "cancelled",
+							resolution: "wontfix",
+							resolution_note: "Cancelled from the story board.",
+						});
 						return;
 					}
 					if (matchesKey(data, "enter")) {
-						done(all[selectedIndex] ?? null);
+						done(rows[selectedIndex]?.story ?? null);
 					}
 				}
 
 				function render(width: number): string[] {
 					if (cachedLines && widthCached === width) return cachedLines;
 					const lines: string[] = [];
+					const openCount = rows.filter((r) => isOpen(r.story)).length;
 					lines.push(theme.fg("accent", "═".repeat(Math.max(0, width))));
-					lines.push(` ${theme.fg("accent", theme.bold("Story Board"))}  ${theme.fg("muted", `${all.filter((s) => s.status !== "done" && s.status !== "cancelled" && s.status !== "archived").length} open`)}`);
+					lines.push(` ${theme.fg("accent", theme.bold("Story Board"))}  ${theme.fg("muted", `${openCount} open`)}`);
 					lines.push(theme.fg("accent", "─".repeat(Math.max(0, width))));
 
-					if (all.length === 0) {
+					if (rows.length === 0) {
 						lines.push(`  ${theme.fg("dim", "No stories yet. Use /plan-stories <goal> to create some.")}`);
 					}
 
-					for (let i = 0; i < all.length; i++) {
-						const s = all[i];
+					for (let i = 0; i < rows.length; i++) {
+						const { story: s, depth } = rows[i];
 						const isActive = i === selectedIndex;
 						const statusColor =
 							s.status === "done"
@@ -594,13 +974,22 @@ export default function (pi: ExtensionAPI) {
 									: s.status === "ready"
 										? "text"
 										: "dim";
+						const indent = "  ".repeat(depth);
 						const prefix = isActive ? theme.fg("accent", "> ") : "  ";
-						const row = `${prefix}${theme.fg(statusColor, `[${s.status}]`)} ${theme.fg("accent", `#${s.id}`)} ${theme.fg("text", s.title)}`;
+						const epicMark = hasChildren(db, s.id) ? theme.fg("muted", "▾ ") : "";
+						const row = `${prefix}${indent}${epicMark}${theme.fg(statusColor, `[${s.status}]`)} ${theme.fg("accent", `#${s.id}`)} ${theme.fg("text", s.title)}`;
 						lines.push(row);
 						if (isActive) {
-							lines.push(`     ${theme.fg("dim", s.sub_goal.slice(0, width - 6))}`);
+							const pad = `     ${indent}`;
+							lines.push(`${pad}${theme.fg("dim", truncate(s.sub_goal, Math.max(10, width - pad.length - 1)))}`);
 							if (s.next_id) {
-								lines.push(`     ${theme.fg("dim", `Next → #${s.next_id}`)}`);
+								lines.push(`${pad}${theme.fg("dim", `Next → #${s.next_id}`)}`);
+							}
+							if (s.resolution) {
+								lines.push(`${pad}${theme.fg("muted", `Resolution: ${s.resolution}${s.resolution_note ? ` — ${s.resolution_note}` : ""}`)}`);
+							}
+							if (s.learnings) {
+								lines.push(`${pad}${theme.fg("warning", `⚠ ${truncate(s.learnings, Math.max(10, width - pad.length - 3))}`)}`);
 							}
 						}
 					}
@@ -616,6 +1005,7 @@ export default function (pi: ExtensionAPI) {
 				return { render, handleInput, invalidate: () => { cachedLines = undefined; } };
 			});
 
+			refreshStatus(ctx);
 			if (result) {
 				ctx.ui.notify(`Selected #${result.id}: ${result.title}`, "info");
 			}
@@ -645,26 +1035,49 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// First pass: ask for clarifications or a story breakdown
-			const systemPrompt = `You are a requirements assistant. The user wants to break down a high-level goal into user stories.\n\nFirst, determine if the goal is ambiguous or needs clarification. If so, respond with a short list of 1-3 clarifying questions, prefixed by ">>> CLARIFY:".\n\nIf the goal is clear enough, respond ONLY with a JSON array of user stories. Each story must have:\n- title (string)\n- sub_goal (string, 1-2 sentences)\n- proposed_changes (string, bullet or numbered list of concrete code/file changes)\n- depends_on (array of 0-based indices referencing earlier array items; optional)\n\nDo NOT include markdown code fences around the JSON. Keep it compact and valid JSON. If dependencies exist, ensure they reference earlier indices only.`;
+			// First pass: ask for clarifications or a story breakdown.
+			// Note the goal itself becomes the root epic below, so the model is asked
+			// only for leaf work — parent_index is for an optional *second* level.
+			const baseSystemPrompt = `You are a requirements assistant. The user wants to break down a high-level goal into user stories.\n\nOnly ask clarifying questions if the goal is genuinely ambiguous and you cannot produce a reasonable breakdown (e.g., missing critical constraints, conflicting requirements, or undefined scope). If the goal is reasonably clear, make sensible assumptions and respond ONLY with a JSON array of user stories.\n\nIf you MUST clarify, respond with a short list of 1-3 clarifying questions, prefixed by ">>> CLARIFY:". Each question must be meaningful and non-empty.\n\nOtherwise, respond ONLY with a JSON array of user stories. Each story must have:\n- title (string)\n- sub_goal (string, 1-2 sentences)\n- proposed_changes (string, bullet or numbered list of concrete code/file changes)\n- depends_on (array of 0-based indices referencing earlier array items; optional)\n- parent_index (number | null, 0-based index of an earlier item that groups this story; optional)\n\nThe overall goal is already tracked separately as the parent of everything you return, so do NOT emit a story for the goal itself. Use parent_index only when a group of stories forms a distinct sub-area worth grouping under one of your own items; leave it out otherwise.\n\nDo NOT include markdown code fences around the JSON. Keep it compact and valid JSON. If dependencies or parent references exist, ensure they reference earlier indices only.`;
 
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			let storiesJson: Array<{ title: string; sub_goal: string; proposed_changes: string; depends_on?: number[] }> | null = null;
+			let storiesJson: PlanItem[] | null = null;
 			let clarifications: string[] | null = null;
 			let turn = 0;
 			const maxTurns = 3;
 
+			// Planning is a command, so these tokens never reach the built-in footer
+			// counter. Total them here and surface them ourselves.
+			const usage = emptyUsage();
+			// One id across turns so the shared system prompt can actually cache.
+			const planSessionId = randomUUID();
+
+			const reportUsage = () => {
+				if (!hasUsage(usage)) return;
+				ctx.ui.setStatus("issue-tracker-planning", `plan ${formatUsage(usage)}`);
+			};
+
 			while (turn < maxTurns && !storiesJson) {
+				const systemPrompt = turn === maxTurns - 1
+					? baseSystemPrompt + "\n\nIMPORTANT: This is your final chance. Do NOT ask for clarification. Produce the JSON array directly."
+					: baseSystemPrompt;
 				const contentText = turn === 0 && !clarifications
 					? goal
 					: `Goal: ${goal}\n\n${clarifications ? `Clarifications:\n${clarifications.join("\n")}` : ""}`;
 
 				// Run model call with persistent loader so the user sees activity and can abort
-				const responseText = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-					const loader = new BorderedLoader(tui, theme, `Planning stories (turn ${turn + 1}/${maxTurns}) using ${ctx.model!.id}…`);
+				type PlanTurn = { text: string | null; usage?: Usage; error?: string };
+				const outcome = await ctx.ui.custom<PlanTurn | null>((tui, theme, _kb, done) => {
+					// BorderedLoader's label is fixed at construction, but we build a new
+					// one each turn — so running totals go straight into the message.
+					const runningTotal = hasUsage(usage) ? ` · ${formatUsage(usage)} so far` : "";
+					const loader = new BorderedLoader(
+						tui,
+						theme,
+						`Planning stories (turn ${turn + 1}/${maxTurns}) using ${ctx.model!.id}…${runningTotal}`,
+					);
 					loader.onAbort = () => done(null);
 
-					const doPlan = async () => {
+					const doPlan = async (): Promise<PlanTurn> => {
 						try {
 							const response = await ctx.modelRegistry.complete(
 								ctx.model!,
@@ -674,45 +1087,70 @@ export default function (pi: ExtensionAPI) {
 										{ role: "user" as const, content: [{ type: "text" as const, text: contentText }], timestamp: Date.now() },
 									],
 								},
-								{ cacheRetention: "none", sessionId: randomUUID(), signal: loader.signal },
+								{ sessionId: planSessionId, signal: loader.signal },
 							);
-							if (response.stopReason === "aborted") return null;
-							return response.content
+							// Aborted turns still burn tokens, so report usage before bailing.
+							if (response.stopReason === "aborted") return { text: null, usage: response.usage };
+							if (response.stopReason === "length") {
+								return { text: null, usage: response.usage, error: "The model hit its output limit before finishing the plan. Try a narrower goal." };
+							}
+							const text = response.content
 								.filter((c): c is { type: "text"; text: string } => c.type === "text")
 								.map((c) => c.text)
 								.join("\n")
 								.trim();
+							return { text, usage: response.usage };
 						} catch (err) {
-							console.error("plan-stories model call failed:", err);
-							return null;
+							return { text: null, error: err instanceof Error ? err.message : String(err) };
 						}
 					};
 
-					doPlan().then(done).catch(() => done(null));
+					doPlan().then(done).catch((err) => done({ text: null, error: String(err) }));
 					return loader;
 				});
 
-				if (responseText === null) {
-					ctx.ui.notify("Planning cancelled or failed. Check logs for details.", "info");
+				// null only comes from the abort path; a failure carries an error string.
+				if (outcome === null) {
+					reportUsage();
+					ctx.ui.notify(`Planning cancelled.${hasUsage(usage) ? ` Used ${formatUsage(usage)}.` : ""}`, "info");
 					return;
 				}
+				addUsage(usage, outcome.usage);
+				reportUsage();
+
+				if (outcome.text === null) {
+					ctx.ui.notify(`Planning failed: ${outcome.error ?? "unknown error"}`, "error");
+					return;
+				}
+				const responseText = outcome.text;
+
+				const parsePlan = (text: string): PlanItem[] | null => {
+					try {
+						return coercePlanItems(JSON.parse(extractJsonArray(text)));
+					} catch {
+						return null;
+					}
+				};
 
 				if (responseText.includes(">>> CLARIFY")) {
-					const qs = responseText.split(">>> CLARIFY")[1]?.split("\n").filter((l) => l.trim().startsWith("-") || l.trim().match(/^\d+\./)) ?? [];
+					const qs = responseText.split(">>> CLARIFY")[1]?.split("\n")
+						.filter((l) => l.trim().startsWith("-") || /^\d+\./.test(l.trim()))
+						.map((l) => l.replace(/^[-\d\.\s]+/, "").trim())
+						.filter((q) => q.length > 0) ?? [];
 					if (qs.length === 0) {
 						// Unexpected format, treat as JSON attempt
-						try {
-							storiesJson = JSON.parse(responseText);
-						} catch {
+						storiesJson = parsePlan(responseText);
+						if (!storiesJson) {
 							ctx.ui.notify("Could not parse plan response. Aborting.", "error");
 							return;
 						}
 					} else {
-						// Ask user clarifications via select/input
+						// Ask user clarifications. The question goes in the TITLE — the
+						// input component ignores its placeholder argument entirely.
 						const answers: string[] = [];
 						for (let i = 0; i < qs.length; i++) {
-							const q = qs[i].replace(/^[-\d\.\s]+/, "").trim();
-							const ans = await ctx.ui.input(`Clarification ${i + 1}/${qs.length}`, q);
+							const q = qs[i];
+							const ans = await ctx.ui.input(`Clarification ${i + 1}/${qs.length}: ${q}`, "");
 							if (ans === undefined) {
 								ctx.ui.notify("Planning cancelled", "info");
 								return;
@@ -722,9 +1160,8 @@ export default function (pi: ExtensionAPI) {
 						clarifications = answers;
 					}
 				} else {
-					try {
-						storiesJson = JSON.parse(responseText);
-					} catch {
+					storiesJson = parsePlan(responseText);
+					if (!storiesJson) {
 						ctx.ui.notify("Could not parse JSON plan. Aborting.", "error");
 						return;
 					}
@@ -732,38 +1169,78 @@ export default function (pi: ExtensionAPI) {
 				turn++;
 			}
 
-			if (!storiesJson || !Array.isArray(storiesJson) || storiesJson.length === 0) {
+			if (!storiesJson || storiesJson.length === 0) {
 				ctx.ui.notify("No stories generated after clarification loop.", "warning");
 				return;
 			}
 
-			// Insert into DB, link next_id
-			const createdIds: number[] = [];
-			for (let i = 0; i < storiesJson.length; i++) {
-				const item = storiesJson[i];
-				const dependsOn = (item.depends_on ?? [])
-					.map((idx) => createdIds[idx])
-					.filter((id): id is number => id !== undefined);
-				const nextId = i + 1 < storiesJson.length ? -1 : null; // placeholder
-				const story = createStory(db, {
-					title: item.title,
-					sub_goal: item.sub_goal,
-					proposed_changes: item.proposed_changes ?? "",
-					status: "draft",
-					priority: i,
-					parent_id: null,
-					next_id: nextId,
-					depends_on: dependsOn,
-				});
-				createdIds.push(story.id);
-			}
-			// Fix next_id chain
-			for (let i = 0; i < createdIds.length; i++) {
-				const nextId = i + 1 < createdIds.length ? createdIds[i + 1] : null;
-				updateStory(db, createdIds[i], { next_id: nextId });
+			const { items, warnings } = repairStoryGraph(storiesJson);
+			if (warnings.length > 0) {
+				ctx.ui.notify(`Plan repaired:\n${warnings.join("\n")}`, "warning");
 			}
 
-			ctx.ui.notify(`Created ${createdIds.length} stories. Use /stories to view.`, "info");
+			// Keep this run's stories after any existing ones instead of restarting at 0.
+			const basePriority = getMaxPriority(db) + 1;
+
+			const { rootId, createdIds } = transaction(db, () => {
+				// The goal itself becomes the root epic. Without it there is no parent
+				// for anything to attach to, which is why parent_id was always null.
+				const root = createStory(db, {
+					title: truncate(goal, 80),
+					sub_goal: goal,
+					proposed_changes: `Delivered by the child stories of this epic.`,
+					status: "draft",
+					priority: basePriority,
+					parent_id: null,
+					next_id: null,
+					depends_on: [],
+				});
+
+				const ids: number[] = [];
+				for (let i = 0; i < items.length; i++) {
+					const item = items[i];
+					const dependsOn = (item.depends_on ?? [])
+						.map((idx) => ids[idx])
+						.filter((id): id is number => id !== undefined);
+					// Default to the root epic; parent_index overrides it with a sub-group.
+					const parentId = item.parent_index != null ? ids[item.parent_index] ?? root.id : root.id;
+					const story = createStory(db, {
+						title: item.title,
+						sub_goal: item.sub_goal,
+						proposed_changes: item.proposed_changes,
+						status: "draft",
+						priority: basePriority + 1 + i,
+						parent_id: parentId,
+						// Linked in the second pass below; inside this transaction the
+						// intermediate state is never externally visible.
+						next_id: null,
+						depends_on: dependsOn,
+					});
+					ids.push(story.id);
+				}
+
+				// Chain the children; the root epic stays out of the chain.
+				for (let i = 0; i < ids.length; i++) {
+					updateStory(db, ids[i], { next_id: i + 1 < ids.length ? ids[i + 1] : null });
+				}
+
+				// Give the agent something to pick up. Without this everything sits in
+				// `draft` and the context injection reports NO ACTIVE WORK.
+				const firstReady = ids.find((id) => (getStoryById(db, id)?.depends_on.length ?? 0) === 0);
+				if (firstReady !== undefined) {
+					updateStory(db, firstReady, { status: "ready" });
+				}
+
+				setAppState(db, "top_level_story_id", String(root.id));
+				return { rootId: root.id, createdIds: ids };
+			});
+
+			refreshStatus(ctx);
+			const costNote = hasUsage(usage) ? `\nPlanning used ${formatUsage(usage)}.` : "";
+			ctx.ui.notify(
+				`Created epic #${rootId} with ${createdIds.length} stories. Use /stories to view.${costNote}`,
+				"info",
+			);
 		},
 	});
 
@@ -808,19 +1285,31 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const lines: string[] = ["# User Stories", ""];
-			for (const s of all) {
-				lines.push(`## ${s.status === "in_progress" ? "▶" : s.status === "done" ? "✓" : s.status === "ready" ? "○" : "•"} #${s.id}: ${s.title}`);
+			// Epics become sections, their children nest one heading level deeper.
+			for (const { story: s, depth } of treeOrder(all)) {
+				const marker = s.status === "in_progress" ? "▶" : s.status === "done" ? "✓" : s.status === "ready" ? "○" : "•";
+				const heading = "#".repeat(Math.min(6, depth + 2));
+				lines.push(`${heading} ${marker} #${s.id}: ${s.title}`);
 				lines.push(`**Status:** ${s.status}`);
 				lines.push(`**Sub-goal:** ${s.sub_goal}`);
 				lines.push("**Proposed changes:**");
 				for (const change of s.proposed_changes.split("\n")) {
 					lines.push(`- ${change}`);
 				}
+				if (s.parent_id) {
+					lines.push(`**Part of:** #${s.parent_id}`);
+				}
 				if (s.depends_on.length) {
 					lines.push(`**Depends on:** ${s.depends_on.map((id) => `#${id}`).join(", ")}`);
 				}
 				if (s.next_id) {
 					lines.push(`**Next →** #${s.next_id}`);
+				}
+				if (s.resolution) {
+					lines.push(`**Resolution:** ${s.resolution}${s.resolution_note ? ` — ${s.resolution_note}` : ""}`);
+				}
+				if (s.learnings) {
+					lines.push(`**Learned:** ${s.learnings}`);
 				}
 				lines.push("");
 			}
