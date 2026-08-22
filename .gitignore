@@ -1,0 +1,10 @@
+node_modules/
+
+# Tracker state. The database is per-checkout and binary — committing it would
+# conflict on every merge once stories start producing commits.
+.pi/stories.db
+.pi/stories.db-wal
+.pi/stories.db-shm
+
+# Epic worktrees, if worktreeRoot is ever pointed inside the repo.
+.pi-worktrees/

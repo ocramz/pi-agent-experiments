@@ -13,11 +13,11 @@ import {
 	getAllStories,
 	getAppState,
 	getChildren,
-	getDb,
 	getMaxPriority,
 	getStoriesByStatus,
 	getStoryById,
 	hasChildren,
+	openDb,
 	searchStories,
 	setAppState,
 	transaction,
@@ -26,17 +26,37 @@ import {
 } from "../src/database.ts";
 import type { Story } from "../src/types.ts";
 import { STORY_RESOLUTIONS } from "../src/types.ts";
-import type { RelatedStoriesStrategy } from "../src/related.ts";
 import { keywordStrategy } from "../src/related.ts";
+import { resolvePaths } from "../src/config.ts";
+import type { GitRunner, TrackerContext } from "../src/context.ts";
+import { probeRepo, type RepoInfo } from "../src/git.ts";
 
 // ─── State ──────────────────────────────────────────────────────────
-let dbPath: string | null = null;
-let relatedStrategy: RelatedStoriesStrategy = keywordStrategy;
+/**
+ * Everything stateful lives on one context, rebuilt on each `session_start`.
+ * `src/` never reaches for a module-level singleton, which is what lets it be
+ * tested against a temp repo with no pi runtime — see src/context.ts.
+ */
+let tracker: TrackerContext | null = null;
+/** Repository state as of session start. Null before the first probe. */
+let repo: RepoInfo | null = null;
 
 // ─── Helpers ────────────────────────────────────────────────────────
+function ensureTracker(): TrackerContext {
+	if (!tracker) throw new Error("Tracker not initialized (session not started)");
+	return tracker;
+}
+
 function ensureDb() {
-	if (!dbPath) throw new Error("Database not initialized (session not started)");
-	return getDb(dbPath);
+	return ensureTracker().db;
+}
+
+/** A `GitRunner` backed by the host's sanctioned exec. Never throws; see src/context.ts. */
+function createExecGitRunner(pi: ExtensionAPI): GitRunner {
+	return async (args, opts) => {
+		const result = await pi.exec("git", args, { cwd: opts?.cwd, timeout: opts?.timeout });
+		return { stdout: result.stdout, stderr: result.stderr, code: result.code };
+	};
 }
 
 const CLOSED_STATUSES: Story["status"][] = ["done", "cancelled", "archived"];
@@ -89,11 +109,32 @@ function isDbReady() {
 	}
 }
 
+type UiContext = { hasUI: boolean; ui: { setStatus(key: string, text: string | undefined): void } };
+
 /** Keep the footer's open-story count honest after stories change. */
-function refreshStatus(ctx: { hasUI: boolean; ui: { setStatus(key: string, text: string | undefined): void } }) {
+function refreshStatus(ctx: UiContext) {
 	if (!ctx.hasUI || !isDbReady()) return;
 	const open = getAllStories(ensureDb()).filter(isOpen).length;
 	ctx.ui.setStatus("issue-tracker", open > 0 ? `${open} open story(ies)` : undefined);
+}
+
+/**
+ * The single write path for a story's status.
+ *
+ * Status used to be written from three unrelated places — the `mark_in_progress`
+ * action, the ungated `update` action, and the board's key handler — so anything
+ * that had to happen on a transition would have had to be repeated three times
+ * and would still have been missed by the next new caller. Git side effects hang
+ * off this function; nothing else may change `status`.
+ */
+function transitionStatus(
+	storyId: number,
+	updates: Partial<Omit<Story, "id" | "created_at" | "updated_at">>,
+	uiCtx?: UiContext,
+): Story | null {
+	const updated = updateStory(ensureDb(), storyId, updates);
+	if (updated && uiCtx) refreshStatus(uiCtx);
+	return updated;
 }
 
 // ─── Usage accounting ───────────────────────────────────────────────
@@ -220,7 +261,7 @@ function repairStoryGraph(items: PlanItem[]): { items: PlanItem[]; warnings: str
  * Mirrors the existing next_id auto-promote: finishing work should move the
  * board without a second round-trip.
  */
-function rollUpEpics(db: DatabaseSync, fromStoryId: number): Story[] {
+function closeCompletedParents(db: DatabaseSync, fromStoryId: number): Story[] {
 	const closed: Story[] = [];
 	const seen = new Set<number>();
 	let cursor = getStoryById(db, fromStoryId)?.parent_id ?? null;
@@ -232,7 +273,7 @@ function rollUpEpics(db: DatabaseSync, fromStoryId: number): Story[] {
 		const children = getChildren(db, epic.id);
 		if (children.length === 0 || children.some(isOpen)) break;
 
-		const updated = updateStory(db, epic.id, {
+		const updated = transitionStatus(epic.id, {
 			status: "done",
 			resolution: "completed",
 			resolution_note: `All ${children.length} child stories closed.`,
@@ -319,14 +360,38 @@ export default function (pi: ExtensionAPI) {
 		// SessionStartEvent carries no cwd — the session's cwd is on the context.
 		// Reading it off the event silently resolved to undefined every time.
 		const cwd = ctx.cwd ?? process.cwd();
-		const base = cwd.startsWith("/tmp") ? process.cwd() : cwd;
-		dbPath = `${base}/.pi/stories.db`;
-		ensureDb();
+		const git = createExecGitRunner(pi);
+
+		// Paths come from the *common* git dir, so a linked worktree resolves to
+		// the main checkout's stories.db rather than opening an empty one of its
+		// own and losing the epic. See src/config.ts.
+		const paths = await resolvePaths({ cwd, git });
+		repo = await probeRepo(git, cwd);
+
+		closeDb(tracker?.db ?? null);
+		tracker = {
+			paths,
+			db: openDb(paths.dbPath),
+			git,
+			related: keywordStrategy,
+			now: () => Date.now(),
+			notify: (message, level) => {
+				if (ctx.hasUI) ctx.ui.notify(message, level);
+			},
+		};
+
+		// session_start cannot be cancelled, so an unusable repo is reported
+		// rather than enforced here; /start-epic is the gate.
+		if (!repo.isRepo && ctx.hasUI) {
+			ctx.ui.setStatus("issue-tracker-git", "not a git repository");
+		}
 		refreshStatus(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
-		closeDb();
+		closeDb(tracker?.db ?? null);
+		tracker = null;
+		repo = null;
 	});
 
 	// ── Context injection ─────────────────────────────────────────────
@@ -418,7 +483,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (primaryFocus) {
-			const related = relatedStrategy.findRelated(db, primaryFocus, 5);
+			const related = ensureTracker().related.findRelated(db, primaryFocus, 5);
 			if (related.length > 0) {
 				lines.push(`\n>>> RELATED STORIES`);
 				for (const s of related) {
@@ -428,7 +493,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Things earlier work discovered that contradicted its plan. Capped and
 			// relevance-filtered — this rides on every turn's context.
-			const lessons = relatedStrategy.findLearnings(db, primaryFocus, 3);
+			const lessons = ensureTracker().related.findLearnings(db, primaryFocus, 3);
 			if (lessons.length > 0) {
 				lines.push(`\n>>> LESSONS FROM COMPLETED WORK — these contradicted an earlier plan; check they don't apply here`);
 				for (const s of lessons) {
@@ -504,7 +569,7 @@ export default function (pi: ExtensionAPI) {
 						return { content: [{ type: "text", text: `Error: parenting #${params.story_id} to #${params.parent_story_id} would create a cycle` }], details: { action, error: "cycle" } };
 					}
 				}
-				const story = updateStory(db, params.story_id, {
+				const story = transitionStatus(params.story_id, {
 					title: params.title,
 					sub_goal: params.sub_goal,
 					proposed_changes: params.proposed_changes,
@@ -575,7 +640,7 @@ export default function (pi: ExtensionAPI) {
 						details: { action, error: "unmet dependencies", unmet },
 					};
 				}
-				const updated = updateStory(db, params.story_id, { status: "in_progress" });
+				const updated = transitionStatus(params.story_id, { status: "in_progress" });
 				if (!updated) {
 					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
 				}
@@ -659,7 +724,7 @@ export default function (pi: ExtensionAPI) {
 						details: { action, error: "open children", open: openKids.map((s) => s.id) },
 					};
 				}
-				const updated = updateStory(db, params.story_id, {
+				const updated = transitionStatus(params.story_id, {
 					status: "done",
 					resolution: params.resolution,
 					resolution_note: params.resolution_note,
@@ -677,7 +742,7 @@ export default function (pi: ExtensionAPI) {
 					if (next && next.status !== "done" && next.status !== "cancelled") {
 						const nextUnmet = next.depends_on.filter((id) => getStoryById(db, id)?.status !== "done");
 						if (nextUnmet.length === 0 && next.status !== "in_progress") {
-							updateStory(db, next.id, { status: "ready" });
+							transitionStatus(next.id, { status: "ready" });
 							nextMsg = `\n\n>>> NEXT UP: Story #${next.id} is now READY.\nTitle: ${next.title}\nSub-goal: ${next.sub_goal}\nProposed changes: ${next.proposed_changes}`;
 						} else if (nextUnmet.length > 0) {
 							nextMsg = `\n\nNext story #${next.id} (${next.title}) is still waiting on dependencies: ${nextUnmet.map((id) => `#${id}`).join(", ")}`;
@@ -686,15 +751,15 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Close any ancestor epic this completed
-				const rolledUp = rollUpEpics(db, updated.id);
-				const epicMsg = rolledUp.length
-					? `\n\n>>> EPIC COMPLETE: ${rolledUp.map((s) => `#${s.id} ${s.title}`).join(", ")}`
+				const closedParents = closeCompletedParents(db, updated.id);
+				const epicMsg = closedParents.length
+					? `\n\n>>> EPIC COMPLETE: ${closedParents.map((s) => `#${s.id} ${s.title}`).join(", ")}`
 					: "";
 
 				refreshStatus(ctx);
 				return {
 					content: [{ type: "text", text: `✓ Story #${updated.id} marked as DONE (${updated.resolution}).${epicMsg}${nextMsg}` }],
-					details: { action, story: updated, nextMessage: nextMsg, closedEpics: rolledUp },
+					details: { action, story: updated, nextMessage: nextMsg, closedEpics: closedParents },
 				};
 			}
 
@@ -793,7 +858,7 @@ export default function (pi: ExtensionAPI) {
 								updateStory(db, child.id, { parent_id: created.id });
 							}
 						}
-						updateStory(db, s.id, {
+						transitionStatus(s.id, {
 							status: "archived",
 							resolution: "superseded",
 							resolution_note: `Merged into #${created.id}`,
@@ -902,7 +967,7 @@ export default function (pi: ExtensionAPI) {
 				function setStatus(index: number, updates: Partial<Story>) {
 					const row = rows[index];
 					if (!row) return;
-					const updated = updateStory(db, row.story.id, updates);
+					const updated = transitionStatus(row.story.id, updates);
 					if (updated) rows[index] = { ...row, story: updated };
 					refresh();
 				}
@@ -1228,7 +1293,7 @@ export default function (pi: ExtensionAPI) {
 				// `draft` and the context injection reports NO ACTIVE WORK.
 				const firstReady = ids.find((id) => (getStoryById(db, id)?.depends_on.length ?? 0) === 0);
 				if (firstReady !== undefined) {
-					updateStory(db, firstReady, { status: "ready" });
+					transitionStatus(firstReady, { status: "ready" });
 				}
 
 				setAppState(db, "top_level_story_id", String(root.id));

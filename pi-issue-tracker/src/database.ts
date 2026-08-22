@@ -1,9 +1,16 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { type Story, type StoryHistoryEntry, type StoryResolution } from "./types.ts";
-
-let db: DatabaseSync | null = null;
+import {
+	type EpicBranch,
+	type EpicMode,
+	type EpicSetupRecord,
+	type EpicState,
+	type Story,
+	type StoryCommit,
+	type StoryHistoryEntry,
+	type StoryResolution,
+} from "./types.ts";
 
 /** node:sqlite does not export SQLInputValue; this covers everything we bind. */
 type SqlValue = null | number | bigint | string;
@@ -42,21 +49,60 @@ CREATE TABLE IF NOT EXISTS story_history (
   new_value TEXT,
   timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
 );
+
+-- The branch (and optionally worktree) an epic's work happens on.
+-- The setup column is JSON on purpose: new fields land there, not in a migration.
+CREATE TABLE IF NOT EXISTS epic_branches (
+  epic_id     INTEGER PRIMARY KEY,
+  mode        TEXT NOT NULL DEFAULT 'branch' CHECK(mode IN ('branch', 'worktree')),
+  branch      TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  path        TEXT,
+  state       TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active', 'merged', 'cancelled')),
+  setup       TEXT NOT NULL DEFAULT '{}',
+  created_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+  updated_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+);
+CREATE INDEX IF NOT EXISTS idx_epic_branches_state ON epic_branches(state);
+
+-- What a story started from and what it produced, so it can be undone.
+CREATE TABLE IF NOT EXISTS story_commits (
+  story_id     INTEGER PRIMARY KEY,
+  epic_id      INTEGER NOT NULL,
+  start_commit TEXT NOT NULL,
+  commit_sha   TEXT,
+  backup_ref   TEXT,
+  created_at   INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+);
+CREATE INDEX IF NOT EXISTS idx_story_commits_epic ON story_commits(epic_id);
 `;
 
-export function getDb(dbPath: string): DatabaseSync {
-	if (!db) {
-		mkdirSync(dirname(dbPath), { recursive: true });
-		db = new DatabaseSync(dbPath);
-		db.exec(INIT_SQL);
-	}
-	return db;
+/**
+ * Open a database at `dbPath`.
+ *
+ * Returns a fresh handle every call. The previous module-level singleton ignored
+ * its argument after the first call, so one process could never hold two
+ * databases — which made parallel tests impossible. Callers that want one handle
+ * per path cache it themselves.
+ */
+export function openDb(dbPath: string): DatabaseSync {
+	mkdirSync(dirname(dbPath), { recursive: true });
+	const handle = new DatabaseSync(dbPath);
+	// Several worktrees and sessions can share one file; node:sqlite defaults to
+	// a rollback journal, which turns concurrent writes into SQLITE_BUSY.
+	handle.exec("PRAGMA journal_mode = WAL;");
+	handle.exec("PRAGMA busy_timeout = 5000;");
+	handle.exec(INIT_SQL);
+	return handle;
 }
 
-export function closeDb(): void {
-	if (db) {
-		db.close();
-		db = null;
+export function closeDb(handle: DatabaseSync | null): void {
+	if (!handle) return;
+	try {
+		handle.close();
+	} catch {
+		// Already closed, or the file went away under us. Nothing to recover.
 	}
 }
 
@@ -262,4 +308,173 @@ export function setAppState(db: DatabaseSync, key: string, value: string): void 
 		"INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 	);
 	stmt.run(key, value);
+}
+
+// ─── Epic branches ──────────────────────────────────────────────────
+
+function rowToEpicBranch(row: Record<string, unknown>): EpicBranch {
+	let setup: EpicSetupRecord = {};
+	try {
+		setup = JSON.parse((row.setup as string) ?? "{}") as EpicSetupRecord;
+	} catch {
+		// A hand-edited or truncated value should not take the extension down.
+	}
+	return {
+		epic_id: row.epic_id as number,
+		mode: row.mode as EpicMode,
+		branch: row.branch as string,
+		base_branch: row.base_branch as string,
+		base_commit: row.base_commit as string,
+		path: (row.path as string | null) ?? null,
+		state: row.state as EpicState,
+		setup,
+		created_at: row.created_at as number,
+		updated_at: row.updated_at as number,
+	};
+}
+
+export type CreateEpicBranchInput = Omit<EpicBranch, "created_at" | "updated_at" | "state" | "setup"> &
+	Partial<Pick<EpicBranch, "state" | "setup">>;
+
+export function createEpicBranch(db: DatabaseSync, data: CreateEpicBranchInput): EpicBranch {
+	const stmt = db.prepare(
+		`INSERT INTO epic_branches (epic_id, mode, branch, base_branch, base_commit, path, state, setup)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING *`,
+	);
+	const row = stmt.get(
+		data.epic_id,
+		data.mode,
+		data.branch,
+		data.base_branch,
+		data.base_commit,
+		data.path,
+		data.state ?? "active",
+		JSON.stringify(data.setup ?? {}),
+	) as Record<string, unknown>;
+	return rowToEpicBranch(row);
+}
+
+export function getEpicBranch(db: DatabaseSync, epicId: number): EpicBranch | null {
+	const row = db.prepare("SELECT * FROM epic_branches WHERE epic_id = ?").get(epicId) as
+		| Record<string, unknown>
+		| undefined;
+	return row ? rowToEpicBranch(row) : null;
+}
+
+/**
+ * The epic currently being worked on. At most one is active in branch mode;
+ * worktree mode allows several, so this returns the most recently started.
+ */
+export function getActiveEpicBranch(db: DatabaseSync): EpicBranch | null {
+	const row = db
+		.prepare("SELECT * FROM epic_branches WHERE state = 'active' ORDER BY created_at DESC, epic_id DESC LIMIT 1")
+		.get() as Record<string, unknown> | undefined;
+	return row ? rowToEpicBranch(row) : null;
+}
+
+export function getEpicBranchesByState(db: DatabaseSync, state: EpicState): EpicBranch[] {
+	const rows = db
+		.prepare("SELECT * FROM epic_branches WHERE state = ? ORDER BY created_at ASC")
+		.all(state) as Record<string, unknown>[];
+	return rows.map(rowToEpicBranch);
+}
+
+/** Find the epic whose worktree contains `path`, so a session can tell where it is. */
+export function getEpicBranchByPath(db: DatabaseSync, path: string): EpicBranch | null {
+	const row = db.prepare("SELECT * FROM epic_branches WHERE path = ?").get(path) as
+		| Record<string, unknown>
+		| undefined;
+	return row ? rowToEpicBranch(row) : null;
+}
+
+export function updateEpicBranch(
+	db: DatabaseSync,
+	epicId: number,
+	updates: Partial<Pick<EpicBranch, "state" | "setup" | "path" | "base_commit">>,
+): EpicBranch | null {
+	const setClauses: string[] = [];
+	const values: SqlValue[] = [];
+	for (const [key, value] of Object.entries(updates)) {
+		if (value === undefined) continue;
+		setClauses.push(`${key} = ?`);
+		values.push(key === "setup" ? JSON.stringify(value) : (value as SqlValue));
+	}
+	if (setClauses.length === 0) return getEpicBranch(db, epicId);
+
+	setClauses.push(`updated_at = strftime('%s', 'now') * 1000`);
+	values.push(epicId);
+	const row = db
+		.prepare(`UPDATE epic_branches SET ${setClauses.join(", ")} WHERE epic_id = ? RETURNING *`)
+		.get(...values) as Record<string, unknown> | undefined;
+	return row ? rowToEpicBranch(row) : null;
+}
+
+// ─── Story commits ──────────────────────────────────────────────────
+
+function rowToStoryCommit(row: Record<string, unknown>): StoryCommit {
+	return {
+		story_id: row.story_id as number,
+		epic_id: row.epic_id as number,
+		start_commit: row.start_commit as string,
+		commit_sha: (row.commit_sha as string | null) ?? null,
+		backup_ref: (row.backup_ref as string | null) ?? null,
+		created_at: row.created_at as number,
+	};
+}
+
+/**
+ * Record where a story began. Re-starting a story keeps the original
+ * `start_commit`: it is the undo target, and moving it would strand the work
+ * done in the first attempt.
+ */
+export function recordStoryStart(
+	db: DatabaseSync,
+	storyId: number,
+	epicId: number,
+	startCommit: string,
+): StoryCommit {
+	const row = db
+		.prepare(
+			`INSERT INTO story_commits (story_id, epic_id, start_commit) VALUES (?, ?, ?)
+       ON CONFLICT(story_id) DO UPDATE SET epic_id = excluded.epic_id
+       RETURNING *`,
+		)
+		.get(storyId, epicId, startCommit) as Record<string, unknown>;
+	return rowToStoryCommit(row);
+}
+
+export function recordStoryCommit(
+	db: DatabaseSync,
+	storyId: number,
+	updates: { commit_sha?: string | null; backup_ref?: string | null },
+): StoryCommit | null {
+	const setClauses: string[] = [];
+	const values: SqlValue[] = [];
+	for (const [key, value] of Object.entries(updates)) {
+		if (value === undefined) continue;
+		setClauses.push(`${key} = ?`);
+		values.push(value as SqlValue);
+	}
+	if (setClauses.length === 0) return getStoryCommit(db, storyId);
+
+	values.push(storyId);
+	const row = db
+		.prepare(`UPDATE story_commits SET ${setClauses.join(", ")} WHERE story_id = ? RETURNING *`)
+		.get(...values) as Record<string, unknown> | undefined;
+	return row ? rowToStoryCommit(row) : null;
+}
+
+export function getStoryCommit(db: DatabaseSync, storyId: number): StoryCommit | null {
+	const row = db.prepare("SELECT * FROM story_commits WHERE story_id = ?").get(storyId) as
+		| Record<string, unknown>
+		| undefined;
+	return row ? rowToStoryCommit(row) : null;
+}
+
+export function getStoryCommitsForEpic(db: DatabaseSync, epicId: number): StoryCommit[] {
+	const rows = db
+		.prepare("SELECT * FROM story_commits WHERE epic_id = ? ORDER BY created_at ASC")
+		.all(epicId) as Record<string, unknown>[];
+	return rows.map(rowToStoryCommit);
 }
