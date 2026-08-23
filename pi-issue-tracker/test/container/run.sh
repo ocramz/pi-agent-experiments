@@ -42,6 +42,25 @@ if ! command -v "$ENGINE" >/dev/null 2>&1; then
 	exit 127
 fi
 
+# The inner image store must be a dedicated volume. Without one every layer a
+# pull or build writes lands on the dev container's overlay — 8 GB, shared with
+# the toolchain — and fills it silently; that is how this rig once ate 2.1 GB.
+# `make dev` mounts STORAGE_VOL there; a container started any other way does not.
+# This runs before the smoke test below, which would itself write into the store.
+# Only meaningful when nested: on a CI runner podman is not itself in a container
+# and its graphroot is legitimately a plain directory.
+if [ -z "${PI_ALLOW_UNMOUNTED_STORE:-}" ] && { [ -f /run/.containerenv ] || [ -f /.dockerenv ]; }; then
+	graphroot="$("$ENGINE" info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
+	if [ -n "$graphroot" ] && command -v findmnt >/dev/null 2>&1 &&
+		[ "$(findmnt -T "$graphroot" -no TARGET 2>/dev/null)" != "$graphroot" ]; then
+		echo "the inner image store '$graphroot' is not a mounted volume." >&2
+		echo "Pulling into it fills this container's overlay filesystem." >&2
+		echo "Start the dev container with 'make dev', which mounts STORAGE_VOL there." >&2
+		echo "Set PI_ALLOW_UNMOUNTED_STORE=1 to run anyway." >&2
+		exit 1
+	fi
+fi
+
 # Prove the engine can actually start a container before running any suite.
 # Without this, a sandbox that blocks mount propagation or lacks /dev/fuse makes
 # every assertion fail and the run reports "git capability probe failed" — which

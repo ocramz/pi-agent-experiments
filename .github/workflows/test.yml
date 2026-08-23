@@ -19,9 +19,14 @@ jobs:
           # Node 24 strips TypeScript types natively, so there is no build step
           # and no test-framework dependency to install.
           node-version: "24"
-          # Only the type-check installs anything, and what it installs is large.
+          # The type-check is the only step here that installs anything, but it
+          # installs two scopes: the compiler and pi's declarations, which are
+          # large, and the interactive tier's own dependencies, which are small
+          # but which tsconfig.json's `include` reaches — see the note there.
           cache: npm
-          cache-dependency-path: pi-issue-tracker/tools/typecheck/package-lock.json
+          cache-dependency-path: |
+            pi-issue-tracker/tools/typecheck/package-lock.json
+            pi-issue-tracker/test/tui/package-lock.json
       - run: npm test
       # Type-checks the extension against pi's real declarations, which the
       # script installs into tools/typecheck. Without them the pi types degrade

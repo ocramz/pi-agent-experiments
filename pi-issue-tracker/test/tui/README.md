@@ -35,6 +35,8 @@ node --test test/tui/start-epic.test.ts    # one group
 `npm run test:tui` installs this directory's own `node_modules` first. That scope is deliberate:
 the package's `node_modules/@earendil-works/*` are symlinks into the container's global pi
 install, and an `npm install` at the package root would reify that tree and prune them.
+`npm run typecheck` installs it too — the root `tsconfig.json` type-checks these files, so the
+compiler needs the same scope Node does.
 
 Three cases — B1, B3 and I1 — drive a real model and need `OPENROUTER_API_KEY`, which
 `make test-tui` passes from `.env`. Without it [live.test.ts](live.test.ts) fails the run rather

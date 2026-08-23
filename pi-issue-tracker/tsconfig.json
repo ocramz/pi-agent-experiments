@@ -41,5 +41,15 @@
 			"typebox": ["./tools/typecheck/node_modules/typebox/build/index.d.mts"]
 		}
 	},
+	// The third pattern reaches test/tui, whose harness imports
+	// `cli-testing-library` and `strip-ansi` from test/tui/node_modules — a scope
+	// the package root deliberately does not carry; see the description in
+	// test/tui/package.json for why it sits off to one side. Nothing configured
+	// here points at it: node's own directory walk finds it from the importing
+	// file, and the compiler follows the same walk. So the check needs that scope
+	// installed, which is why the `typecheck` script installs it alongside
+	// tools/typecheck. Missing, it fails loudly rather than degrading to `any` —
+	// the opposite of the pi declarations above, and the reason this only ever
+	// broke on a clean checkout.
 	"include": ["src/**/*.ts", "extensions/**/*.ts", "test/**/*.ts"]
 }

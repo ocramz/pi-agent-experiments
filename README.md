@@ -59,6 +59,14 @@ quietly.
   65532. `stage_pkg` in `pi-issue-tracker/test/container/lib.sh` copies the
   package and normalises modes before mounting it. Without that the in-image
   suite copies nothing and passes vacuously — which is exactly what it used to do.
+- **`make dev` is the only supported way into the dev container.** The inner
+  podman's image store has to be the `pi-dev-storage` volume the Makefile mounts
+  at `/var/lib/containers/storage`. Started any other way — VS Code's "Reopen in
+  Container" used to do this — the store lands on the container's own 8 GB
+  overlay and the test rig quietly fills it; that cost 2.1 GB once. There is no
+  `devcontainer.json` for this reason. `run.sh` now refuses to start when it is
+  nested and the store is not a mounted volume; `PI_ALLOW_UNMOUNTED_STORE=1`
+  overrides. Attach VS Code to the running `pi-dev` container instead.
 - **Every live pi call has a time budget** (`PI_TIMEOUT`, 240s). One run once
   blocked for twenty minutes on `grep -r "strand its work" /`: the branch guard
   had blocked the model, and it went looking through the whole filesystem for the

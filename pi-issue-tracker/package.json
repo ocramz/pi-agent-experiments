@@ -13,7 +13,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test 'test/*.test.ts'",
-    "typecheck": "npm --prefix tools/typecheck install --no-audit --no-fund --silent && node tools/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "typecheck": "npm --prefix tools/typecheck install --no-audit --no-fund --silent && npm --prefix test/tui install --no-audit --no-fund --silent && node tools/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
     "test:container": "test/container/run.sh",
     "test:tui": "npm --prefix test/tui install --no-audit --no-fund --silent && node --test 'test/tui/*.test.ts'"
   },
