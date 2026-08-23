@@ -189,10 +189,215 @@ export function storyCommitMessage(story: Story): CommitMessage {
 	if (story.sub_goal) bodyLines.push(story.sub_goal);
 	if (story.resolution_note) bodyLines.push(`Resolution: ${story.resolution_note}`);
 	if (story.learnings) bodyLines.push(`Learned: ${story.learnings}`);
+	// The handoff note rides into git history on purpose: stories.db has no
+	// migrations and is deleted whenever a column is added, so the commit is the
+	// copy of this that survives.
+	if (story.handoff_notes) bodyLines.push(`Handoff: ${story.handoff_notes}`);
 	return {
 		subject: `story(#${story.id}): ${story.title}${resolution}`,
 		body: bodyLines.join("\n\n"),
 	};
+}
+
+// ── Review ──────────────────────────────────────────────────────────
+
+/**
+ * One thing a review noticed.
+ *
+ * A `blocker` is a mechanical fact — the story is an epic, its dependencies
+ * form a cycle, `verify` failed. No reviewer, independent or self, may record
+ * `approved` while one stands; that is what stops a review being a rubber
+ * stamp. A `note` is context for whoever judges, and blocks nothing.
+ */
+export interface ReviewFinding {
+	severity: "blocker" | "note";
+	message: string;
+}
+
+export function hasBlocker(findings: ReviewFinding[]): boolean {
+	return findings.some((finding) => finding.severity === "blocker");
+}
+
+/** Render findings for a model or a human. Empty reads as a clean bill. */
+export function formatFindings(findings: ReviewFinding[]): string {
+	if (findings.length === 0) return "No mechanical findings.";
+	return findings
+		.map((finding) => `${finding.severity === "blocker" ? "BLOCKER" : "note"}: ${finding.message}`)
+		.join("\n");
+}
+
+/**
+ * The first cycle reachable from `startId` by following `edges`, or null.
+ *
+ * `wouldCreateCycle` guards `parent_id` only, so nothing has ever checked
+ * `depends_on` or `next_id`. That was survivable while `/plan-stories` built
+ * every graph — `repairStoryGraph` only ever emits backward references. Once an
+ * agent authors its own links it can write A→B→A, and every gate then refuses
+ * forever with no way back except editing the row by hand.
+ *
+ * Returns the cycle in visit order, so the message can name it.
+ */
+export function findCycle(startId: number, edges: (id: number) => number[]): number[] | null {
+	const path: number[] = [];
+	const onPath = new Set<number>();
+	const done = new Set<number>();
+
+	const walk = (id: number): number[] | null => {
+		if (onPath.has(id)) return [...path.slice(path.indexOf(id)), id];
+		if (done.has(id)) return null;
+		onPath.add(id);
+		path.push(id);
+		for (const next of edges(id)) {
+			const found = walk(next);
+			if (found) return found;
+		}
+		path.pop();
+		onPath.delete(id);
+		done.add(id);
+		return null;
+	};
+
+	return walk(startId);
+}
+
+/** Just enough of the graph to review a story's plan without a database. */
+export interface PlanReviewInput {
+	story: Story;
+	/** Direct children. Non-empty means the story is an epic. */
+	children: Story[];
+	/** Every story, for resolving `depends_on` and `next_id` edges. */
+	all: Story[];
+	/** Open stories that look like near-duplicates, already scored by the caller. */
+	similar?: Story[];
+}
+
+const MIN_PROPOSED_CHANGES = 20;
+
+/**
+ * Mechanical findings on a story's plan — is it worth starting as written?
+ *
+ * Pure so every branch is testable without a repository, a database or a model,
+ * and so the same findings reach the reviewer model, the self-review path and
+ * `/review-story` from one place.
+ */
+export function reviewPlan(input: PlanReviewInput): ReviewFinding[] {
+	const { story, children, all, similar = [] } = input;
+	const findings: ReviewFinding[] = [];
+	const byId = new Map(all.map((s) => [s.id, s]));
+
+	if (children.length > 0) {
+		findings.push({
+			severity: "blocker",
+			message: `#${story.id} is an epic with ${children.length} child ${children.length === 1 ? "story" : "stories"}, not a unit of work. Epics are never handed out; review and start a child instead.`,
+		});
+	}
+
+	const missing = story.depends_on.filter((id) => !byId.has(id));
+	if (missing.length > 0) {
+		findings.push({
+			severity: "blocker",
+			message: `depends_on references ${missing.map((id) => `#${id}`).join(", ")}, which ${missing.length === 1 ? "does" : "do"} not exist. Drop or correct the reference.`,
+		});
+	}
+
+	const depCycle = findCycle(story.id, (id) => byId.get(id)?.depends_on ?? []);
+	if (depCycle) {
+		findings.push({
+			severity: "blocker",
+			message: `dependency cycle: ${depCycle.map((id) => `#${id}`).join(" → ")}. Nothing in this cycle can ever start — break it before working.`,
+		});
+	}
+
+	const nextCycle = findCycle(story.id, (id) => {
+		const next = byId.get(id)?.next_id;
+		return next == null ? [] : [next];
+	});
+	if (nextCycle) {
+		findings.push({
+			severity: "blocker",
+			message: `next_id cycle: ${nextCycle.map((id) => `#${id}`).join(" → ")}. Closing any of these would promote the chain forever.`,
+		});
+	}
+
+	const deadDeps = story.depends_on
+		.map((id) => byId.get(id))
+		.filter((dep): dep is Story => !!dep && (dep.status === "cancelled" || dep.status === "archived"));
+	if (deadDeps.length > 0) {
+		findings.push({
+			severity: "note",
+			message: `depends on ${deadDeps.map((s) => `#${s.id} (${s.status})`).join(", ")} — a dependency that is not \`done\` never unblocks this story.`,
+		});
+	}
+
+	if (story.proposed_changes.trim().length < MIN_PROPOSED_CHANGES) {
+		findings.push({
+			severity: "note",
+			message: "proposed_changes is empty or too short to act on. Say which files or behaviour change.",
+		});
+	}
+
+	if (story.parent_id === null) {
+		findings.push({
+			severity: "note",
+			message: "no parent — this story belongs to no epic, so it will not be committed to an epic branch or close one.",
+		});
+	}
+
+	const dupes = similar.filter((s) => s.id !== story.id);
+	if (dupes.length > 0) {
+		findings.push({
+			severity: "note",
+			message: `possible overlap with ${dupes.map((s) => `#${s.id} ${s.title}`).join("; ")}. Consider \`simplify\` if this duplicates them.`,
+		});
+	}
+
+	return findings;
+}
+
+/** What the working tree holds, and what `verify` made of it. */
+export interface WorkReviewInput {
+	story: Story;
+	/** From `changeStats` — the files a commit would sweep up. */
+	changedFiles: string[];
+	totalBytes: number;
+	/** Null when `.pi/epic.json` declares no `verify` command. */
+	verify: { command: string; ok: boolean; output: string } | null;
+	maxFiles?: number;
+	maxBytes?: number;
+}
+
+/** Mechanical findings on the work a story produced — does it deserve to close? */
+export function reviewWork(input: WorkReviewInput): ReviewFinding[] {
+	const findings: ReviewFinding[] = [];
+
+	if (input.verify && !input.verify.ok) {
+		findings.push({
+			severity: "blocker",
+			message: `verify failed (\`${input.verify.command}\`):\n${input.verify.output.trim().slice(-2000)}`,
+		});
+	}
+
+	if (input.changedFiles.length === 0) {
+		findings.push({
+			severity: "note",
+			message: "the working tree is clean — this story changed nothing. If that is right, close it as obsolete or wontfix rather than completed.",
+		});
+	}
+
+	const size = checkStageSize({
+		fileCount: input.changedFiles.length,
+		totalBytes: input.totalBytes,
+		maxFiles: input.maxFiles,
+		maxBytes: input.maxBytes,
+	});
+	if (!size.ok) {
+		findings.push({
+			severity: "blocker",
+			message: `${size.reason}. The commit would be refused; split the story or remove what does not belong.`,
+		});
+	}
+
+	return findings;
 }
 
 export type UndoStrategy =

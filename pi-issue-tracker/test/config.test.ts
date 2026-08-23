@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { readManifest, resolvePaths } from "../src/config.ts";
+import { describeReviewerConfig, readManifest, resolvePaths, resolveReviewer } from "../src/config.ts";
 import { resolveRepoRoot } from "../src/git.ts";
 import { createTempRepo, type TempRepo } from "./helpers/repo.ts";
 
@@ -113,5 +113,90 @@ describe("readManifest", () => {
 		assert.deepEqual(readManifest(join(r.dir, "nope.json")), {});
 		writeFileSync(join(r.dir, "bad.json"), "{not json");
 		assert.deepEqual(readManifest(join(r.dir, "bad.json")), {});
+	});
+});
+
+describe("resolveReviewer", () => {
+	const settings = (dir: string, tracker: Record<string, unknown>) => {
+		mkdirSync(join(dir, ".pi"), { recursive: true });
+		writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ tracker }));
+	};
+
+	// Off by default: two extra model calls per story is not a cost to impose
+	// without being asked for it.
+	it("returns null when nothing is configured — self-review is the default", async () => {
+		const r = await repo();
+		assert.equal(resolveReviewer({ repoRoot: r.dir, env: {} }), null);
+	});
+
+	it("reads both halves from settings.json", async () => {
+		const r = await repo();
+		settings(r.dir, { reviewProvider: "openrouter", reviewModel: "anthropic/claude-sonnet-5" });
+		assert.deepEqual(resolveReviewer({ repoRoot: r.dir, env: {} }), {
+			provider: "openrouter",
+			modelId: "anthropic/claude-sonnet-5",
+		});
+	});
+
+	it("lets the environment beat settings.json", async () => {
+		const r = await repo();
+		settings(r.dir, { reviewProvider: "openrouter", reviewModel: "from-settings" });
+		const choice = resolveReviewer({
+			repoRoot: r.dir,
+			env: { PI_TRACKER_REVIEW_MODEL: "from-env" },
+		});
+		assert.equal(choice?.modelId, "from-env");
+		assert.equal(choice?.provider, "openrouter", "the unset half still falls through");
+	});
+
+	it("lets explicit overrides beat the environment", async () => {
+		const r = await repo();
+		const choice = resolveReviewer({
+			repoRoot: r.dir,
+			overrides: { reviewProvider: "a", reviewModel: "b" },
+			env: { PI_TRACKER_REVIEW_PROVIDER: "x", PI_TRACKER_REVIEW_MODEL: "y" },
+		});
+		assert.deepEqual(choice, { provider: "a", modelId: "b" });
+	});
+
+	it("needs both halves — a provider alone is not a reviewer", async () => {
+		const r = await repo();
+		assert.equal(resolveReviewer({ repoRoot: r.dir, env: { PI_TRACKER_REVIEW_PROVIDER: "openrouter" } }), null);
+	});
+
+	it("treats a blank value as unset", async () => {
+		const r = await repo();
+		settings(r.dir, { reviewProvider: "  ", reviewModel: "  " });
+		assert.equal(resolveReviewer({ repoRoot: r.dir, env: {} }), null);
+	});
+});
+
+describe("describeReviewerConfig", () => {
+	it("is content with nothing configured", async () => {
+		const r = await repo();
+		assert.deepEqual(describeReviewerConfig({ repoRoot: r.dir, env: {} }), { ok: true });
+	});
+
+	it("is content with both halves", async () => {
+		const r = await repo();
+		const env = { PI_TRACKER_REVIEW_PROVIDER: "openrouter", PI_TRACKER_REVIEW_MODEL: "m" };
+		assert.deepEqual(describeReviewerConfig({ repoRoot: r.dir, env }), { ok: true });
+	});
+
+	/**
+	 * A half-configured reviewer must not quietly become self-review: the user
+	 * asked for an independent one and would otherwise never find out.
+	 */
+	it("names the missing half rather than silently falling back", async () => {
+		const r = await repo();
+		const result = describeReviewerConfig({ repoRoot: r.dir, env: { PI_TRACKER_REVIEW_PROVIDER: "openrouter" } });
+		assert.equal(result.ok, false);
+		assert.match(result.ok === false ? result.reason : "", /PI_TRACKER_REVIEW_MODEL is not set/);
+	});
+
+	it("names the other missing half too", async () => {
+		const r = await repo();
+		const result = describeReviewerConfig({ repoRoot: r.dir, env: { PI_TRACKER_REVIEW_MODEL: "m" } });
+		assert.match(result.ok === false ? result.reason : "", /PI_TRACKER_REVIEW_PROVIDER is not set/);
 	});
 });

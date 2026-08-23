@@ -8,12 +8,17 @@ import {
 	checkpointRefPrefix,
 	chooseUndoStrategy,
 	epicBranchName,
+	findCycle,
+	formatFindings,
 	isBranchEscapingCommand,
 	refsToPrune,
+	reviewPlan,
+	reviewWork,
 	slugify,
 	storyCommitMessage,
 	worktreeDirName,
 	type ActiveEpicSummary,
+	type ReviewFinding,
 } from "../src/rules.ts";
 import type { EpicBranch, Story, StoryCommit } from "../src/types.ts";
 
@@ -31,6 +36,8 @@ function story(overrides: Partial<Story> = {}): Story {
 		resolution: null,
 		resolution_note: null,
 		learnings: null,
+		review: {},
+		handoff_notes: null,
 		created_at: 0,
 		updated_at: 0,
 		...overrides,
@@ -255,6 +262,19 @@ describe("storyCommitMessage", () => {
 	it("omits the resolution marker while the story is still open", () => {
 		assert.equal(storyCommitMessage(story()).subject, "story(#12): Add auth");
 	});
+
+	// stories.db has no migrations and is deleted whenever a column is added, so
+	// the commit is the copy of the handoff note that survives.
+	it("carries the handoff note into the commit body", () => {
+		const message = storyCommitMessage(
+			story({ resolution: "completed", handoff_notes: "the limiter is keyed by IP, not by token" }),
+		);
+		assert.match(message.body, /Handoff: the limiter is keyed by IP, not by token/);
+	});
+
+	it("omits the handoff line when there is none", () => {
+		assert.doesNotMatch(storyCommitMessage(story({ resolution: "completed" })).body, /Handoff:/);
+	});
 });
 
 describe("chooseUndoStrategy", () => {
@@ -319,4 +339,149 @@ describe("isBranchEscapingCommand", () => {
 	]) {
 		it(`allows: ${command}`, () => assert.equal(isBranchEscapingCommand(command), false));
 	}
+});
+
+describe("findCycle", () => {
+	const graph = (edges: Record<number, number[]>) => (id: number) => edges[id] ?? [];
+
+	it("finds nothing in a chain", () => {
+		assert.equal(findCycle(1, graph({ 1: [2], 2: [3], 3: [] })), null);
+	});
+
+	it("finds nothing in a diamond — a DAG is not a cycle", () => {
+		assert.equal(findCycle(1, graph({ 1: [2, 3], 2: [4], 3: [4], 4: [] })), null);
+	});
+
+	it("finds a self-loop", () => {
+		assert.deepEqual(findCycle(1, graph({ 1: [1] })), [1, 1]);
+	});
+
+	it("finds a two-node cycle", () => {
+		assert.deepEqual(findCycle(1, graph({ 1: [2], 2: [1] })), [1, 2, 1]);
+	});
+
+	it("finds a three-node cycle and reports it in visit order", () => {
+		assert.deepEqual(findCycle(1, graph({ 1: [2], 2: [3], 3: [1] })), [1, 2, 3, 1]);
+	});
+
+	it("finds a cycle that does not include the start node", () => {
+		assert.deepEqual(findCycle(1, graph({ 1: [2], 2: [3], 3: [2] })), [2, 3, 2]);
+	});
+
+	it("treats a missing node as a dead end rather than throwing", () => {
+		assert.equal(findCycle(1, graph({ 1: [99] })), null);
+	});
+});
+
+describe("reviewPlan", () => {
+	const messages = (findings: ReviewFinding[]) => findings.map((f) => f.message).join("\n");
+	const blockers = (findings: ReviewFinding[]) => findings.filter((f) => f.severity === "blocker");
+
+	const good = story({
+		id: 1,
+		parent_id: 9,
+		proposed_changes: "add src/limiter.ts and wire it into the router",
+	});
+
+	it("passes a well-formed leaf story with no findings", () => {
+		assert.deepEqual(reviewPlan({ story: good, children: [], all: [good] }), []);
+	});
+
+	it("blocks an epic — epics are never handed out as work", () => {
+		const child = story({ id: 2, parent_id: 1 });
+		const findings = reviewPlan({ story: good, children: [child], all: [good, child] });
+		assert.equal(blockers(findings).length, 1);
+		assert.match(messages(findings), /is an epic with 1 child story/);
+	});
+
+	it("blocks a dependency that does not exist", () => {
+		const s = story({ ...good, depends_on: [404] });
+		const findings = reviewPlan({ story: s, children: [], all: [s] });
+		assert.match(messages(blockers(findings)), /#404, which does not exist/);
+	});
+
+	it("blocks a dependency cycle — the deadlock nothing else catches", () => {
+		const a = story({ id: 1, parent_id: 9, depends_on: [2], proposed_changes: "a".repeat(30) });
+		const b = story({ id: 2, parent_id: 9, depends_on: [1], proposed_changes: "b".repeat(30) });
+		const findings = reviewPlan({ story: a, children: [], all: [a, b] });
+		assert.match(messages(blockers(findings)), /dependency cycle: #1 → #2 → #1/);
+	});
+
+	it("blocks a next_id cycle", () => {
+		const a = story({ id: 1, parent_id: 9, next_id: 2, proposed_changes: "a".repeat(30) });
+		const b = story({ id: 2, parent_id: 9, next_id: 1, proposed_changes: "b".repeat(30) });
+		const findings = reviewPlan({ story: a, children: [], all: [a, b] });
+		assert.match(messages(blockers(findings)), /next_id cycle: #1 → #2 → #1/);
+	});
+
+	it("notes a dependency that can never complete, without blocking", () => {
+		const dead = story({ id: 2, status: "cancelled" });
+		const s = story({ ...good, depends_on: [2] });
+		const findings = reviewPlan({ story: s, children: [], all: [s, dead] });
+		assert.equal(blockers(findings).length, 0);
+		assert.match(messages(findings), /#2 \(cancelled\)/);
+	});
+
+	it("notes proposed_changes too short to act on", () => {
+		const s = story({ ...good, proposed_changes: "fix it" });
+		assert.match(messages(reviewPlan({ story: s, children: [], all: [s] })), /too short to act on/);
+	});
+
+	it("notes a story detached from the tree", () => {
+		const s = story({ ...good, parent_id: null });
+		assert.match(messages(reviewPlan({ story: s, children: [], all: [s] })), /belongs to no epic/);
+	});
+
+	it("notes possible duplicates and excludes the story itself", () => {
+		const other = story({ id: 5, title: "Also rate limiting" });
+		const findings = reviewPlan({ story: good, children: [], all: [good], similar: [good, other] });
+		assert.match(messages(findings), /possible overlap with #5 Also rate limiting/);
+		assert.doesNotMatch(messages(findings), /#1 Add auth/);
+	});
+});
+
+describe("reviewWork", () => {
+	const s = story();
+	const clean = { story: s, changedFiles: ["src/a.ts"], totalBytes: 100, verify: null };
+
+	it("passes changed files with no verify configured", () => {
+		assert.deepEqual(reviewWork(clean), []);
+	});
+
+	it("blocks a failing verify and carries its output", () => {
+		const findings = reviewWork({ ...clean, verify: { command: "npm test", ok: false, output: "1 failing" } });
+		assert.equal(findings[0].severity, "blocker");
+		assert.match(findings[0].message, /verify failed \(`npm test`\)/);
+		assert.match(findings[0].message, /1 failing/);
+	});
+
+	it("passes a verify that succeeds", () => {
+		assert.deepEqual(reviewWork({ ...clean, verify: { command: "npm test", ok: true, output: "ok" } }), []);
+	});
+
+	it("notes a clean tree without blocking — closing as obsolete is legitimate", () => {
+		const findings = reviewWork({ ...clean, changedFiles: [], totalBytes: 0 });
+		assert.equal(findings.filter((f) => f.severity === "blocker").length, 0);
+		assert.match(findings[0].message, /changed nothing/);
+	});
+
+	it("blocks a commit the stage guard would refuse anyway", () => {
+		const findings = reviewWork({ ...clean, changedFiles: Array(600).fill("f.ts"), maxFiles: 500 });
+		assert.equal(findings[0].severity, "blocker");
+		assert.match(findings[0].message, /600 changed files exceeds the limit of 500/);
+	});
+});
+
+describe("formatFindings", () => {
+	it("reads as a clean bill when there is nothing to say", () => {
+		assert.equal(formatFindings([]), "No mechanical findings.");
+	});
+
+	it("marks blockers distinctly from notes", () => {
+		const text = formatFindings([
+			{ severity: "blocker", message: "cycle" },
+			{ severity: "note", message: "short" },
+		]);
+		assert.equal(text, "BLOCKER: cycle\nnote: short");
+	});
 });

@@ -38,8 +38,13 @@ PI_TUI_KEEP=1 node --test test/tui/merge-epic.test.ts   # keep the fixture and p
 
 `make check` **calls a LLM API and costs money**: an extension only exists inside a running pi
 session, so the only coverage `extensions/index.ts` has is a real model driving it. Three tiers
-spend money — `test/container/test_extension_live.sh`, and cases B1/B3/I1/W10 in `test/tui/`.
+spend money — `test/container/test_extension_live.sh` (four blocks: the story tool, the two hooks,
+the autonomous review cycle, and the independent reviewer), and cases B1/B3/I1/W10 in `test/tui/`.
 `PI_TUI_SKIP_LIVE=1` opts the interactive tier out (used by the fork CI job).
+
+The reviewer block calls a *second* model per review. `PI_REVIEW_PROVIDER`/`PI_REVIEW_MODEL` default
+to the working model (see [shared/versions.env](shared/versions.env)), so it costs one extra call and
+no second pin; set them to review with something genuinely different.
 
 ## Repo-wide invariants
 
@@ -88,7 +93,7 @@ Four tiers, each covering what the one below structurally cannot:
 |---|---|---|
 | unit | `npm test` | `src/`, against a temp repo built under `mkdtemp` with `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`HOME` redirected into it |
 | types | `npm run typecheck` | `src/`, `extensions/`, `test/` against pi's real declarations |
-| interactive | `npm run test:tui` | the ten slash commands and the story board — pi dispatches commands from its TUI alone, so cases run pi under `script(1)` in a pty |
+| interactive | `npm run test:tui` | the eleven slash commands and the story board — pi dispatches commands from its TUI alone, so cases run pi under `script(1)` in a pty |
 | container | `npm run test:container` | the same unit suites in the pinned distroless image, then a real model driving the extension |
 
 Interactive cases: build a fixture by calling `src/` (not by scripting git), drive pi, `close()`,

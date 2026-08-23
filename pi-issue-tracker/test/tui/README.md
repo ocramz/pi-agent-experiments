@@ -62,7 +62,7 @@ walking up from the importing file. `npm run typecheck` installs it too — this
 `tsconfig.json` type-checks the shared harness along with these files, so the compiler needs the
 same scope node does.
 
-Three cases — B1, B3 and I1 — drive a real model and need `OPENROUTER_API_KEY`, which
+Four cases — B1, B3, I1 and W10 — drive a real model and need `OPENROUTER_API_KEY`, which
 `make test-tui` passes from `.env`. Without it [live.test.ts](live.test.ts) fails the run rather
 than skipping quietly; `PI_TUI_SKIP_LIVE=1` is the explicit opt-out, used by the fork CI job.
 
@@ -70,8 +70,9 @@ than skipping quietly; `PI_TUI_SKIP_LIVE=1` is the explicit opt-out, used by the
 
 | File | Cases | Covers |
 |---|---|---|
-| [board.test.ts](board.test.ts) | A1–A5 | `/stories`: rendering, arrows, `r` `s` `d` `x`, `escape`. A5 is the important one — closing a story inside an active epic is the only route from a keystroke to a git commit |
-| [commands.test.ts](commands.test.ts) | B2, C1–C5 | `/plan-stories` usage, `/top-story`, `/export-stories` |
+| [board.test.ts](board.test.ts) | A1–A8 | `/stories`: rendering, arrows, `r` `s` `d` `x`, `escape`, review markers and handoff notes. A5 is the important one — closing a story inside an active epic is the only route from a keystroke to a git commit. A8 pins the board's deliberate bypass of the review gates |
+| [commands.test.ts](commands.test.ts) | B2, C1–C6 | `/plan-stories` usage, `/top-story`, `/export-stories` |
+| [review-story.test.ts](review-story.test.ts) | J1–J8 | `/review-story`: the mechanical half of both review gates. The gates themselves are tool actions and unreachable from the TUI, so this covers the shared `reviewPlan`/`reviewWork` path — deterministically, with no model |
 | [start-epic.test.ts](start-epic.test.ts) | D1–D9 | One case per refusal in `checkCanStartEpic`, plus the dirty-tree prompt both ways and flag parsing |
 | [merge-epic.test.ts](merge-epic.test.ts) | E1–E5, F1–F2 | `/merge-epic` confirm, decline, base-moved, conflict, already-merged; `/cancel-epic` |
 | [undo.test.ts](undo.test.ts) | G1–G4, H1–H2, I2–I3 | `/undo-story` reset and revert paths, `/undo-merge`, `/undo-turn` |

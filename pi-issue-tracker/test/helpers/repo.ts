@@ -3,7 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { resolvePaths } from "../../src/config.ts";
-import type { GitResult, GitRunner, ShellRunner, TrackerContext } from "../../src/context.ts";
+import type {
+	GitResult,
+	GitRunner,
+	ReviewReply,
+	ReviewRequest,
+	ReviewerRunner,
+	ShellRunner,
+	TrackerContext,
+} from "../../src/context.ts";
 import { openDb } from "../../src/database.ts";
 import { createLocalGitRunner, createLocalShellRunner } from "../../src/git.ts";
 import { keywordStrategy } from "../../src/related.ts";
@@ -152,4 +160,34 @@ export function createRecordingGitRunner(
 	}) as GitRunner & { calls: string[][] };
 	runner.calls = calls;
 	return runner;
+}
+
+/**
+ * A reviewer that answers from a script instead of calling a model.
+ *
+ * The independent-review path is the part of this extension most expensive to
+ * exercise for real — a second model call per review — and least deterministic.
+ * With this, every branch of it (approve, request changes, unparseable prose,
+ * transport failure) runs in the unit tier for free, and the live tier only has
+ * to prove the wiring.
+ */
+export function createStubReviewer(
+	reply: ReviewReply | ((req: ReviewRequest) => ReviewReply | Promise<ReviewReply>),
+): ReviewerRunner & { calls: ReviewRequest[] } {
+	const calls: ReviewRequest[] = [];
+	const runner = (async (req: ReviewRequest) => {
+		calls.push(req);
+		return typeof reply === "function" ? await reply(req) : reply;
+	}) as ReviewerRunner & { calls: ReviewRequest[] };
+	runner.calls = calls;
+	return runner;
+}
+
+/** A reviewer returning a well-formed verdict, as the real one would. */
+export function stubVerdict(
+	verdict: "approved" | "changes_requested",
+	findings = "looks fine",
+	model = "stub/reviewer-1",
+): ReviewerRunner & { calls: ReviewRequest[] } {
+	return createStubReviewer({ ok: true, model, text: JSON.stringify({ verdict, findings }) });
 }

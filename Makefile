@@ -14,6 +14,11 @@ include shared/versions.env
 TEST_IMAGE  ?= $(DEFAULT_TEST_IMAGE)
 PI_PROVIDER ?= $(DEFAULT_PI_PROVIDER)
 PI_MODEL    ?= $(DEFAULT_PI_MODEL)
+# Empty by default: shared/versions.sh then falls back to the working model
+# inside the container, so the reviewer block costs one extra call and no second
+# pin. `make check PI_REVIEW_MODEL=...` points it at a different reviewer.
+PI_REVIEW_PROVIDER ?= $(DEFAULT_PI_REVIEW_PROVIDER)
+PI_REVIEW_MODEL    ?= $(DEFAULT_PI_REVIEW_MODEL)
 
 # Every extension in the repo. `make check` runs the lot; PKG=... narrows any
 # target to one. Adding an extension is a one-line edit here and one in
@@ -54,7 +59,14 @@ MOUNTS = \
 # No -w here: each target sets its own working directory, and two -w flags on one
 # command line is confusing to read even though podman takes the last.
 RUN_FLAGS = $(NEST_FLAGS) $(MOUNTS) --env-file $(ENV_FILE) \
-            -e PI_PROVIDER=$(PI_PROVIDER) -e PI_MODEL=$(PI_MODEL)
+            -e PI_PROVIDER=$(PI_PROVIDER) -e PI_MODEL=$(PI_MODEL) \
+            -e PI_REVIEW_PROVIDER=$(PI_REVIEW_PROVIDER) -e PI_REVIEW_MODEL=$(PI_REVIEW_MODEL) \
+            -e PI_TUI_SKIP_LIVE=$(PI_TUI_SKIP_LIVE)
+
+# The documented opt-out from the money-spending interactive cases. It is read
+# inside the container by test/tui/live.test.ts, so it has to be forwarded —
+# `make test-tui PI_TUI_SKIP_LIVE=1` silently ran them before this existed.
+PI_TUI_SKIP_LIVE ?=
 
 $(ENV_FILE):
 	@echo "$(ENV_FILE) is missing. cp env.example $(ENV_FILE) and set OPENROUTER_API_KEY." >&2

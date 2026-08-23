@@ -8,7 +8,10 @@ An extension for **pi** that turns a high-level goal into a linked, tracked set 
 - **Story tool** — The agent can create, update, delete, list, search, simplify, reorder, and mark stories done.
 - **Hierarchy** — Stories form a tree. A story with children is an epic: it is never handed out as work, and it closes automatically once its last child closes. The board, the markdown export, and the injected context all show the tree.
 - **Context injection** — Before every turn, the extension injects a focused story context showing: (1) the next ready story to work on and the epic it belongs to, (2) the top-level big-picture story, (3) the story just completed in the previous turn, (4) other in-progress stories, and (5) lessons from completed work that contradicted an earlier plan.
+- **Review gates** — Work cannot start until the story's *plan* is reviewed, and cannot close until its *work* is. Both gates run mechanical checks first — dependency cycles, whether the story is an epic, whether `verify` passes — and a finding marked BLOCKER cannot be approved past by anyone.
+- **Independent review** — The reviews can be handed to a **different model**, so the agent doing the work is not the one grading it. Off by default; see [Reviewer](#reviewer). When one is configured the working agent's own verdict is refused outright, and a reviewer that cannot be reached records nothing rather than quietly handing the decision back.
 - **Outcomes** — Closing a story records **why** (`completed`, `superseded`, `obsolete`, `wontfix`, `duplicate`) plus an optional note, so `done` / `cancelled` / `archived` no longer lose the reason. `mark_done` refuses to close a story without one.
+- **Handoff notes** — Every closed story records what the next person needs to pick up from here. `mark_done` refuses without one. Relevant notes are injected into later turns, written into the story's commit message, and rolled up onto the epic when it closes — so the memory accumulates instead of dying with the conversation.
 - **Learnings** — A story can record something that contradicted its own `proposed_changes` — a false assumption, a surprising API, a hidden dependency. Relevant ones are fed back into later turns. Most stories have none, and that is the expected case.
 - **Linked continuation** — When a story is marked done, the next linked story is automatically promoted to `ready` and highlighted for the agent.
 - **Dependency gating** — A story can’t be started or marked done if its dependencies aren’t finished.
@@ -44,6 +47,7 @@ Project-scoped packages (`-l`) load only once the project is trusted; a user-sco
 | `/start-epic <id> [--worktree]` | Start an epic on `epic/<id>-<slug>`, branched from the current branch. With `--worktree`, in a checkout of its own — see below. |
 | `/merge-epic [id]` | Bring the base branch into the epic, then fast-forward the base branch onto it. Always confirmed. |
 | `/cancel-epic [id]` | Stop an epic without merging. The branch is kept, so this is reversible. |
+| `/review-story <id> [work]` | Show the mechanical review findings for a story, and any verdict already recorded. Read-only. |
 | `/undo-story <id>` | Reverse one story's commit — reset while it is still the tip, revert once it is not. |
 | `/undo-merge [id]` | Put the base branch back exactly where it was before `/merge-epic`. |
 | `/undo-turn` | Restore the working tree from the last turn's checkpoint. |
@@ -99,6 +103,45 @@ Every path the tracker uses is overridable under a `tracker` key, and by an envi
 | `dbPath` | `PI_TRACKER_DB` | `<repo>/.pi/stories.db` |
 | `worktreeRoot` | `PI_TRACKER_WORKTREE_ROOT` | `<parent of repo>/.pi-worktrees/<repo name>` |
 | `manifestPath` | `PI_TRACKER_MANIFEST` | `<repo>/.pi/epic.json` |
+| `reviewProvider` | `PI_TRACKER_REVIEW_PROVIDER` | unset — self-review |
+| `reviewModel` | `PI_TRACKER_REVIEW_MODEL` | unset — self-review |
+
+### Reviewer
+
+Both review gates are self-reviewed by default: the working agent judges, and a
+mechanical BLOCKER still cannot be approved past. Naming a second model hands the
+judgement to something that did not write the code:
+
+```json
+{ "tracker": { "reviewProvider": "openrouter", "reviewModel": "anthropic/claude-sonnet-5" } }
+```
+
+Both halves are required; setting only one is reported at session start rather
+than silently falling back, as are an unknown model and one with no credentials.
+It costs two extra model calls per story, which is why it is opt-in — the
+reviewer's token usage gets its own footer line, since a tool's model calls never
+become session entries and pi's built-in counter cannot see them.
+
+With a reviewer configured, three things change:
+
+- The verdict is an **output**, not an input. A verdict passed by the working
+  agent is refused — you do not grade your own work.
+- A reviewer that errors or times out **records nothing** and leaves the gate
+  shut. There is no fallback to self-certification; that would make the
+  guarantee a lie precisely when it matters.
+- The recorded verdict is attributed to the reviewer's model id instead of
+  `self`, and shows that way on the board and in the export.
+
+### Who may do what
+
+The agent owns the **story** lifecycle end to end: it creates stories linked into
+the graph, reviews them, starts them, does the work, reviews it, and closes them
+with a handoff note. No human step is required in that loop.
+
+The **epic** lifecycle is the user's: `/start-epic`, `/merge-epic`,
+`/cancel-epic`. Merging rewrites the branch the user is standing on, and pi can
+only relocate a session from a command handler, so both live in commands rather
+than in the tool. An agent that needs one asks.
 
 ## Story Tool Actions (agent-usable)
 
@@ -107,8 +150,10 @@ Every path the tracker uses is overridable under a `tracker` key, and by an envi
 - `delete` — Remove a story; its children are reparented rather than orphaned.
 - `list` — Filter by status or show all.
 - `search` — Find stories by title, sub-goal, or proposed changes.
-- `mark_in_progress` — Move to `in_progress` (blocked by unmet dependencies, and by being an epic).
-- `mark_done` — Close a story and auto-promote `next_id` to `ready`. **Requires `resolution`**; accepts `resolution_note` and `learnings`.
+- `review_plan` — Review a story before starting it. Call with only `story_id` to get the mechanical findings; call again with `verdict` and `findings` to record a judgement. Gates `mark_in_progress`.
+- `review_work` — Review what a story produced before closing it: the pending diff and the manifest's `verify`. Same two-step shape. Gates `mark_done`.
+- `mark_in_progress` — Move to `in_progress` (blocked by unmet dependencies, by being an epic, and by an unapproved plan review).
+- `mark_done` — Close a story and auto-promote `next_id` to `ready`. **Requires `resolution` and `handoff_notes`**, and an approved work review; accepts `resolution_note` and `learnings`.
 - `get_next` — Return the top `ready` leaf story with no unmet dependencies.
 - `set_top_level` — Designate a story as the big-picture context.
 - `reorder` — Rewrite priorities and `next_id` chain for a given ID order.

@@ -20,6 +20,12 @@ export PI_PROVIDER="${PI_PROVIDER:-$DEFAULT_PI_PROVIDER}"
 export PI_MODEL="${PI_MODEL:-$DEFAULT_PI_MODEL}"
 export PI_VERSION="${PI_VERSION:-$DEFAULT_PI_VERSION}"
 
+# The reviewer defaults are empty on purpose (see versions.env), so these fall
+# back to the working model rather than to a second pin. `:-` not `:=` for the
+# same reason as everything else here: an already-exported value wins.
+export PI_REVIEW_PROVIDER="${PI_REVIEW_PROVIDER:-${DEFAULT_PI_REVIEW_PROVIDER:-$PI_PROVIDER}}"
+export PI_REVIEW_MODEL="${PI_REVIEW_MODEL:-${DEFAULT_PI_REVIEW_MODEL:-$PI_MODEL}}"
+
 # The container harness reads IMAGE, not TEST_IMAGE — the two names are historic
 # and both are load-bearing (lib.sh requires IMAGE; the Makefile exposes
 # TEST_IMAGE). Bridge them here rather than in each caller.

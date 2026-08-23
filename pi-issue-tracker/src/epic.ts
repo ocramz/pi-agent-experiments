@@ -338,6 +338,40 @@ export async function recordStoryStartCommit(
  * before staging — `git add -A` honours .gitignore but will happily commit an
  * untracked credentials file or a stray model checkpoint.
  */
+/**
+ * Gather what a work review needs to judge: the pending changes, and whether
+ * the manifest's `verify` passes.
+ *
+ * Runs `verify` at *review* time as well as at commit time. Duplicated work, but
+ * a `verify` failure discovered here is reported as a finding the agent can act
+ * on, where the same failure inside `commitStory` only aborts the close with a
+ * note — and by then the agent has already decided it was finished.
+ */
+export async function collectWorkEvidence(
+	ctx: TrackerContext,
+	epic: EpicBranch,
+	manifest: EpicManifest = readManifest(ctx.paths.manifestPath),
+): Promise<{
+	changedFiles: string[];
+	totalBytes: number;
+	verify: { command: string; ok: boolean; output: string } | null;
+}> {
+	const cwd = epicCwd(ctx, epic);
+	const stats = await changeStats(ctx.git, cwd);
+
+	let verify: { command: string; ok: boolean; output: string } | null = null;
+	if (manifest.verify) {
+		const ran = await ctx.shell(manifest.verify, { cwd });
+		verify = {
+			command: manifest.verify,
+			ok: ran.code === 0,
+			output: ran.stdout || ran.stderr,
+		};
+	}
+
+	return { changedFiles: stats.files, totalBytes: stats.totalBytes, verify };
+}
+
 export async function commitStory(
 	ctx: TrackerContext,
 	story: Story,
