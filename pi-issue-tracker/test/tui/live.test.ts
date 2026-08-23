@@ -1,21 +1,26 @@
-// The three cases that need a real model turn.
+// The cases that need a real model turn.
 //
 // /plan-stories drives the model itself, and /undo-turn has nothing to restore
 // until the turn_end hook has fired — which only happens after the agent has
-// actually answered. That makes these slow, non-deterministic and not free, so
-// they are the one file that needs a key.
+// actually answered. Session relocation is here for a subtler reason: pi writes
+// a session file only once the session holds an assistant message, so before the
+// first reply there is no file for `SessionManager.forkFrom` to fork and a
+// session cannot move at all.
+//
+// That makes these slow, non-deterministic and not free, so they are the one
+// file that needs a key.
 //
 // Refusing loudly beats skipping quietly, so an absent key fails the run rather
 // than silently reducing it. PI_TUI_SKIP_LIVE=1 is the explicit opt-out, for the
 // fork CI job that gets no secrets.
 
 import assert from "node:assert/strict";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { getAllStories } from "../../src/database.ts";
+import { getAllStories, getEpicBranch } from "../../src/database.ts";
 import { rowCount } from "./inspect.ts";
-import { session, type Session } from "./pi-session.ts";
+import { session, sessionFileExists, sessionFilesFor, type Session } from "./pi-session.ts";
 
 const SKIP = process.env.PI_TUI_SKIP_LIVE === "1";
 if (!SKIP && !process.env.OPENROUTER_API_KEY) {
@@ -88,5 +93,50 @@ describe("/undo-turn", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
 		await s.close();
 
 		assert.match(s.read("README.md"), /work in progress/, "the checkpointed change is back");
+	});
+});
+
+describe("/start-epic --worktree", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
+	/**
+	 * The one case that reaches pi's session relocation.
+	 *
+	 * The model turn is not incidental: pi flushes a session file only once the
+	 * first assistant message lands, and `SessionManager.forkFrom` refuses an
+	 * unwritten one — so before a reply there is literally nothing to relocate.
+	 * That is why this lives here and not beside W1–W9, which cover everything
+	 * about worktree mode that does not depend on the session moving.
+	 *
+	 * It stops after the move. Driving a *second* command through the rebuilt TUI
+	 * does not work in this harness — see the note in README.md — so the rest of
+	 * the round trip is covered at the library level in ../worktree.test.ts.
+	 */
+	it("W10 relocates the session into the epic's worktree", async (t) => {
+		const s = await session(t, "stories", { live: true });
+		const epic = s.facts.epicId!;
+
+		await s.command("Reply with exactly the word: ok. Do not use any tools.");
+		// Not "wait until the screen says ok": the model streams its own paraphrase
+		// of the prompt, so that matches long before the turn is over. The session
+		// file appearing is the actual precondition — it is what makes the session
+		// forkable at all.
+		await until(s, "pi to write a session file", async () => sessionFileExists(s.dir));
+
+		await s.command(`/start-epic ${epic} --worktree`);
+		await s.expect("This session has moved into the worktree at", MODEL);
+		await s.close();
+
+		const worktree = s.db((db) => getEpicBranch(db, epic))?.path;
+		assert.ok(worktree, "the epic recorded its worktree");
+		assert.ok(existsSync(worktree!), "the worktree exists on disk");
+
+		// The durable proof, and the reason this case exists: pi wrote a session
+		// whose header names the worktree. The screen cannot show this — a switch
+		// repaints the TUI and the footer is not reliable evidence either way.
+		assert.equal(
+			sessionFilesFor(worktree!).length,
+			1,
+			`pi should have forked a session rooted in ${worktree}`,
+		);
+		assert.equal(await s.branch(), "feat/work", "the main checkout never moved");
 	});
 });

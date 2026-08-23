@@ -24,7 +24,7 @@
 // polling primitive, re-driven by its stdout observer — does the waiting.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { TestContext } from "node:test";
@@ -42,7 +42,45 @@ const PI_BIN = process.env.PI_BIN ?? "pi";
 // directory would pay for that download in every single case. Setting it also
 // suppresses pi's first-time-setup wizard, which would otherwise sit waiting for
 // a theme choice that nobody is there to make.
-const AGENT_DIR = process.env.PI_TUI_AGENT_DIR ?? join(tmpdir(), "pi-tui-agent");
+export const AGENT_DIR = process.env.PI_TUI_AGENT_DIR ?? join(tmpdir(), "pi-tui-agent");
+
+/**
+ * Whether pi has written a session file for a fixture yet.
+ *
+ * pi flushes a session only once it holds an assistant message, so before the
+ * first model reply there is no file at all — and `SessionManager.forkFrom`,
+ * which is how worktree mode relocates a session, refuses an unwritten one.
+ * A live case that needs to relocate has to wait for this rather than for
+ * anything on screen: the model streams its own paraphrase of the prompt, so
+ * matching output is not evidence the turn is over.
+ */
+export function sessionFileExists(cwd: string): boolean {
+	return sessionFilesFor(cwd).length > 0;
+}
+
+/**
+ * Session files whose header records `cwd`.
+ *
+ * This is how a relocation is checked. `SessionManager.forkFrom` writes a new
+ * session whose header names the target directory, so a file appearing under the
+ * worktree's cwd is direct evidence that the session moved — and unlike the
+ * screen, it does not depend on what the TUI chose to repaint.
+ */
+export function sessionFilesFor(cwd: string): string[] {
+	const root = join(AGENT_DIR, "sessions");
+	if (!existsSync(root)) return [];
+	const found: string[] = [];
+	for (const entry of readdirSync(root)) {
+		const dir = join(root, entry);
+		if (!statSync(dir).isDirectory()) continue;
+		for (const file of readdirSync(dir)) {
+			if (!file.endsWith(".jsonl")) continue;
+			const path = join(dir, file);
+			if (readFileSync(path, "utf8").includes(`"cwd":"${cwd}"`)) found.push(path);
+		}
+	}
+	return found;
+}
 
 // Long enough for a git merge or a conflict report, nowhere near long enough to
 // hide a hang. Live cases raise it per call.

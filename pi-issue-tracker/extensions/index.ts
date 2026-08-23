@@ -34,7 +34,7 @@ import type { Story } from "../src/types.ts";
 import { STORY_RESOLUTIONS } from "../src/types.ts";
 import { keywordStrategy } from "../src/related.ts";
 import { resolvePaths } from "../src/config.ts";
-import type { GitRunner, ShellRunner, TrackerContext } from "../src/context.ts";
+import type { GitRunner, NotifyLevel, ShellRunner, TrackerContext } from "../src/context.ts";
 import { currentBranch, isDirty, probeRepo, revParse, withLockRetry, type RepoInfo } from "../src/git.ts";
 import {
 	cancelEpic,
@@ -97,6 +97,63 @@ let sessionEpicId: number | null = null;
  * worth and costs a kilobyte of refs.
  */
 const CHECKPOINT_RETENTION = 20;
+
+/**
+ * Why a session sometimes cannot follow its epic into the worktree.
+ *
+ * pi writes a session file only once the session contains an assistant message
+ * — `SessionManager._persist` checks for one before flushing anything — and
+ * slash commands produce no session entries at all. So a session that has only
+ * run `/plan-stories` and `/start-epic` has never been written to disk, and
+ * `forkFrom` has nothing to fork.
+ *
+ * Nothing is lost when this happens: the worktree exists and the epic is
+ * recorded, so opening pi in that directory picks it up. Saying so is better
+ * than inventing a session, which would silently discard whatever conversation
+ * the user did have.
+ */
+const NOTHING_TO_RELOCATE =
+	"this session has not been saved yet (pi writes a session file after the first model reply)";
+
+/**
+ * The context handed to a `withSession` callback after a session switch.
+ *
+ * pi names this `ReplacedSessionContext` but does not re-export it from the
+ * package root, so it is recovered from the one signature that does mention it
+ * rather than reached for through `dist/`. It is an `ExtensionCommandContext`
+ * plus `sendMessage`/`sendUserMessage`.
+ */
+type ReplacedSession = Parameters<
+	NonNullable<NonNullable<Parameters<ExtensionCommandContext["switchSession"]>[1]>["withSession"]>
+>[0];
+
+/**
+ * Tell the user what happened, through a channel that survives where it is said.
+ *
+ * A `ui.notify` posted while pi is rebuilding the TUI around a replacement
+ * session is simply lost: the repaint draws the new session's transcript and the
+ * notification was never part of it. Everything worth saying after a relocation
+ * — the epic started, the merge landed, the worktree is gone — is therefore sent
+ * as a displayed message, which *is* part of the transcript.
+ *
+ * Outside a relocation there is no repaint to lose it to, and `notify` is the
+ * right, familiar affordance.
+ */
+async function report(
+	ctx: ExtensionCommandContext | ReplacedSession,
+	text: string,
+	level: NotifyLevel = "info",
+): Promise<void> {
+	const replacement = ctx as Partial<ReplacedSession>;
+	if (typeof replacement.sendMessage === "function") {
+		// Failures matter more here than successes, not less: a merge that did not
+		// happen must not be the thing the repaint swallows.
+		const prefix = level === "error" ? "Error: " : level === "warning" ? "Warning: " : "";
+		await replacement.sendMessage({ customType: "epic-worktree", content: `${prefix}${text}`, display: true });
+		return;
+	}
+	ctx.ui.notify(text, level);
+}
 
 function sessionEpic(): EpicBranch | null {
 	if (sessionEpicId === null || !tracker) return null;
@@ -1709,28 +1766,24 @@ export default function (pi: ExtensionAPI) {
 	async function relocateSession(
 		ctx: ExtensionCommandContext,
 		targetCwd: string,
-		after: (rc: ExtensionCommandContext) => Promise<void>,
+		after: (rc: ReplacedSession) => Promise<void>,
 	): Promise<{ ok: boolean; note: string }> {
 		const sourceSession = ctx.sessionManager.getSessionFile();
+		if (!sourceSession) return { ok: false, note: NOTHING_TO_RELOCATE };
 
-		// `forkFrom` carries the conversation across, but it refuses an empty or
-		// unwritten source file — which is the most likely case of all: open pi,
-		// run /start-epic --worktree before saying anything. There is no history to
-		// carry there, so a fresh session in the target directory is not a fallback
-		// so much as the right answer.
 		let relocated: string | undefined;
 		try {
-			relocated = sourceSession
-				? SessionManager.forkFrom(sourceSession, targetCwd).getSessionFile()
-				: SessionManager.create(targetCwd).getSessionFile();
-		} catch {
-			try {
-				relocated = SessionManager.create(targetCwd).getSessionFile();
-			} catch (error) {
-				return { ok: false, note: `could not open a session in ${targetCwd}: ${String(error)}` };
-			}
+			relocated = SessionManager.forkFrom(sourceSession, targetCwd).getSessionFile();
+		} catch (error) {
+			// Overwhelmingly this is the empty-session case, which is not a fault
+			// worth spelling out in SDK terms.
+			const detail = String(error);
+			return {
+				ok: false,
+				note: detail.includes("empty or invalid") ? NOTHING_TO_RELOCATE : `could not fork the session: ${detail}`,
+			};
 		}
-		if (!relocated) return { ok: false, note: `could not open a session in ${targetCwd}` };
+		if (!relocated) return { ok: false, note: NOTHING_TO_RELOCATE };
 
 		const result = await ctx.switchSession(relocated, { withSession: async (rc) => after(rc) });
 		return result.cancelled
@@ -1820,7 +1873,10 @@ export default function (pi: ExtensionAPI) {
 			const note = started.note;
 			const worktree = started.epic.path;
 			const moved = await relocateSession(ctx, worktree, async (rc) => {
-				rc.ui.notify(`${note}\nThis session is now working in the worktree.`, "info");
+				await report(
+					rc,
+					`${note}\n\nThis session has moved into the worktree at ${worktree}. Work here; /merge-epic will bring it back.`,
+				);
 			});
 			if (!moved.ok) {
 				// The worktree exists and the epic is recorded; only the session
@@ -1841,10 +1897,10 @@ export default function (pi: ExtensionAPI) {
 	 * resolved tracker — the one captured before a switch belongs to a torn-down
 	 * session.
 	 */
-	async function finishMerge(epic: EpicBranch, ctx: ExtensionCommandContext): Promise<void> {
+	async function finishMerge(epic: EpicBranch, ctx: ExtensionCommandContext | ReplacedSession): Promise<void> {
 		const tracked = ensureTracker();
 		const merged = await serializeGit(() => mergeIntoBase(tracked, epic));
-		if (!merged.ok) return void ctx.ui.notify(merged.note, "error");
+		if (!merged.ok) return void (await report(ctx, merged.note, "error"));
 
 		const notes = [merged.note];
 		const current = getEpicBranch(tracked.db, epic.epic_id) ?? epic;
@@ -1858,7 +1914,7 @@ export default function (pi: ExtensionAPI) {
 		// Reported before the prune question, not after it. Pruning is an optional
 		// afterthought and the merge is the thing the user asked for; making them
 		// answer a dialog before learning whether it worked gets that backwards.
-		ctx.ui.notify(notes.join("\n"), "info");
+		await report(ctx, notes.join("\n"));
 		await offerToPrune(epic.epic_id, "pre-merge", "The merge stays undoable either way.", ctx);
 	}
 
@@ -1873,7 +1929,7 @@ export default function (pi: ExtensionAPI) {
 		epicId: number,
 		keep: string,
 		reassurance: string,
-		ctx: ExtensionCommandContext,
+		ctx: ExtensionCommandContext | ReplacedSession,
 	): Promise<void> {
 		if (!ctx.hasUI) return;
 		const choice = await ctx.ui.select(`Prune epic #${epicId}'s checkpoints and backup refs? ${reassurance}`, [
@@ -1884,7 +1940,7 @@ export default function (pi: ExtensionAPI) {
 
 		const tracked = ensureTracker();
 		const pruned = await serializeGit(() => pruneEpicRefs(tracked, epicId, [keep]));
-		ctx.ui.notify(`Pruned ${pruned} ref(s) for epic #${epicId}.`, "info");
+		await report(ctx, `Pruned ${pruned} ref(s) for epic #${epicId}.`);
 	}
 
 	pi.registerCommand("merge-epic", {
@@ -1955,13 +2011,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Cancel, then offer to prune. Runs after any relocation, like `finishMerge`. */
-	async function finishCancel(epic: EpicBranch, ctx: ExtensionCommandContext): Promise<void> {
+	async function finishCancel(epic: EpicBranch, ctx: ExtensionCommandContext | ReplacedSession): Promise<void> {
 		const tracked = ensureTracker();
 		const result = await serializeGit(() => cancelEpic(tracked, epic));
-		if (!result.ok) return void ctx.ui.notify(result.note, "error");
+		if (!result.ok) return void (await report(ctx, result.note, "error"));
 		if (sessionEpicId === epic.epic_id) sessionEpicId = null;
 
-		ctx.ui.notify(result.note, "info");
+		await report(ctx, result.note);
 		// pre-cancel holds the abandoned work; pruning it would make the cancel
 		// irreversible, which is the one thing it promises not to be.
 		await offerToPrune(epic.epic_id, "pre-cancel", "The abandoned work stays reachable either way.", ctx);

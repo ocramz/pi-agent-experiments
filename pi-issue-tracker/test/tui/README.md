@@ -49,8 +49,8 @@ than skipping quietly; `PI_TUI_SKIP_LIVE=1` is the explicit opt-out, used by the
 | [start-epic.test.ts](start-epic.test.ts) | D1–D9 | One case per refusal in `checkCanStartEpic`, plus the dirty-tree prompt both ways and flag parsing |
 | [merge-epic.test.ts](merge-epic.test.ts) | E1–E5, F1–F2 | `/merge-epic` confirm, decline, base-moved, conflict, already-merged; `/cancel-epic` |
 | [undo.test.ts](undo.test.ts) | G1–G4, H1–H2, I2–I3 | `/undo-story` reset and revert paths, `/undo-merge`, `/undo-turn` |
-| [worktree.test.ts](worktree.test.ts) | W1–W8 | `/start-epic --worktree` and pi's session relocation, concurrent epics, worktree-aware merge and cancel, session scoping |
-| [live.test.ts](live.test.ts) | B1, B3, I1 | The three that need a model turn. Costs a little money |
+| [worktree.test.ts](worktree.test.ts) | W1–W8 | `/start-epic --worktree`, concurrent epics, worktree-aware merge and cancel, session scoping |
+| [live.test.ts](live.test.ts) | B1, B3, I1, W10 | The four that need a model turn. Costs a little money |
 
 ## How a case is built
 
@@ -109,6 +109,21 @@ by `updated_at`, so "the last epic to merge" is a real answer rather than a coin
 sharing a second. But asserting it needs a controlled clock, which makes it a unit test, not an
 interactive one. It lives in [../database.test.ts](../database.test.ts) as "picks the last merged
 epic by when it merged, not by when it started".
+
+**A second command after a session switch.** W10 relocates a session into a worktree and proves it
+with the session file pi wrote there. It stops at that point on purpose: typing another command into
+the rebuilt TUI does not work here. `switchSession` tears the TUI down and rebuilds it around the
+replacement session, and keystrokes sent afterwards arrive as one or two stray characters — the
+command is never parsed. Waiting does not fix it: pi prints its `ctrl+o more` hint only on the first
+paint, so there is nothing to poll for, and a fixed sleep did not help either. That looks like the
+pty surviving the rebuild while the library's pipe into it does not.
+
+Two consequences. Worktree-mode `/merge-epic` and `/cancel-epic` are covered from the *outside* — W5
+and W7 drive them from a session in the main checkout, which is a real usage and needs no switch —
+and from below, in [../worktree.test.ts](../worktree.test.ts), which exercises `mergeIntoBase`,
+`releaseWorktree` and `cancelEpic` against real worktrees. What is not machine-checked anywhere is
+the keystroke path "type /merge-epic into a session that has already been relocated". The manual
+check in the package README covers it.
 
 **A second concurrent session.** W3 proves the *rule* — a second epic that branch mode refuses is
 accepted with `--worktree` — but it does so from one pi session. Two sessions running at the same

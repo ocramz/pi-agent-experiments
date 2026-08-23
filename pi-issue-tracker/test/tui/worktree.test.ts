@@ -27,6 +27,10 @@ describe("/start-epic --worktree", () => {
 		await s.expect(`epic #${epic} started on epic/${epic}-ship-the-widget`);
 		await s.close();
 
+		// These cases never send a message, so pi has written no session file and
+		// the session cannot follow the epic into the worktree — see W10, which is
+		// the live case that does have one. The epic is created either way, and
+		// that is what is asserted here.
 		const row = s.db((db) => getEpicBranch(db, epic));
 		assert.equal(row?.mode, "worktree", "the epic is recorded as a worktree epic");
 		assert.ok(row?.path, "and with the directory it lives in");
@@ -165,39 +169,6 @@ describe("/cancel-epic in worktree mode", () => {
 		assert.ok(
 			(await s.piRefs("backup")).includes(`refs/pi/backup/${epic}/pre-cancel`),
 			"the abandoned work is still reachable",
-		);
-	});
-});
-
-describe("the worktree round trip", () => {
-	/**
-	 * The full cycle in one session, which is how the mode is actually used:
-	 * `/start-epic --worktree` moves the session in, `/merge-epic` moves it back
-	 * out and only then deletes the directory it was standing in. Nothing else
-	 * exercises the relocation in both directions.
-	 */
-	it("W9 merges from inside the worktree, moving the session out first", async (t) => {
-		const s = await session(t, "stories");
-		const epic = s.facts.epicId!;
-
-		await s.command(`/start-epic ${epic} --worktree`);
-		await s.expect("This session is now working in the worktree.");
-
-		await s.command("/merge-epic");
-		await s.expect(`Merge epic/${epic}-ship-the-widget into feat/work?`);
-		await s.choose(0);
-		await s.expect(`merged epic/${epic}-ship-the-widget into feat/work`);
-		await s.expect("removed the worktree at");
-		await s.choose(0); // the ref-pruning offer
-		await s.close();
-
-		const row = s.db((db) => getEpicBranch(db, epic));
-		assert.equal(row?.state, "merged");
-		assert.equal(row?.path, null, "the worktree was released");
-		assert.equal(
-			await s.branch(),
-			"feat/work",
-			"the main checkout is where it was — the session came back to it, it did not move",
 		);
 	});
 });

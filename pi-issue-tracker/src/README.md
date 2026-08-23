@@ -137,6 +137,17 @@ depends on — `pre-merge` and `pre-cancel` respectively.
   beforehand — `ctx`, `ctx.sessionManager` — throws if touched. Only plain strings survive
   the switch, which is why every database write happens *before* it and `finishMerge`
   re-resolves the tracker rather than closing over one.
+- **`ui.notify` is lost across a session switch.** The replacement repaints the TUI from
+  the new session's transcript, and a notification was never part of one. Anything said
+  after a relocation — including failures — goes through `report`, which sends a displayed
+  message instead when the context can. A silently swallowed "the merge did not happen" is
+  the worst outcome available here, so errors take the same route as successes.
+- **A session with no assistant message has no file.** `SessionManager._persist` waits for
+  one before flushing anything, and slash commands produce no session entries, so a session
+  that has only run `/plan-stories` and `/start-epic` has never been written. `forkFrom`
+  refuses it, and worktree mode says so rather than inventing a session: the worktree and
+  the epic row both exist, so opening pi in that directory picks the epic up. This is also
+  why the one interactive test of relocation has to spend a model turn first.
 - `pi.exec` never throws and never rejects on a non-zero exit; `code !== 0` is the only
   error signal. Both `GitRunner` implementations match that contract deliberately.
 - Git work is serialized through one promise chain, which orders *this* process only.
