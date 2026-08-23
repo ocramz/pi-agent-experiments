@@ -134,6 +134,38 @@ git switch -c feat/scratch          # main and master are refused as bases
 /merge-epic                         # returns to the main repo, then removes the worktree
 ```
 
-## Schema notes
+## Architecture
 
-The database lives at `<project>/.pi/stories.db`. There is **no migration system** — schema changes mean deleting that file. Add one (`PRAGMA user_version` plus an ordered list of `ALTER TABLE` steps) before the data starts mattering.
+- **`src/` must not import from `@earendil-works/*`.** [extensions/index.ts](pi-issue-tracker/extensions/index.ts)
+  is the only pi-aware file: it builds a `TrackerContext` (paths, db, injected git/shell runners,
+  clock, notify) and delegates. That boundary is what lets everything below run under plain
+  `node --test` against a temp repository, with no pi runtime and no network.
+- **Git runners never throw.** `pi.exec` resolves with a non-zero `code` on failure, and both
+  `GitRunner` implementations match that contract deliberately — `code !== 0` is the only error
+  signal.
+- **There is no "the" active epic.** Worktree mode allows any number of concurrent epics across pi
+  sessions sharing one `stories.db`. `resolveSessionEpic` answers "which epic is *this* session on"
+  by path, not by branch (the user is allowed to wander off the epic branch mid-epic). Cache the
+  **id**, re-read the row on every use.
+- **`transitionStatus` is the single write path for `status`**, and git effects hang off it. The two
+  deliberate bypasses (`simplify`, `/plan-stories`) write status inside a SQLite transaction, which
+  cannot stay open across a git subprocess. Any new status writer goes through `transitionStatus`.
+- **Nothing becomes unreachable.** Every destructive operation writes `refs/pi/backup/<epic>/<op>`
+  first, so each command has an inverse. Nothing is pruned unasked except turn checkpoints (newest
+  twenty kept).
+- **Merging is two steps in order**: `merge --no-ff <base>` *into* the epic branch (so conflicts
+  surface where the agent works), then fast-forward the base onto the epic. The other direction is
+  wrong and is not done.
+- **No schema migrations.** `INIT_SQL` is all `CREATE TABLE IF NOT EXISTS`; adding a column means
+  deleting `.pi/stories.db`. `PRAGMA user_version` is unused.
+
+
+## Constraints discovered in the SDK
+
+- Session relocation only works from a *command*
+handler
+- `withSession` callbacks run in a torn-down closure where only plain strings survive
+- `ui.notify` is lost across a session switch
+- a session with no assistant message has no file to fork. 
+
+Be extra careful if touching `relocateSession` or anything around `switchSession`.
