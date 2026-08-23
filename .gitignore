@@ -1,0 +1,16 @@
+node_modules/
+**/node_modules/
+
+# Tracker state. The database is per-checkout and binary — committing it would
+# conflict on every merge once stories start producing commits.
+.pi/stories.db
+.pi/stories.db-wal
+.pi/stories.db-shm
+
+# Epic worktrees, if worktreeRoot is ever pointed inside the repo.
+.pi-worktrees/
+
+# The API key the container suite runs against. env.example is the tracked
+# template; the real file never is.
+.env
+

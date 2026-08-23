@@ -1,0 +1,139 @@
+# Pi Issue Tracker
+
+An extension for **pi** that turns a high-level goal into a linked, tracked set of user stories stored in a project-local SQLite database.
+
+## Features
+
+- **Plan from a goal** — `/plan-stories <goal>` breaks down work into user stories using the active model. The goal itself becomes a root **epic**, every generated story is parented to it, and it is set as the big-picture story automatically.
+- **Story tool** — The agent can create, update, delete, list, search, simplify, reorder, and mark stories done.
+- **Hierarchy** — Stories form a tree. A story with children is an epic: it is never handed out as work, and it closes automatically once its last child closes. The board, the markdown export, and the injected context all show the tree.
+- **Context injection** — Before every turn, the extension injects a focused story context showing: (1) the next ready story to work on and the epic it belongs to, (2) the top-level big-picture story, (3) the story just completed in the previous turn, (4) other in-progress stories, and (5) lessons from completed work that contradicted an earlier plan.
+- **Outcomes** — Closing a story records **why** (`completed`, `superseded`, `obsolete`, `wontfix`, `duplicate`) plus an optional note, so `done` / `cancelled` / `archived` no longer lose the reason. `mark_done` refuses to close a story without one.
+- **Learnings** — A story can record something that contradicted its own `proposed_changes` — a false assumption, a surprising API, a hidden dependency. Relevant ones are fed back into later turns. Most stories have none, and that is the expected case.
+- **Linked continuation** — When a story is marked done, the next linked story is automatically promoted to `ready` and highlighted for the agent.
+- **Dependency gating** — A story can’t be started or marked done if its dependencies aren’t finished.
+- **TUI board** — `/stories` opens an interactive tree. Navigate with `↑↓`, press `R` ready, `S` start, `D` done, `X` cancel.
+- **Export** — `/export-stories [path]` dumps all stories to human-readable Markdown (`stories.md` by default), nested by epic.
+
+## Install
+
+```bash
+pi install npm:pi-issue-tracker
+```
+
+Needs **Node 24 or later** — the package ships TypeScript and relies on Node's native type stripping, so there is no build step and nothing to compile.
+
+For local development, point pi at a checkout instead:
+
+```bash
+pi install /path/to/pi-issue-tracker      # user settings, ~/.pi/agent/settings.json
+pi install -l /path/to/pi-issue-tracker   # project settings, .pi/settings.json
+pi -e /path/to/pi-issue-tracker           # this run only, nothing written
+```
+
+Project-scoped packages (`-l`) load only once the project is trusted; a user-scoped install has no such gate.
+
+## Commands
+
+| Command | Description |
+|--------|-------------|
+| `/plan-stories <goal>` | Use the LLM to break down a goal into user stories under a root epic. Resolves `depends_on` and `next_id` chains, promotes the first unblocked story to `ready`, and reports what the planning calls cost. |
+| `/stories` | Open an interactive story tree in the TUI (headless mode prints a plain list). |
+| `/top-story <id>` | Set the top-level story that provides big-picture context on every turn. |
+| `/export-stories [path]` | Write `stories.md` or the given path. |
+| `/start-epic <id> [--worktree]` | Start an epic on `epic/<id>-<slug>`, branched from the current branch. With `--worktree`, in a checkout of its own — see below. |
+| `/merge-epic [id]` | Bring the base branch into the epic, then fast-forward the base branch onto it. Always confirmed. |
+| `/cancel-epic [id]` | Stop an epic without merging. The branch is kept, so this is reversible. |
+| `/undo-story <id>` | Reverse one story's commit — reset while it is still the tip, revert once it is not. |
+| `/undo-merge [id]` | Put the base branch back exactly where it was before `/merge-epic`. |
+| `/undo-turn` | Restore the working tree from the last turn's checkpoint. |
+
+Planning tokens do not reach pi's built-in footer counter — that counter sums session entries, and a command's model calls never become session entries. `/plan-stories` totals them itself and shows them on the footer's extension-status line and in the completion notice.
+
+## Git integration
+
+Opt-in. Until `/start-epic` runs, nothing in git is touched and the tracker behaves exactly as it did before.
+
+Once an epic is running, closing a story commits what it changed as one commit, titled after the story. Every destructive operation writes a `refs/pi/backup/<epic>/<operation>` ref first, so each command has an inverse. Each turn that ends with a dirty tree is checkpointed with `git stash create` under `refs/pi/checkpoint/<epic>/`, which is what `/undo-turn` restores; the newest twenty are kept.
+
+### Branch mode vs worktree mode
+
+| | Branch mode (default) | Worktree mode (`--worktree`) |
+|---|---|---|
+| Where work happens | The current checkout, switched to the epic branch | A separate checkout under the worktree root |
+| Main checkout | Moves to the epic branch | Never touched |
+| Concurrency | One at a time | Any number, each in its own pi session |
+| A dirty tree at start | Offered to carry into the first commit | Irrelevant — the new checkout is elsewhere |
+
+`/start-epic <id> --worktree` creates the worktree and **relocates the running pi session into it**. To run a second epic at the same time, open another pi session and start it there. All sessions share one `stories.db`, which is anchored to the main repository, so the story tree stays consistent across them. `/merge-epic` and `/cancel-epic` move the session back to the main repository before removing the worktree.
+
+Worktrees are created outside the repository by default — a second full copy of the tree *inside* it makes every `rg`, `tsc --build` and test glob descend into it.
+
+### `.pi/epic.json`
+
+An optional manifest describing how to prepare and check an epic's environment. Every field is optional; a missing file means an empty manifest.
+
+```json
+{
+  "setup": "npm ci",
+  "verify": "npm test",
+  "versions": "node --version && npm --version",
+  "copy": [".env", "config/local.json"],
+  "caches": ["npm_config_cache", "PIP_CACHE_DIR"]
+}
+```
+
+- **`setup`** runs once per epic, and again only when the command string itself changes.
+- **`verify`** must pass before a story is committed; a failure commits nothing.
+- **`versions`** is captured at setup time so environment drift is detectable later.
+- **`copy`** carries gitignored files into a new worktree. A worktree is a checkout, so it brings tracked files and nothing else. Paths are repo-relative; absolute paths and anything reaching outside the repository are refused.
+- **`caches`** names environment variables pointed at one shared directory before `setup` runs, so several worktrees do not each download the world.
+
+### `.pi/settings.json`
+
+Every path the tracker uses is overridable under a `tracker` key, and by an environment variable that takes precedence over it.
+
+| Key | Environment variable | Default |
+|---|---|---|
+| `repoRoot` | `PI_TRACKER_REPO_ROOT` | `git rev-parse --git-common-dir`, so a worktree resolves to the main checkout |
+| `dbPath` | `PI_TRACKER_DB` | `<repo>/.pi/stories.db` |
+| `worktreeRoot` | `PI_TRACKER_WORKTREE_ROOT` | `<parent of repo>/.pi-worktrees/<repo name>` |
+| `manifestPath` | `PI_TRACKER_MANIFEST` | `<repo>/.pi/epic.json` |
+
+## Story Tool Actions (agent-usable)
+
+- `create` — Add a new story with optional linking (`parent_story_id`, `next_story_id`, `depends_on`).
+- `update` — Edit fields by ID. Pass `parent_story_id: null` to detach a story from its parent. Self-parenting and cycles are rejected.
+- `delete` — Remove a story; its children are reparented rather than orphaned.
+- `list` — Filter by status or show all.
+- `search` — Find stories by title, sub-goal, or proposed changes.
+- `mark_in_progress` — Move to `in_progress` (blocked by unmet dependencies, and by being an epic).
+- `mark_done` — Close a story and auto-promote `next_id` to `ready`. **Requires `resolution`**; accepts `resolution_note` and `learnings`.
+- `get_next` — Return the top `ready` leaf story with no unmet dependencies.
+- `set_top_level` — Designate a story as the big-picture context.
+- `reorder` — Rewrite priorities and `next_id` chain for a given ID order.
+- `simplify` — Merge multiple stories into a single one, archiving the sources as `superseded`, adopting their children, and repointing anything that depended on them.
+
+### Trying concurrent epics by hand
+
+Two epics at once means two pi sessions. The library-level guarantees are covered by
+`test/worktree.test.ts`; this is what it looks like from the outside.
+
+```bash
+git switch -c feat/scratch          # main and master are refused as bases
+# /plan-stories a goal that splits into two independent epics, then:
+
+# Session one
+/start-epic <a> --worktree          # the session relocates into the worktree
+
+# Session two, started separately in the main checkout
+/start-epic <b> --worktree          # accepted; branch mode would refuse here
+
+# Close a story in each — one commit lands on each epic branch, in each worktree,
+# and both sessions see the same story tree. Then, in each session:
+/merge-epic                         # returns to the main repo, then removes the worktree
+```
+
+## Schema notes
+
+The database lives at `<project>/.pi/stories.db`. There is **no migration system** — schema changes mean deleting that file. Add one (`PRAGMA user_version` plus an ordered list of `ALTER TABLE` steps) before the data starts mattering.

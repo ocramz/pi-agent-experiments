@@ -1,0 +1,11 @@
+{
+	"name": "pi-tui-tests",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Dependency scope for the interactive tier. Deliberately separate from the package's own node_modules: node_modules/@earendil-works/* there are symlinks into the container's global pi install, and an `npm install` at the package root would reify that tree and prune them. Node resolves these two packages from test/tui/*.test.ts by finding this directory's node_modules first, so the package root is never touched.",
+	"dependencies": {
+		"cli-testing-library": "4.0.0",
+		"strip-ansi": "7.2.0"
+	}
+}
