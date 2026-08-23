@@ -20,7 +20,7 @@
 # guard, went looking through the whole filesystem for the source of the message.
 # An unbounded live test is one curious model away from wedging CI, so a run that
 # overshoots its budget fails instead of hanging.
-source "$(dirname "$0")/lib.sh"
+source "$(dirname "$0")/../../../shared/test/container/lib.sh"
 
 # Per pi invocation. Generous: a healthy run is well under a minute, and the
 # point is to catch a wedge, not to police latency.

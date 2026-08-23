@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { getAppState } from "../../src/database.ts";
 import { rowCount } from "./inspect.ts";
-import { session } from "./pi-session.ts";
+import { session } from "./session.ts";
 
 describe("/plan-stories without a model", () => {
 	it("B2 with no argument shows usage", async (t) => {

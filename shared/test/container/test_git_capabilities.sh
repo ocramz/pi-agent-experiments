@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # The gate on everything else.
 #
+# This tests the *image*, not any one package, which is why it lives in shared/
+# and runs once per repo rather than once per extension — the answer cannot
+# differ between packages pinned to the same digest.
+#
 # The image's git is built with C builtins only and without perl, to save ~35 MB.
-# Every git feature this extension depends on is therefore an assumption until
-# proven here. If `stash create` is missing, /undo-turn has to be rebuilt around
-# `commit-tree`; if `worktree` is missing, worktree mode cannot exist at all.
-# Much cheaper to learn on day one than after the feature is written.
+# Every git feature an extension depends on is therefore an assumption until
+# proven here. If `stash create` is missing, pi-issue-tracker's /undo-turn has to
+# be rebuilt around `commit-tree`; if `worktree` is missing, its worktree mode
+# cannot exist at all. Much cheaper to learn on day one than after the feature is
+# written. The ref and branch names below are arbitrary probe strings; they
+# borrow pi-issue-tracker's shapes because that is what first needed proving.
 #
 # Note for edits: userland is busybox — no `grep -P`, no GNU-only find predicates.
 # The snippet below is passed through `bash -c`, so anything the outer shell would

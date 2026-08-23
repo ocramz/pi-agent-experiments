@@ -1,104 +1,22 @@
 #!/usr/bin/env bash
-# Run every container test, in dependency order.
+# This package's container tests, in dependency order.
 #
-# Requires a container engine and an OpenRouter key. test_git_capabilities.sh
-# runs first on purpose: it is the gate on the design, so a failure there should
-# stop the run rather than be buried under later output. test_extension_live.sh
-# runs last: it is the slowest and the only one that spends money.
+# Everything generic — the engine smoke test, the architecture diagnostics, the
+# inner-store guard, the pinned digest — lives in the shared driver. All that is
+# left here is which suites to run and in what order.
 #
-#   IMAGE=...  override the image (pin a digest in CI)
-#   ENGINE=... podman (default) or docker
-#   PI_MODEL=, PI_PROVIDER=  what the live suite drives
+# test_unit_in_image.sh runs first: it is cheap and it proves the package is even
+# readable to the image user. test_extension_live.sh runs last: it is the slowest
+# and the only one that spends money, which is also why REQUIRE_API_KEY is set.
+#
+# The image's git capabilities are probed once for the whole repo rather than
+# once per package — see `make test-image` and
+# shared/test/container/test_git_capabilities.sh.
 set -uo pipefail
 
 cd "$(dirname "$0")"
 
-# Pinned by digest, like TEST_IMAGE in the root Makefile and IMAGE in
-# .github/workflows/test.yml — all three must move together. The capability probe
-# asserts what this userland's perl-less git can do, and on a moving tag a base
-# image change would alter that silently. The digest is the multi-arch index, so
-# it resolves on an arm64 laptop and an amd64 runner alike — see the Makefile for
-# why a per-platform digest is the wrong thing to paste here.
-export IMAGE="${IMAGE:-ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b}"
-export ENGINE="${ENGINE:-podman}"
-export PI_PROVIDER="${PI_PROVIDER:-openrouter}"
-export PI_MODEL="${PI_MODEL:-deepseek/deepseek-v4-flash}"
-
-# test_extension_live.sh drives a real model, which is the only way to reach the
-# extension at all — everything in extensions/index.ts hangs off a pi runtime.
-# Refusing loudly beats skipping quietly, same as the engine check below.
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-	echo "OPENROUTER_API_KEY is not set — the live extension suite cannot run." >&2
-	echo "Set it in .env at the repo root (see env.example), then use 'make test-container'." >&2
-	exit 78
-fi
-
-# lib.sh splices USER_FLAGS into every `podman run` it issues, so this is the
-# whole of the hand-off inward. The distroless image points HOME and
-# PI_CODING_AGENT_DIR at read-only paths; /tmp is all uid 65532 can write.
-export USER_FLAGS="${USER_FLAGS:-} -e OPENROUTER_API_KEY -e PI_PROVIDER -e PI_MODEL -e HOME=/tmp -e PI_CODING_AGENT_DIR=/tmp/agent"
-
-if ! command -v "$ENGINE" >/dev/null 2>&1; then
-	echo "no container engine: '$ENGINE' is not on PATH" >&2
-	echo "install podman, or set ENGINE=docker" >&2
-	exit 127
-fi
-
-# The inner image store must be a dedicated volume. Without one every layer a
-# pull or build writes lands on the dev container's overlay — 8 GB, shared with
-# the toolchain — and fills it silently; that is how this rig once ate 2.1 GB.
-# `make dev` mounts STORAGE_VOL there; a container started any other way does not.
-# This runs before the smoke test below, which would itself write into the store.
-# Only meaningful when nested: on a CI runner podman is not itself in a container
-# and its graphroot is legitimately a plain directory.
-if [ -z "${PI_ALLOW_UNMOUNTED_STORE:-}" ] && { [ -f /run/.containerenv ] || [ -f /.dockerenv ]; }; then
-	graphroot="$("$ENGINE" info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
-	if [ -n "$graphroot" ] && command -v findmnt >/dev/null 2>&1 &&
-		[ "$(findmnt -T "$graphroot" -no TARGET 2>/dev/null)" != "$graphroot" ]; then
-		echo "the inner image store '$graphroot' is not a mounted volume." >&2
-		echo "Pulling into it fills this container's overlay filesystem." >&2
-		echo "Start the dev container with 'make dev', which mounts STORAGE_VOL there." >&2
-		echo "Set PI_ALLOW_UNMOUNTED_STORE=1 to run anyway." >&2
-		exit 1
-	fi
-fi
-
-# Prove the engine can actually start a container before running any suite.
-# Without this, a sandbox that blocks mount propagation or lacks /dev/fuse makes
-# every assertion fail and the run reports "git capability probe failed" — which
-# sends the reader after entirely the wrong problem.
-if ! smoke="$("$ENGINE" run --rm --entrypoint /bin/bash "$IMAGE" -c 'echo engine-ok' 2>&1)" ||
-	[ "${smoke#*engine-ok}" = "$smoke" ]; then
-	# An architecture mismatch fails here too, and it is not an engine fault: the
-	# engine is fine, the image is for another CPU. `podman pull` by digest does
-	# not enforce a platform, so a per-platform digest pulls cleanly and only dies
-	# at `run` — pointing the reader at their engine sends them nowhere.
-	case "$smoke" in
-	*"Exec format error"* | *"does not match the expected platform"*)
-		echo "the image is built for a different architecture than this host — the tests were not run." >&2
-		printf '%s\n' "$smoke" | head -3 >&2
-		echo "IMAGE must be pinned to the multi-arch index digest, not to one platform's" >&2
-		echo "manifest; see the TEST_IMAGE comment in the root Makefile for how to re-pin." >&2
-		exit 127
-		;;
-	esac
-	echo "container engine '$ENGINE' cannot run containers here — the tests were not run." >&2
-	printf '%s\n' "$smoke" | head -3 >&2
-	echo "Run these on a machine with a working engine, or in CI." >&2
-	exit 127
-fi
-
-status=0
-for script in test_git_capabilities.sh test_unit_in_image.sh test_extension_live.sh; do
-	[ -f "$script" ] || continue
-	printf '\n=== %s ===\n' "$script"
-	bash "$script" || status=1
-	# The capability probe gates the rest: if git cannot do what the design
-	# assumes, later failures are noise.
-	if [ "$script" = "test_git_capabilities.sh" ] && [ "$status" -ne 0 ]; then
-		echo "git capability probe failed — stopping before the dependent suites" >&2
-		exit 1
-	fi
-done
-
-exit "$status"
+REQUIRE_API_KEY=1 CALLER_DIR="$PWD" \
+	exec ../../../shared/test/container/run-suites.sh \
+	test_unit_in_image.sh \
+	test_extension_live.sh

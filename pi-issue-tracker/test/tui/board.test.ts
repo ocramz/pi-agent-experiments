@@ -9,7 +9,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { getStoryById, getStoryCommit } from "../../src/database.ts";
-import { session } from "./pi-session.ts";
+import { session } from "./session.ts";
 
 describe("/stories board", () => {
 	it("A1 opens, shows the tree and the open count", async (t) => {

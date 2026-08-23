@@ -1,0 +1,52 @@
+{
+	// The compiler settings every pi extension in this repo shares. A package's
+	// own tsconfig.json extends this and supplies nothing but `include`.
+	//
+	// Relative paths below — `typeRoots`, `paths` — resolve against THIS file's
+	// directory, not against the extending package's. That is what makes the
+	// single shared scope work: `./typecheck/node_modules` means shared/typecheck
+	// no matter which package is being checked. Verify with
+	// `tsc --showConfig -p <pkg>/tsconfig.json` after any move.
+	"compilerOptions": {
+		"target": "ES2023",
+		"lib": ["ES2023"],
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"types": ["node"],
+		// Node's own types come from the same pinned scope, and at the major
+		// version this code actually runs on. Left to the default lookup they come
+		// from whatever @types/node the installed pi happens to bundle — 22.x
+		// today — so the compiler would be checking node 24 source against node 22
+		// declarations, and only inside the container, where that symlink resolves.
+		"typeRoots": ["./typecheck/node_modules/@types"],
+		"strict": true,
+		"noEmit": true,
+		"allowImportingTsExtensions": true,
+		"forceConsistentCasingInFileNames": true,
+		// Skipping .d.ts checking keeps the compiler off pi's own declarations and
+		// the provider SDKs underneath them; a package's job is to type-check its
+		// own source against those declarations, not to audit them.
+		"skipLibCheck": true,
+		// Where pi's declarations come from. They are not in any package's
+		// node_modules because the packages have no install step — see
+		// shared/typecheck/package.json for why they live off to one side. Only the
+		// compiler resolves through these; at runtime pi supplies its own modules
+		// to the extension, which is why the container suite can stage a package
+		// with no node_modules at all and still load it.
+		//
+		// Each entry points at a declaration *file*, not at the package directory.
+		// The packages are `"type": "module"`, so nodenext resolves in ESM mode,
+		// where a directory does not resolve through package.json at all — mapping
+		// to the directory silently leaves every pi type as `any`, which type-checks
+		// clean and proves nothing. The paths mirror each package's own `types`
+		// field, and the versions that define that layout are pinned alongside them.
+		"paths": {
+			"@earendil-works/pi-ai": ["./typecheck/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
+			"@earendil-works/pi-coding-agent": [
+				"./typecheck/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+			],
+			"@earendil-works/pi-tui": ["./typecheck/node_modules/@earendil-works/pi-tui/dist/index.d.ts"],
+			"typebox": ["./typecheck/node_modules/typebox/build/index.d.mts"]
+		}
+	}
+}

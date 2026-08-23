@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Vendored from ocramz/pi-container-distroless-node24 (tests/lib.sh), kept in-tree
-# so this package's container tests are self-contained — no submodule, no fetch at
-# test time. The harness is short and stable; re-sync it if upstream changes.
+# so the container tests are self-contained — no submodule, no fetch at test time.
+# The harness is short and stable; re-sync it if upstream changes.
+#
+# Shared by every package in this repo: nothing here knows which package it is
+# staging, and stage_pkg takes the directory as an argument.
 #
 #   ENGINE     container engine (default: podman)
 #   IMAGE      image to test against — pin a digest, never :latest
@@ -10,10 +13,10 @@
 set -uo pipefail
 
 # ok / fail / assert_* / summary.
-source "$(dirname "${BASH_SOURCE[0]}")/../lib/assert.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../assert.sh"
 
 ENGINE="${ENGINE:-podman}"
-IMAGE="${IMAGE:?IMAGE must be set — see run.sh for the pinned digest}"
+IMAGE="${IMAGE:?IMAGE must be set — see TEST_IMAGE in shared/versions.env}"
 FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/fixtures" 2>/dev/null && pwd)}"
 USER_FLAGS="${USER_FLAGS:-}"
 
@@ -27,11 +30,12 @@ USER_FLAGS="${USER_FLAGS:-}"
 # the same on Linux, where the modes were fine to begin with.
 #
 # Every node_modules is excluded during the copy rather than deleted after it,
-# and at any depth. There are three of them and none belongs in the image: the
-# package's own is a tree of symlinks into the global pi install, test/tui's
-# holds the interactive tier's dependencies, and tools/typecheck's is a quarter
-# of a gigabyte of pi and its provider SDKs. Deleting them afterwards, as this
-# used to, still pays to copy them first.
+# and at any depth. None belongs in the image: a package's own is a tree of
+# symlinks into the global pi install, and the two big shared scopes —
+# shared/typecheck (260 MB of pi and its provider SDKs) and shared/test/tui —
+# are outside the staged directory entirely now, which is a second reason the
+# copy stays cheap. Deleting them afterwards, as this used to, still pays to
+# copy them first.
 stage_pkg() {
 	local src="$1" dest
 	dest="$(mktemp -d)" || return 1
