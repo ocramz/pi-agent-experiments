@@ -336,10 +336,25 @@ function rowToEpicBranch(row: Record<string, unknown>): EpicBranch {
 export type CreateEpicBranchInput = Omit<EpicBranch, "created_at" | "updated_at" | "state" | "setup"> &
 	Partial<Pick<EpicBranch, "state" | "setup">>;
 
-export function createEpicBranch(db: DatabaseSync, data: CreateEpicBranchInput): EpicBranch {
+/**
+ * The timestamp is written by the caller, not left to the column default.
+ *
+ * `DEFAULT (strftime('%s','now') * 1000)` is millisecond *scale* at second
+ * *resolution*: two epics created in the same second hold identical values, and
+ * every ordering that falls back on them degenerates to rowid. It also ignores
+ * `TrackerContext.now`, so a test could not control the clock. Passing `now`
+ * here fixes both. The column defaults stay because `INIT_SQL` is
+ * `CREATE TABLE IF NOT EXISTS` and there are no migrations — they simply stop
+ * being the path that runs.
+ */
+export function createEpicBranch(
+	db: DatabaseSync,
+	data: CreateEpicBranchInput,
+	now: number = Date.now(),
+): EpicBranch {
 	const stmt = db.prepare(
-		`INSERT INTO epic_branches (epic_id, mode, branch, base_branch, base_commit, path, state, setup)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO epic_branches (epic_id, mode, branch, base_branch, base_commit, path, state, setup, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      RETURNING *`,
 	);
 	const row = stmt.get(
@@ -351,6 +366,8 @@ export function createEpicBranch(db: DatabaseSync, data: CreateEpicBranchInput):
 		data.path,
 		data.state ?? "active",
 		JSON.stringify(data.setup ?? {}),
+		now,
+		now,
 	) as Record<string, unknown>;
 	return rowToEpicBranch(row);
 }
@@ -363,21 +380,57 @@ export function getEpicBranch(db: DatabaseSync, epicId: number): EpicBranch | nu
 }
 
 /**
- * The epic currently being worked on. At most one is active in branch mode;
- * worktree mode allows several, so this returns the most recently started.
+ * Every epic still being worked on.
+ *
+ * Several can be active at once: branch mode allows one, and each worktree epic
+ * adds another. This is what the start gate reasons over — see
+ * `checkCanStartEpic` in src/rules.ts.
  */
-export function getActiveEpicBranch(db: DatabaseSync): EpicBranch | null {
+export function getActiveEpicBranches(db: DatabaseSync): EpicBranch[] {
+	const rows = db
+		.prepare("SELECT * FROM epic_branches WHERE state = 'active' ORDER BY created_at ASC, epic_id ASC")
+		.all() as Record<string, unknown>[];
+	return rows.map(rowToEpicBranch);
+}
+
+/**
+ * The active epic occupying the *main* checkout.
+ *
+ * At most one can exist, because a branch-mode epic owns the main working tree's
+ * HEAD and two of them would fight over it. Worktree epics are invisible here on
+ * purpose: they never touch the main checkout, which is exactly what lets them
+ * run concurrently.
+ */
+export function getActiveBranchModeEpic(db: DatabaseSync): EpicBranch | null {
 	const row = db
-		.prepare("SELECT * FROM epic_branches WHERE state = 'active' ORDER BY created_at DESC, epic_id DESC LIMIT 1")
+		.prepare(
+			"SELECT * FROM epic_branches WHERE state = 'active' AND mode = 'branch' ORDER BY created_at DESC, epic_id DESC LIMIT 1",
+		)
 		.get() as Record<string, unknown> | undefined;
 	return row ? rowToEpicBranch(row) : null;
 }
 
+/** Ordered oldest first by when each row last changed. */
 export function getEpicBranchesByState(db: DatabaseSync, state: EpicState): EpicBranch[] {
 	const rows = db
-		.prepare("SELECT * FROM epic_branches WHERE state = ? ORDER BY created_at ASC")
+		.prepare("SELECT * FROM epic_branches WHERE state = ? ORDER BY updated_at ASC, epic_id ASC")
 		.all(state) as Record<string, unknown>[];
 	return rows.map(rowToEpicBranch);
+}
+
+/**
+ * The epic whose merge landed most recently — what `/undo-merge` means by "the
+ * last one".
+ *
+ * Ordered by `updated_at`, not `created_at`: those answer different questions
+ * ("which merged last" versus "which started last") and only coincided while a
+ * single epic could be active at a time.
+ */
+export function getLastMergedEpicBranch(db: DatabaseSync): EpicBranch | null {
+	const row = db
+		.prepare("SELECT * FROM epic_branches WHERE state = 'merged' ORDER BY updated_at DESC, epic_id DESC LIMIT 1")
+		.get() as Record<string, unknown> | undefined;
+	return row ? rowToEpicBranch(row) : null;
 }
 
 /** Find the epic whose worktree contains `path`, so a session can tell where it is. */
@@ -388,10 +441,12 @@ export function getEpicBranchByPath(db: DatabaseSync, path: string): EpicBranch 
 	return row ? rowToEpicBranch(row) : null;
 }
 
+/** `now` is caller-supplied for the same reason as in `createEpicBranch`. */
 export function updateEpicBranch(
 	db: DatabaseSync,
 	epicId: number,
 	updates: Partial<Pick<EpicBranch, "state" | "setup" | "path" | "base_commit">>,
+	now: number = Date.now(),
 ): EpicBranch | null {
 	const setClauses: string[] = [];
 	const values: SqlValue[] = [];
@@ -402,8 +457,8 @@ export function updateEpicBranch(
 	}
 	if (setClauses.length === 0) return getEpicBranch(db, epicId);
 
-	setClauses.push(`updated_at = strftime('%s', 'now') * 1000`);
-	values.push(epicId);
+	setClauses.push("updated_at = ?");
+	values.push(now, epicId);
 	const row = db
 		.prepare(`UPDATE epic_branches SET ${setClauses.join(", ")} WHERE epic_id = ? RETURNING *`)
 		.get(...values) as Record<string, unknown> | undefined;
@@ -433,14 +488,15 @@ export function recordStoryStart(
 	storyId: number,
 	epicId: number,
 	startCommit: string,
+	now: number = Date.now(),
 ): StoryCommit {
 	const row = db
 		.prepare(
-			`INSERT INTO story_commits (story_id, epic_id, start_commit) VALUES (?, ?, ?)
+			`INSERT INTO story_commits (story_id, epic_id, start_commit, created_at) VALUES (?, ?, ?, ?)
        ON CONFLICT(story_id) DO UPDATE SET epic_id = excluded.epic_id
        RETURNING *`,
 		)
-		.get(storyId, epicId, startCommit) as Record<string, unknown>;
+		.get(storyId, epicId, startCommit, now) as Record<string, unknown>;
 	return rowToStoryCommit(row);
 }
 

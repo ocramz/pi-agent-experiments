@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { readManifest, type EpicManifest } from "./config.ts";
-import type { TrackerContext } from "./context.ts";
+import type { GitRunner, TrackerContext } from "./context.ts";
 import {
 	createEpicBranch,
+	getActiveBranchModeEpic,
 	getEpicBranch,
+	getEpicBranchByPath,
 	getStoryById,
 	getStoryCommit,
 	recordStoryCommit,
@@ -17,18 +19,23 @@ import {
 	currentBranch,
 	findConflicts,
 	isDirty,
+	listBackupRefs,
 	revParse,
 	writeBackupRef,
 } from "./git.ts";
 import {
 	backupRefName,
 	checkStageSize,
+	checkpointRefPrefix,
 	chooseUndoStrategy,
 	epicBranchName,
+	refsToPrune,
 	storyCommitMessage,
+	worktreeDirName,
 	type CheckResult,
 } from "./rules.ts";
 import type { EpicBranch, EpicMode, Story } from "./types.ts";
+import { addWorktree, branchCheckoutLocation, copyManifestFiles, removeWorktree } from "./worktree.ts";
 
 /**
  * The epic lifecycle: start, commit each story, update from the base branch,
@@ -45,9 +52,46 @@ export interface Outcome {
 	note: string;
 }
 
-/** Where an epic's git commands run: its worktree if it has one, else the main repo. */
+/**
+ * Where an epic's git commands run: its worktree if it has one, else the main repo.
+ *
+ * `path` is non-null exactly while the worktree exists — it is cleared when the
+ * worktree is removed, so a merged or cancelled epic falls back to the main
+ * repository and `undoStory` against it still works.
+ */
 export function epicCwd(ctx: TrackerContext, epic: EpicBranch): string {
 	return epic.path ?? ctx.paths.repoRoot;
+}
+
+/** The top of the working tree containing `cwd` — the *linked* one, not the main repo. */
+export async function worktreeTopLevel(git: GitRunner, cwd: string): Promise<string | null> {
+	const result = await git(["rev-parse", "--show-toplevel"], { cwd });
+	return result.code === 0 ? result.stdout.trim() || null : null;
+}
+
+/**
+ * The epic this session owns, resolved from where the session is standing.
+ *
+ * With concurrent epics there is no such thing as "the" active epic: several run
+ * at once, each in its own worktree and its own pi session. A session inside a
+ * linked worktree owns whatever epic claims that directory; a session in the
+ * main checkout owns the branch-mode epic, of which there is at most one.
+ *
+ * Deliberately *not* resolved by current branch. The design lets the user wander
+ * off the epic branch mid-epic — that is why `base_branch` is recorded at start
+ * rather than read at merge time — and branch-based resolution would lose the
+ * epic the moment they did.
+ */
+export async function resolveSessionEpic(
+	ctx: TrackerContext,
+	cwd: string,
+): Promise<EpicBranch | null> {
+	const top = await worktreeTopLevel(ctx.git, cwd);
+	if (top && top !== ctx.paths.repoRoot) {
+		const epic = getEpicBranchByPath(ctx.db, top);
+		return epic && epic.state === "active" ? epic : null;
+	}
+	return getActiveBranchModeEpic(ctx.db);
 }
 
 /** Nearest ancestor (or self) that has an epic branch recorded. */
@@ -147,9 +191,12 @@ export async function runSetup(
 		versions = probed.stdout.trim();
 	}
 
-	updateEpicBranch(ctx.db, epic.epic_id, {
-		setup: { hash, exit_code: result.code, versions, ran_at: ctx.now() },
-	});
+	updateEpicBranch(
+		ctx.db,
+		epic.epic_id,
+		{ setup: { hash, exit_code: result.code, versions, ran_at: ctx.now() } },
+		ctx.now(),
+	);
 
 	return result.code === 0
 		? { ok: true, note: "setup completed" }
@@ -161,10 +208,15 @@ export async function runSetup(
 export interface StartEpicOptions {
 	story: Story;
 	mode?: EpicMode;
-	/** Commit a dirty tree as the epic's first commit instead of refusing. */
+	/** Commit a dirty tree as the epic's first commit instead of refusing. Branch mode only. */
 	carryDirty?: boolean;
-	/** Worktree mode only. */
+	/** Worktree mode: overrides the derived `<worktreeRoot>/<worktreeDirName>`. */
 	path?: string | null;
+}
+
+/** Where a worktree epic's directory goes, unless the caller names one. */
+export function epicWorktreePath(ctx: TrackerContext, story: Story): string {
+	return join(ctx.paths.worktreeRoot, worktreeDirName(story));
 }
 
 /**
@@ -173,6 +225,11 @@ export interface StartEpicOptions {
  * Preconditions are checked by the caller through `checkCanStartEpic`; this
  * function performs. A backup ref is written before the branch is created so
  * that even "start" has an inverse.
+ *
+ * The two modes diverge on one question: does the main checkout move? In branch
+ * mode it does — `git switch -c` — and that is why only one branch-mode epic can
+ * exist. In worktree mode nothing about the main checkout changes, which is what
+ * makes concurrent epics possible.
  */
 export async function startEpic(
 	ctx: TrackerContext,
@@ -182,6 +239,8 @@ export async function startEpic(
 	const cwd = ctx.paths.repoRoot;
 
 	// Before anything is committed, so the tracker never commits its own database.
+	// `.git/info/exclude` lives in the common git dir, so one write covers every
+	// worktree.
 	await ensureDatabaseIgnored(ctx);
 
 	const baseBranch = await currentBranch(ctx.git, cwd);
@@ -193,39 +252,69 @@ export async function startEpic(
 	await writeBackupRef(ctx.git, backupRefName(story.id, "pre-start"), baseCommit, cwd);
 
 	const branch = epicBranchName(story);
-	const created = await ctx.git(["switch", "--quiet", "-c", branch], { cwd });
-	if (created.code !== 0) {
-		return { ok: false, note: `could not create ${branch}: ${created.stderr.trim()}` };
+	const manifest = readManifest(ctx.paths.manifestPath);
+
+	let path: string | null = null;
+	let located = "";
+
+	if (mode === "worktree") {
+		path = opts.path ?? epicWorktreePath(ctx, story);
+		const added = await addWorktree(ctx.git, { cwd, path, branch, base: baseBranch });
+		if (added.code !== 0) {
+			return { ok: false, note: `could not create a worktree at ${path}: ${(added.stderr || added.stdout).trim()}` };
+		}
+
+		// Store the path git resolved, not the one we asked for. `resolveSessionEpic`
+		// looks the row up by string equality against `rev-parse --show-toplevel`,
+		// and git reports the real path — so a worktree root reached through a
+		// symlink (every /tmp on macOS) would never match what we wrote.
+		path = (await worktreeTopLevel(ctx.git, path)) ?? path;
+
+		// A worktree is a checkout: it carries tracked files and nothing else.
+		// Whatever the manifest declares under `copy` — .env and friends — has to
+		// be brought over or setup fails for reasons that look like its fault.
+		const { copied, skipped } = copyManifestFiles(cwd, path, manifest.copy);
+		located = ` in ${path}`;
+		if (copied.length) located += ` (copied ${copied.join(", ")})`;
+		if (skipped.length) located += ` (could not copy ${skipped.join(", ")})`;
+	} else {
+		const created = await ctx.git(["switch", "--quiet", "-c", branch], { cwd });
+		if (created.code !== 0) {
+			return { ok: false, note: `could not create ${branch}: ${created.stderr.trim()}` };
+		}
+
+		// Carrying a dirty tree keeps the user's in-flight work rather than making
+		// them stash it by hand — the branch switch above brought it along.
+		if (carryDirty && (await isDirty(ctx.git, cwd))) {
+			await ctx.git(["add", "-A"], { cwd });
+			const committed = await ctx.git(
+				["commit", "--quiet", "-m", `story(#${story.id}): carry uncommitted changes into ${branch}`],
+				{ cwd },
+			);
+			if (committed.code === 0) located = " (existing changes carried into the first commit)";
+		}
 	}
 
-	// Carrying a dirty tree keeps the user's in-flight work rather than making
-	// them stash it by hand — the branch switch above brought it along.
-	let carried = "";
-	if (carryDirty && (await isDirty(ctx.git, cwd))) {
-		await ctx.git(["add", "-A"], { cwd });
-		const committed = await ctx.git(
-			["commit", "--quiet", "-m", `story(#${story.id}): carry uncommitted changes into ${branch}`],
-			{ cwd },
-		);
-		if (committed.code === 0) carried = " (existing changes carried into the first commit)";
-	}
+	const epic = createEpicBranch(
+		ctx.db,
+		{
+			epic_id: story.id,
+			mode,
+			branch,
+			base_branch: baseBranch,
+			base_commit: baseCommit,
+			path,
+		},
+		ctx.now(),
+	);
 
-	const epic = createEpicBranch(ctx.db, {
-		epic_id: story.id,
-		mode,
-		branch,
-		base_branch: baseBranch,
-		base_commit: baseCommit,
-		path: opts.path ?? null,
-	});
-
-	const setup = await runSetup(ctx, epic);
+	const setup = await runSetup(ctx, epic, manifest);
 	const refreshed = getEpicBranch(ctx.db, story.id) ?? epic;
 
 	return {
 		ok: setup.ok,
 		epic: refreshed,
-		note: `epic #${story.id} started on ${branch} (from ${baseBranch})${carried}${setup.note ? ` — ${setup.note}` : ""}`,
+		note: `epic #${story.id} started on ${branch} (from ${baseBranch})${located}${setup.note ? ` — ${setup.note}` : ""}`,
 	};
 }
 
@@ -238,7 +327,7 @@ export async function recordStoryStartCommit(
 	epic: EpicBranch,
 ): Promise<void> {
 	const head = await revParse(ctx.git, "HEAD", epicCwd(ctx, epic));
-	if (head) recordStoryStart(ctx.db, story.id, epic.epic_id, head);
+	if (head) recordStoryStart(ctx.db, story.id, epic.epic_id, head, ctx.now());
 }
 
 /**
@@ -359,39 +448,84 @@ export async function updateFromBase(
  * `--ff-only` is the point: after step 1 the base branch is an ancestor, so this
  * cannot conflict and cannot leave the user's branch half-merged. A backup ref
  * is written first, which is what makes `undoMerge` a one-liner.
+ *
+ * Two ways to move the branch. The working-tree way — check out the base branch
+ * and `merge --ff-only` — is right whenever the main checkout should end up
+ * showing the merged result: always in branch mode, where the user has been
+ * sitting on the epic branch and expects to come back, and in worktree mode when
+ * the main checkout already happens to be on the base branch.
+ *
+ * Otherwise the ref is moved directly, under a compare-and-swap. Checking the
+ * base branch out just to merge it would drag a session somewhere it did not ask
+ * to go, and with concurrent epics that session belongs to somebody else.
+ * `checkCanMerge` has already refused the third case, where another worktree
+ * holds the base branch.
  */
 export async function mergeIntoBase(
 	ctx: TrackerContext,
 	epic: EpicBranch,
 ): Promise<Outcome & { backupRef?: string }> {
 	const cwd = ctx.paths.repoRoot;
-
-	if (await isDirty(ctx.git, cwd)) {
-		return { ok: false, note: `${ctx.paths.repoRoot} has uncommitted changes — commit or stash them first` };
-	}
-
-	// The base branch has to be the checked-out branch for the merge to land.
-	const onBranch = await currentBranch(ctx.git, cwd);
-	if (onBranch !== epic.base_branch) {
-		const switched = await ctx.git(["switch", "--quiet", epic.base_branch], { cwd });
-		if (switched.code !== 0) {
-			return { ok: false, note: `could not switch to ${epic.base_branch}: ${switched.stderr.trim()}` };
-		}
-	}
-
 	const backupRef = backupRefName(epic.epic_id, "pre-merge");
-	const baseHead = await revParse(ctx.git, "HEAD", cwd);
-	if (baseHead) await writeBackupRef(ctx.git, backupRef, baseHead, cwd);
 
-	const merged = await ctx.git(["merge", "--ff-only", epic.branch], { cwd });
-	if (merged.code !== 0) {
+	const holder = await branchCheckoutLocation(ctx.git, cwd, epic.base_branch);
+	if (holder && holder !== cwd) {
 		return {
 			ok: false,
-			note: `fast-forward of ${epic.base_branch} failed — ${epic.base_branch} has moved. Update the epic from it first, then merge again.`,
+			note: `${epic.base_branch} is checked out in ${holder} — finish or move that worktree before merging.`,
 		};
 	}
 
-	updateEpicBranch(ctx.db, epic.epic_id, { state: "merged" });
+	const baseHead = await revParse(ctx.git, epic.base_branch, cwd);
+	if (!baseHead) return { ok: false, note: `${epic.base_branch} no longer exists` };
+	const epicTip = await revParse(ctx.git, epic.branch, cwd);
+	if (!epicTip) return { ok: false, note: `${epic.branch} no longer exists` };
+
+	await writeBackupRef(ctx.git, backupRef, baseHead, cwd);
+
+	// Branch mode always lands in the working tree: the user started the epic
+	// from this checkout and the merge is what brings them home.
+	const inWorkingTree = epic.mode === "branch" || holder === cwd;
+
+	if (inWorkingTree) {
+		if (await isDirty(ctx.git, cwd)) {
+			return { ok: false, note: `${cwd} has uncommitted changes — commit or stash them first` };
+		}
+		if (holder !== cwd) {
+			const switched = await ctx.git(["switch", "--quiet", epic.base_branch], { cwd });
+			if (switched.code !== 0) {
+				return { ok: false, note: `could not switch to ${epic.base_branch}: ${switched.stderr.trim()}` };
+			}
+		}
+		const merged = await ctx.git(["merge", "--ff-only", epic.branch], { cwd });
+		if (merged.code !== 0) {
+			return {
+				ok: false,
+				note: `fast-forward of ${epic.base_branch} failed — ${epic.base_branch} has moved. Update the epic from it first, then merge again.`,
+			};
+		}
+	} else {
+		// Nobody has the base branch checked out, so no working tree can go stale.
+		// Ancestry is checked explicitly because `update-ref` would happily move
+		// the branch sideways; the CAS on `baseHead` closes the window between the
+		// check and the write.
+		const ancestor = await ctx.git(["merge-base", "--is-ancestor", epic.base_branch, epic.branch], { cwd });
+		if (ancestor.code !== 0) {
+			return {
+				ok: false,
+				note: `fast-forward of ${epic.base_branch} failed — ${epic.base_branch} has moved. Update the epic from it first, then merge again.`,
+			};
+		}
+		const moved = await ctx.git(["update-ref", `refs/heads/${epic.base_branch}`, epicTip, baseHead], { cwd });
+		if (moved.code !== 0) {
+			return {
+				ok: false,
+				note: `could not move ${epic.base_branch}: ${(moved.stderr || moved.stdout).trim()}`,
+			};
+		}
+	}
+
+	updateEpicBranch(ctx.db, epic.epic_id, { state: "merged" }, ctx.now());
 	return {
 		ok: true,
 		backupRef,
@@ -399,24 +533,65 @@ export async function mergeIntoBase(
 	};
 }
 
-/** Stop working on an epic without merging. The branch is kept, so this is reversible. */
+/**
+ * Take down an epic's worktree and clear the row's `path`.
+ *
+ * Split out because both `/merge-epic` and `/cancel-epic` need it, and both need
+ * it to happen *after* the session standing in that directory has moved out.
+ * Clearing `path` maintains the invariant `epicCwd` depends on: a row points at
+ * a directory only while that directory exists.
+ */
+export async function releaseWorktree(
+	ctx: TrackerContext,
+	epic: EpicBranch,
+	opts: { force?: boolean } = {},
+): Promise<Outcome> {
+	if (epic.mode !== "worktree" || !epic.path) return { ok: true, note: "" };
+
+	const removed = await removeWorktree(ctx.git, ctx.paths.repoRoot, epic.path, opts);
+	if (removed.code !== 0) {
+		return {
+			ok: false,
+			note: `could not remove the worktree at ${epic.path}: ${(removed.stderr || removed.stdout).trim()}`,
+		};
+	}
+	updateEpicBranch(ctx.db, epic.epic_id, { path: null }, ctx.now());
+	return { ok: true, note: `removed the worktree at ${epic.path}` };
+}
+
+/**
+ * Stop working on an epic without merging. The branch is kept, so this is reversible.
+ *
+ * Branch mode has to move the main checkout back off the epic branch. Worktree
+ * mode must not touch it at all — the main checkout was never moved, and another
+ * session may be sitting in it.
+ */
 export async function cancelEpic(
 	ctx: TrackerContext,
 	epic: EpicBranch,
-	opts: { deleteBranch?: boolean } = {},
+	opts: { deleteBranch?: boolean; force?: boolean } = {},
 ): Promise<Outcome> {
 	const cwd = ctx.paths.repoRoot;
 
 	const tip = await revParse(ctx.git, epic.branch, cwd);
 	if (tip) await writeBackupRef(ctx.git, backupRefName(epic.epic_id, "pre-cancel"), tip, cwd);
 
-	if (await isDirty(ctx.git, cwd)) {
-		return { ok: false, note: "working tree has uncommitted changes — commit or stash them first" };
-	}
-
-	const switched = await ctx.git(["switch", "--quiet", epic.base_branch], { cwd });
-	if (switched.code !== 0) {
-		return { ok: false, note: `could not switch back to ${epic.base_branch}: ${switched.stderr.trim()}` };
+	let where: string;
+	if (epic.mode === "worktree") {
+		// Removing the worktree is what frees the branch: git refuses `branch -D`
+		// while a working tree has it checked out.
+		const released = await releaseWorktree(ctx, epic, { force: opts.force });
+		if (!released.ok) return released;
+		where = `the main checkout is untouched, ${released.note}`;
+	} else {
+		if (await isDirty(ctx.git, cwd)) {
+			return { ok: false, note: "working tree has uncommitted changes — commit or stash them first" };
+		}
+		const switched = await ctx.git(["switch", "--quiet", epic.base_branch], { cwd });
+		if (switched.code !== 0) {
+			return { ok: false, note: `could not switch back to ${epic.base_branch}: ${switched.stderr.trim()}` };
+		}
+		where = `back on ${epic.base_branch}`;
 	}
 
 	let deleted = "";
@@ -427,11 +602,62 @@ export async function cancelEpic(
 		deleted = removed.code === 0 ? `, branch ${epic.branch} deleted` : "";
 	}
 
-	updateEpicBranch(ctx.db, epic.epic_id, { state: "cancelled" });
+	updateEpicBranch(ctx.db, epic.epic_id, { state: "cancelled" }, ctx.now());
 	return {
 		ok: true,
-		note: `epic #${epic.epic_id} cancelled, back on ${epic.base_branch}${deleted}. Its work is still reachable at ${backupRefName(epic.epic_id, "pre-cancel")}.`,
+		note: `epic #${epic.epic_id} cancelled, ${where}${deleted}. Its work is still reachable at ${backupRefName(epic.epic_id, "pre-cancel")}.`,
 	};
+}
+
+// ─── Ref hygiene ────────────────────────────────────────────────────
+
+/**
+ * Keep the newest `keep` checkpoints for an epic and delete the rest.
+ *
+ * `turn_end` writes one ref per turn that ended with a dirty tree, so an epic
+ * that runs for a day leaves hundreds. They cost 41 bytes each and keep their
+ * stash commits alive, which is the point — but only for as long as anybody
+ * might reach for them, and `/undo-turn` only ever reads the newest.
+ */
+export async function pruneCheckpoints(
+	ctx: TrackerContext,
+	epic: EpicBranch,
+	keep = 20,
+): Promise<number> {
+	const cwd = epicCwd(ctx, epic);
+	const refs = await listBackupRefs(ctx.git, checkpointRefPrefix(epic.epic_id), cwd);
+	const doomed = refsToPrune(refs, keep);
+	for (const ref of doomed) await ctx.git(["update-ref", "-d", ref], { cwd });
+	return doomed.length;
+}
+
+/**
+ * Delete an epic's backup refs, except the operations named in `keep`.
+ *
+ * Backup refs are the safety net that gives every command an inverse, so they
+ * are never pruned automatically — only when the user asks, at merge or cancel,
+ * and never the one that command's own undo depends on (`pre-merge` for
+ * `/undo-merge`, `pre-cancel` for the work an abandoned epic left behind).
+ */
+export async function pruneEpicRefs(
+	ctx: TrackerContext,
+	epicId: number,
+	keepOperations: string[] = [],
+): Promise<number> {
+	const cwd = ctx.paths.repoRoot;
+	const keep = new Set(keepOperations.map((operation) => backupRefName(epicId, operation)));
+	const refs = [
+		...(await listBackupRefs(ctx.git, `refs/pi/backup/${epicId}`, cwd)),
+		...(await listBackupRefs(ctx.git, checkpointRefPrefix(epicId), cwd)),
+	];
+
+	let deleted = 0;
+	for (const ref of refs) {
+		if (keep.has(ref)) continue;
+		const removed = await ctx.git(["update-ref", "-d", ref], { cwd });
+		if (removed.code === 0) deleted++;
+	}
+	return deleted;
 }
 
 // ─── Undo ───────────────────────────────────────────────────────────
@@ -479,7 +705,14 @@ export async function undoStory(
 	return { ok: true, note: `story #${storyId} reverted (its commit is kept in history).` };
 }
 
-/** Put the base branch back exactly where it was before `mergeIntoBase`. */
+/**
+ * Put the base branch back exactly where it was before `mergeIntoBase`.
+ *
+ * Mirrors that function's two paths for the same reason: reset the working tree
+ * when the main checkout is on the base branch, and move the ref directly when
+ * nothing has it checked out, rather than dragging a session onto a branch it
+ * was not on.
+ */
 export async function undoMerge(ctx: TrackerContext, epic: EpicBranch): Promise<Outcome> {
 	const cwd = ctx.paths.repoRoot;
 	const ref = backupRefName(epic.epic_id, "pre-merge");
@@ -487,22 +720,28 @@ export async function undoMerge(ctx: TrackerContext, epic: EpicBranch): Promise<
 	const target = await revParse(ctx.git, ref, cwd);
 	if (!target) return { ok: false, note: `no merge backup found at ${ref} — nothing to undo` };
 
-	if (await isDirty(ctx.git, cwd)) {
-		return { ok: false, note: "working tree has uncommitted changes — commit or stash them first" };
+	const holder = await branchCheckoutLocation(ctx.git, cwd, epic.base_branch);
+	if (holder && holder !== cwd) {
+		return {
+			ok: false,
+			note: `${epic.base_branch} is checked out in ${holder} — undo the merge from there, or remove that worktree first.`,
+		};
 	}
 
-	const onBranch = await currentBranch(ctx.git, cwd);
-	if (onBranch !== epic.base_branch) {
-		const switched = await ctx.git(["switch", "--quiet", epic.base_branch], { cwd });
-		if (switched.code !== 0) {
-			return { ok: false, note: `could not switch to ${epic.base_branch}: ${switched.stderr.trim()}` };
+	if (holder === cwd) {
+		if (await isDirty(ctx.git, cwd)) {
+			return { ok: false, note: "working tree has uncommitted changes — commit or stash them first" };
+		}
+		const reset = await ctx.git(["reset", "--hard", target], { cwd });
+		if (reset.code !== 0) return { ok: false, note: `reset failed: ${reset.stderr.trim()}` };
+	} else {
+		const moved = await ctx.git(["update-ref", `refs/heads/${epic.base_branch}`, target], { cwd });
+		if (moved.code !== 0) {
+			return { ok: false, note: `could not move ${epic.base_branch}: ${(moved.stderr || moved.stdout).trim()}` };
 		}
 	}
 
-	const reset = await ctx.git(["reset", "--hard", target], { cwd });
-	if (reset.code !== 0) return { ok: false, note: `reset failed: ${reset.stderr.trim()}` };
-
-	updateEpicBranch(ctx.db, epic.epic_id, { state: "active" });
+	updateEpicBranch(ctx.db, epic.epic_id, { state: "active" }, ctx.now());
 	return {
 		ok: true,
 		note: `${epic.base_branch} restored to ${target.slice(0, 8)}; epic #${epic.epic_id} is active again.`,

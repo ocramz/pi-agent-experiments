@@ -1,10 +1,11 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import {
 	closeDb,
@@ -16,14 +17,16 @@ import {
 	getMaxPriority,
 	getStoriesByStatus,
 	getStoryById,
-	getActiveEpicBranch,
+	getActiveBranchModeEpic,
+	getActiveEpicBranches,
 	getEpicBranch,
-	getEpicBranchesByState,
+	getLastMergedEpicBranch,
 	hasChildren,
 	openDb,
 	searchStories,
 	setAppState,
 	transaction,
+	updateEpicBranch,
 	updateStory,
 	wouldCreateCycle,
 } from "../src/database.ts";
@@ -32,22 +35,34 @@ import { STORY_RESOLUTIONS } from "../src/types.ts";
 import { keywordStrategy } from "../src/related.ts";
 import { resolvePaths } from "../src/config.ts";
 import type { GitRunner, ShellRunner, TrackerContext } from "../src/context.ts";
-import { currentBranch, isDirty, probeRepo, revParse, type RepoInfo } from "../src/git.ts";
+import { currentBranch, isDirty, probeRepo, revParse, withLockRetry, type RepoInfo } from "../src/git.ts";
 import {
 	cancelEpic,
 	commitStory,
 	ensureDatabaseIgnored,
 	epicCwd,
+	epicWorktreePath,
 	findEpicForStory,
 	mergeIntoBase,
+	pruneCheckpoints,
+	pruneEpicRefs,
 	recordStoryStartCommit,
+	releaseWorktree,
+	resolveSessionEpic,
 	startEpic,
 	undoMerge,
 	undoStory,
 	updateFromBase,
 } from "../src/epic.ts";
-import { checkCanStartEpic, isBranchEscapingCommand } from "../src/rules.ts";
-import type { EpicBranch } from "../src/types.ts";
+import {
+	checkCanMerge,
+	checkCanStartEpic,
+	checkpointRefPrefix,
+	epicBranchName,
+	isBranchEscapingCommand,
+} from "../src/rules.ts";
+import type { EpicBranch, EpicMode } from "../src/types.ts";
+import { branchCheckoutLocation, findMissingWorktrees, listWorktrees } from "../src/worktree.ts";
 
 // ─── State ──────────────────────────────────────────────────────────
 /**
@@ -60,6 +75,41 @@ let tracker: TrackerContext | null = null;
 let repo: RepoInfo | null = null;
 /** Set once at registration, so module-scope helpers can talk back to the agent. */
 let host: ExtensionAPI | null = null;
+
+/**
+ * The epic *this session* is working on, resolved from where the session stands.
+ *
+ * There is no longer any such thing as "the" active epic: worktree mode runs
+ * several at once, each in its own directory with its own pi session. A hook
+ * asking "am I in an epic?" means its own, so every session-scoped lookup goes
+ * through here rather than through the database's global view.
+ *
+ * Only the id is cached. The row itself is re-read on every use, so a state
+ * change made by this session or another one is seen immediately.
+ */
+let sessionEpicId: number | null = null;
+
+/**
+ * How many per-turn checkpoints an epic keeps.
+ *
+ * `/undo-turn` only ever reads the newest, so this is purely about how far back
+ * a user can reach by hand with `git stash apply`. Twenty is roughly a session's
+ * worth and costs a kilobyte of refs.
+ */
+const CHECKPOINT_RETENTION = 20;
+
+function sessionEpic(): EpicBranch | null {
+	if (sessionEpicId === null || !tracker) return null;
+	const epic = getEpicBranch(tracker.db, sessionEpicId);
+	return epic && epic.state === "active" ? epic : null;
+}
+
+async function refreshSessionEpic(cwd: string): Promise<EpicBranch | null> {
+	if (!tracker) return null;
+	const epic = await resolveSessionEpic(tracker, cwd);
+	sessionEpicId = epic?.epic_id ?? null;
+	return epic;
+}
 
 /**
  * Git work is serialized.
@@ -167,7 +217,19 @@ function isDbReady() {
 	}
 }
 
-type UiContext = { hasUI: boolean; ui: { setStatus(key: string, text: string | undefined): void } };
+/**
+ * The slice of an extension context that module-scope helpers need.
+ *
+ * Structural rather than pi's own `ExtensionContext`, so these helpers stay
+ * callable from a test with a two-field stub.
+ */
+type UiContext = {
+	hasUI: boolean;
+	ui: {
+		setStatus(key: string, text: string | undefined): void;
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+	};
+};
 
 /** Keep the footer's open-story count honest after stories change. */
 function refreshStatus(ctx: UiContext) {
@@ -484,7 +546,9 @@ export default function (pi: ExtensionAPI) {
 		// SessionStartEvent carries no cwd — the session's cwd is on the context.
 		// Reading it off the event silently resolved to undefined every time.
 		const cwd = ctx.cwd ?? process.cwd();
-		const git = createExecGitRunner(pi);
+		// Wrapped, because concurrent worktree epics mean concurrent pi processes
+		// on one repository and `serializeGit` only orders this one. See src/git.ts.
+		const git = withLockRetry(createExecGitRunner(pi));
 
 		// Paths come from the *common* git dir, so a linked worktree resolves to
 		// the main checkout's stories.db rather than opening an empty one of its
@@ -510,6 +574,13 @@ export default function (pi: ExtensionAPI) {
 		// started. Idempotent, so running it every session costs one check-ignore.
 		if (repo.isRepo) await ensureDatabaseIgnored(tracker);
 
+		if (repo.isRepo) {
+			await reconcileWorktrees(ctx);
+			// Which epic this session owns depends on where it is standing, so it
+			// can only be answered once the paths are resolved.
+			await refreshSessionEpic(cwd);
+		}
+
 		// session_start cannot be cancelled, so an unusable repo is reported
 		// rather than enforced here; /start-epic is the gate.
 		if (!repo.isRepo && ctx.hasUI) {
@@ -518,10 +589,54 @@ export default function (pi: ExtensionAPI) {
 		refreshStatus(ctx);
 	});
 
+	/**
+	 * Reconcile what the database believes about worktrees against what git says.
+	 *
+	 * A crashed session or a manual `rm -rf` leaves an active row pointing at a
+	 * directory that is gone; a failed removal leaves a directory no epic claims.
+	 * The first is bookkeeping and is fixed silently — the epic's branch and its
+	 * backup refs are untouched, so nothing is lost by marking the row cancelled.
+	 *
+	 * The second is only reported. Deleting a directory is not a decision to make
+	 * on the user's behalf during startup, and a blocking dialog here would stall
+	 * every session behind a question most of them do not need to answer.
+	 */
+	async function reconcileWorktrees(ctx: UiContext): Promise<void> {
+		const tracked = tracker;
+		if (!tracked) return;
+
+		const entries = await listWorktrees(tracked.git, tracked.paths.repoRoot);
+		const { missing, orphaned } = findMissingWorktrees(
+			getActiveEpicBranches(tracked.db),
+			entries,
+			tracked.paths.worktreeRoot,
+		);
+
+		for (const epic of missing) {
+			updateEpicBranch(tracked.db, epic.epic_id, { state: "cancelled", path: null }, tracked.now());
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Epic #${epic.epic_id}'s worktree is gone — marked cancelled. Its work is still on ${epic.branch}.`,
+					"warning",
+				);
+			}
+		}
+
+		if (orphaned.length > 0 && ctx.hasUI) {
+			const paths = orphaned.map((entry) => entry.path).join(", ");
+			ctx.ui.notify(
+				`${orphaned.length} epic worktree(s) no longer belong to an active epic: ${paths}. ` +
+					`Remove with: git worktree remove <path>`,
+				"info",
+			);
+		}
+	}
+
 	pi.on("session_shutdown", async () => {
 		closeDb(tracker?.db ?? null);
 		tracker = null;
 		repo = null;
+		sessionEpicId = null;
 	});
 
 	// ── Context injection ─────────────────────────────────────────────
@@ -632,10 +747,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		const activeEpic = getActiveEpicBranch(db);
+		const activeEpic = sessionEpic();
 		if (activeEpic) {
 			lines.push(`\n>>> EPIC BRANCH`);
 			lines.push(`Working on ${activeEpic.branch} (started from ${activeEpic.base_branch}).`);
+			if (activeEpic.mode === "worktree" && activeEpic.path) {
+				// Worth stating: the agent is in a checkout of its own, and other
+				// epics may be running in sibling directories it must not touch.
+				lines.push(`This session is in a dedicated worktree at ${activeEpic.path}. Work only inside it.`);
+			}
 			lines.push(`Every story you close is committed automatically — do not commit by hand.`);
 			lines.push(`Do not switch branches, reset --hard, or delete branches; that would strand the epic.`);
 		}
@@ -1541,46 +1661,118 @@ export default function (pi: ExtensionAPI) {
 	// rewrites the branch the user is sitting on, and pi can only relocate a
 	// session from a command handler, so both live here rather than in the tool.
 
-	/** Resolve an epic from an explicit id, or fall back to the active one. */
+	/**
+	 * Split `/start-epic 3 --worktree` into its parts.
+	 *
+	 * Flags used to be detected with `args.includes("--worktree")` while the id
+	 * came from `split(/\s+/)[0]`, so the flag-first spelling would have parsed
+	 * `--worktree` as the story id the moment the mode was implemented.
+	 */
+	function parseArgs(args: string): { tokens: string[]; flags: Set<string> } {
+		const parts = args.trim().split(/\s+/).filter(Boolean);
+		return {
+			tokens: parts.filter((part) => !part.startsWith("--")),
+			flags: new Set(parts.filter((part) => part.startsWith("--"))),
+		};
+	}
+
+	/** Resolve an epic from an explicit id, or fall back to this session's own. */
 	function resolveEpic(args: string): { epic?: EpicBranch; error?: string } {
 		const db = ensureDb();
-		const raw = args.trim().split(/\s+/)[0] ?? "";
+		const raw = parseArgs(args).tokens[0] ?? "";
 		if (raw) {
 			const id = Number(raw);
 			if (!Number.isInteger(id)) return { error: `"${raw}" is not a story id` };
 			const epic = getEpicBranch(db, id);
 			return epic ? { epic } : { error: `epic #${id} has no branch — start it with /start-epic ${id}` };
 		}
-		const active = getActiveEpicBranch(db);
-		return active ? { epic: active } : { error: "no epic is active — pass an id, or start one with /start-epic" };
+		const own = sessionEpic();
+		return own
+			? { epic: own }
+			: { error: "this session is not working on an epic — pass an id, or start one with /start-epic" };
+	}
+
+	/**
+	 * Move this session into `targetCwd`, carrying its history.
+	 *
+	 * The only true relocation pi offers: `ctx.cwd` is a read-only getter, the
+	 * built-in tools capture their directory at construction, and
+	 * `process.chdir()` is inert. `forkFrom` writes a new session file whose
+	 * header records the new directory, and `switchSession` rebinds the runtime
+	 * to it.
+	 *
+	 * Everything after the switch must go through the replacement context. By the
+	 * time `withSession` runs, the old session has emitted `session_shutdown` and
+	 * every session-bound object captured beforehand — including `ctx` and
+	 * `ctx.sessionManager` — throws if touched.
+	 */
+	async function relocateSession(
+		ctx: ExtensionCommandContext,
+		targetCwd: string,
+		after: (rc: ExtensionCommandContext) => Promise<void>,
+	): Promise<{ ok: boolean; note: string }> {
+		const sourceSession = ctx.sessionManager.getSessionFile();
+
+		// `forkFrom` carries the conversation across, but it refuses an empty or
+		// unwritten source file — which is the most likely case of all: open pi,
+		// run /start-epic --worktree before saying anything. There is no history to
+		// carry there, so a fresh session in the target directory is not a fallback
+		// so much as the right answer.
+		let relocated: string | undefined;
+		try {
+			relocated = sourceSession
+				? SessionManager.forkFrom(sourceSession, targetCwd).getSessionFile()
+				: SessionManager.create(targetCwd).getSessionFile();
+		} catch {
+			try {
+				relocated = SessionManager.create(targetCwd).getSessionFile();
+			} catch (error) {
+				return { ok: false, note: `could not open a session in ${targetCwd}: ${String(error)}` };
+			}
+		}
+		if (!relocated) return { ok: false, note: `could not open a session in ${targetCwd}` };
+
+		const result = await ctx.switchSession(relocated, { withSession: async (rc) => after(rc) });
+		return result.cancelled
+			? { ok: false, note: "an extension cancelled the session switch" }
+			: { ok: true, note: `session moved to ${targetCwd}` };
 	}
 
 	pi.registerCommand("start-epic", {
-		description: "Start an epic on its own branch (usage: /start-epic <story_id>)",
+		description:
+			"Start an epic on its own branch, or in its own worktree (usage: /start-epic <story_id> [--worktree])",
 		handler: async (args, ctx) => {
 			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
 			const tracked = ensureTracker();
 			const db = tracked.db;
 
-			if (args.includes("--worktree")) {
-				return void ctx.ui.notify("Worktree mode is not implemented yet — /start-epic works on a branch in place.", "warning");
+			const { tokens, flags } = parseArgs(args);
+			const mode: EpicMode = flags.has("--worktree") ? "worktree" : "branch";
+			const id = Number(tokens[0]);
+			if (!Number.isInteger(id)) {
+				return void ctx.ui.notify("Usage: /start-epic <story_id> [--worktree]", "error");
 			}
-
-			const id = Number(args.trim().split(/\s+/)[0]);
-			if (!Number.isInteger(id)) return void ctx.ui.notify("Usage: /start-epic <story_id>", "error");
 
 			const story = getStoryById(db, id);
 			const branch = await currentBranch(tracked.git, tracked.paths.repoRoot);
 			const dirty = await isDirty(tracked.git, tracked.paths.repoRoot);
-			const active = getActiveEpicBranch(db);
 
+			// Worktree mode collides on two things branch mode cannot: a branch that
+			// already exists, and a directory already sitting where it would go.
+			const worktreePath = story ? epicWorktreePath(tracked, story) : "";
 			const input = {
 				isRepo: repo?.isRepo ?? false,
 				branch,
 				dirty,
 				story,
 				childCount: story ? getChildren(db, story.id).length : 0,
-				activeEpicId: active?.epic_id ?? null,
+				mode,
+				activeEpics: getActiveEpicBranches(db),
+				branchExists:
+					mode === "worktree" && story
+						? (await revParse(tracked.git, `refs/heads/${epicBranchName(story)}`, tracked.paths.repoRoot)) !== null
+						: false,
+				pathExists: mode === "worktree" && story ? existsSync(worktreePath) : false,
 			};
 
 			let carryDirty = false;
@@ -1602,13 +1794,98 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!check.ok) return void ctx.ui.notify(`Cannot start epic: ${check.reason}`, "error");
 
-			const started = await serializeGit(() => startEpic(tracked, { story: story!, carryDirty }));
+			// A worktree checkout plus the manifest's setup command is the slowest
+			// thing this extension does, and it otherwise happens with no output.
+			const start = () => serializeGit(() => startEpic(tracked, { story: story!, mode, carryDirty }));
+			const started =
+				mode === "worktree" && ctx.mode === "tui"
+					? await ctx.ui.custom<Awaited<ReturnType<typeof start>>>((tui, theme, _kb, done) => {
+							const loader = new BorderedLoader(tui, theme, `Creating a worktree for epic #${id}...`);
+							start().then(done, (error) => done({ ok: false, note: String(error) }));
+							return loader;
+						})
+					: await start();
+
 			if (!started.ok || !started.epic) return void ctx.ui.notify(started.note, "error");
 
+			// Every database write has to land before the switch: the session that
+			// makes them is about to be torn down.
 			await transitionStatus(story!.id, { status: "in_progress" }, ctx);
-			ctx.ui.notify(started.note, "info");
+			sessionEpicId = started.epic.epic_id;
+
+			if (mode !== "worktree" || !started.epic.path) {
+				return void ctx.ui.notify(started.note, "info");
+			}
+
+			const note = started.note;
+			const worktree = started.epic.path;
+			const moved = await relocateSession(ctx, worktree, async (rc) => {
+				rc.ui.notify(`${note}\nThis session is now working in the worktree.`, "info");
+			});
+			if (!moved.ok) {
+				// The worktree exists and the epic is recorded; only the session
+				// failed to follow. Say exactly that, because the recovery is to open
+				// pi in the worktree, not to start the epic again.
+				ctx.ui.notify(
+					`${note}\nBut the session could not move: ${moved.note}. Start pi in ${worktree} to work on it.`,
+					"warning",
+				);
+			}
 		},
 	});
+
+	/**
+	 * Land a merge, then take the worktree down and offer to tidy the refs.
+	 *
+	 * Everything here runs *after* any session relocation, against a freshly
+	 * resolved tracker — the one captured before a switch belongs to a torn-down
+	 * session.
+	 */
+	async function finishMerge(epic: EpicBranch, ctx: ExtensionCommandContext): Promise<void> {
+		const tracked = ensureTracker();
+		const merged = await serializeGit(() => mergeIntoBase(tracked, epic));
+		if (!merged.ok) return void ctx.ui.notify(merged.note, "error");
+
+		const notes = [merged.note];
+		const current = getEpicBranch(tracked.db, epic.epic_id) ?? epic;
+
+		if (current.mode === "worktree" && current.path) {
+			const released = await serializeGit(() => releaseWorktree(tracked, current));
+			notes.push(released.ok ? released.note : `${released.note} — remove it by hand when you can.`);
+		}
+		if (sessionEpicId === epic.epic_id) sessionEpicId = null;
+
+		// Reported before the prune question, not after it. Pruning is an optional
+		// afterthought and the merge is the thing the user asked for; making them
+		// answer a dialog before learning whether it worked gets that backwards.
+		ctx.ui.notify(notes.join("\n"), "info");
+		await offerToPrune(epic.epic_id, "pre-merge", "The merge stays undoable either way.", ctx);
+	}
+
+	/**
+	 * Offer to delete an epic's refs, always keeping the one its undo depends on.
+	 *
+	 * Backup refs are the safety net that gives every command an inverse, so they
+	 * are never pruned on their own — only when the user says so, and never the
+	 * ref that would make the operation they just ran irreversible.
+	 */
+	async function offerToPrune(
+		epicId: number,
+		keep: string,
+		reassurance: string,
+		ctx: ExtensionCommandContext,
+	): Promise<void> {
+		if (!ctx.hasUI) return;
+		const choice = await ctx.ui.select(`Prune epic #${epicId}'s checkpoints and backup refs? ${reassurance}`, [
+			"No, keep them",
+			`Yes, prune all but ${keep}`,
+		]);
+		if (!choice?.startsWith("Yes")) return;
+
+		const tracked = ensureTracker();
+		const pruned = await serializeGit(() => pruneEpicRefs(tracked, epicId, [keep]));
+		ctx.ui.notify(`Pruned ${pruned} ref(s) for epic #${epicId}.`, "info");
+	}
 
 	pi.registerCommand("merge-epic", {
 		description: "Merge a finished epic into its base branch (usage: /merge-epic [story_id])",
@@ -1619,8 +1896,17 @@ export default function (pi: ExtensionAPI) {
 			if (!epic) return void ctx.ui.notify(error!, "error");
 			if (epic.state !== "active") return void ctx.ui.notify(`Epic #${epic.epic_id} is already ${epic.state}.`, "warning");
 
+			const gate = checkCanMerge({
+				epic,
+				baseCheckedOutAt: await branchCheckoutLocation(tracked.git, tracked.paths.repoRoot, epic.base_branch),
+				repoRoot: tracked.paths.repoRoot,
+				mainCheckoutEpicId: getActiveBranchModeEpic(tracked.db)?.epic_id ?? null,
+			});
+			if (!gate.ok) return void ctx.ui.notify(`Cannot merge: ${gate.reason}`, "error");
+
 			// Re-run step 1 in case the base branch moved since the epic closed;
-			// step 2 is fast-forward-only and would otherwise refuse.
+			// step 2 is fast-forward-only and would otherwise refuse. It runs in the
+			// worktree, so conflicts land where the agent has been working.
 			const updated = await serializeGit(() => updateFromBase(tracked, epic));
 			if (!updated.ok) return void ctx.ui.notify(updated.note, "error");
 
@@ -1638,10 +1924,48 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const merged = await serializeGit(() => mergeIntoBase(tracked, epic));
-			ctx.ui.notify(merged.note, merged.ok ? "info" : "error");
+			// If this session is standing in the worktree we are about to delete, it
+			// has to move out first — removing the directory a session is sitting in
+			// breaks the session.
+			const inside = sessionIsInsideWorktreeOf(epic);
+			if (!inside) return void (await finishMerge(epic, ctx));
+
+			const epicId = epic.epic_id;
+			const moved = await relocateSession(ctx, tracked.paths.repoRoot, async (rc) => {
+				const fresh = getEpicBranch(ensureTracker().db, epicId);
+				if (fresh) await finishMerge(fresh, rc);
+			});
+			if (!moved.ok) {
+				ctx.ui.notify(`Nothing merged: ${moved.note}. The epic is untouched.`, "error");
+			}
 		},
 	});
+
+	/**
+	 * Whether this session is standing in the directory `epic` is about to lose.
+	 *
+	 * Asked of the resolved session epic rather than by comparing `ctx.cwd` to
+	 * `epic.path`: the path match was already done once, carefully, at
+	 * `session_start` — `resolveSessionEpic` normalises through git — and
+	 * repeating it as raw string equality here would reintroduce exactly the
+	 * symlink mismatch that resolution exists to avoid.
+	 */
+	function sessionIsInsideWorktreeOf(epic: EpicBranch): boolean {
+		return epic.mode === "worktree" && epic.path !== null && sessionEpicId === epic.epic_id;
+	}
+
+	/** Cancel, then offer to prune. Runs after any relocation, like `finishMerge`. */
+	async function finishCancel(epic: EpicBranch, ctx: ExtensionCommandContext): Promise<void> {
+		const tracked = ensureTracker();
+		const result = await serializeGit(() => cancelEpic(tracked, epic));
+		if (!result.ok) return void ctx.ui.notify(result.note, "error");
+		if (sessionEpicId === epic.epic_id) sessionEpicId = null;
+
+		ctx.ui.notify(result.note, "info");
+		// pre-cancel holds the abandoned work; pruning it would make the cancel
+		// irreversible, which is the one thing it promises not to be.
+		await offerToPrune(epic.epic_id, "pre-cancel", "The abandoned work stays reachable either way.", ctx);
+	}
 
 	pi.registerCommand("cancel-epic", {
 		description: "Stop an epic without merging; its branch is kept (usage: /cancel-epic [story_id])",
@@ -1651,8 +1975,19 @@ export default function (pi: ExtensionAPI) {
 			const { epic, error } = resolveEpic(args);
 			if (!epic) return void ctx.ui.notify(error!, "error");
 
-			const result = await serializeGit(() => cancelEpic(tracked, epic));
-			ctx.ui.notify(result.note, result.ok ? "info" : "error");
+			// Same reason as /merge-epic: cancelling a worktree epic removes its
+			// directory, and a session cannot be standing in it when that happens.
+			const inside = sessionIsInsideWorktreeOf(epic);
+			if (!inside) return void (await finishCancel(epic, ctx));
+
+			const epicId = epic.epic_id;
+			const moved = await relocateSession(ctx, tracked.paths.repoRoot, async (rc) => {
+				const fresh = getEpicBranch(ensureTracker().db, epicId);
+				if (fresh) await finishCancel(fresh, rc);
+			});
+			if (!moved.ok) {
+				ctx.ui.notify(`Nothing cancelled: ${moved.note}. The epic is untouched.`, "error");
+			}
 		},
 	});
 
@@ -1661,7 +1996,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
 			const tracked = ensureTracker();
-			const id = Number(args.trim().split(/\s+/)[0]);
+			const id = Number(parseArgs(args).tokens[0]);
 			if (!Number.isInteger(id)) return void ctx.ui.notify("Usage: /undo-story <story_id>", "error");
 
 			const epic = findEpicForStory(tracked, id);
@@ -1677,13 +2012,13 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
 			const tracked = ensureTracker();
-			const raw = args.trim().split(/\s+/)[0] ?? "";
+			const raw = parseArgs(args).tokens[0] ?? "";
 			const db = tracked.db;
 			// Unlike the others this defaults to the most recently merged epic,
 			// because by definition no epic is active once its merge has landed.
-			const epic = raw
-				? getEpicBranch(db, Number(raw))
-				: getEpicBranchesByState(db, "merged").slice(-1)[0] ?? null;
+			// "Most recent" is by `updated_at` — when the merge landed — not by when
+			// the epic started; with concurrent epics those are different questions.
+			const epic = raw ? getEpicBranch(db, Number(raw)) : getLastMergedEpicBranch(db);
 			if (!epic) return void ctx.ui.notify("No merged epic to undo — pass a story id.", "error");
 
 			const result = await serializeGit(() => undoMerge(tracked, epic));
@@ -1696,15 +2031,20 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
 			const tracked = ensureTracker();
-			const epic = getActiveEpicBranch(tracked.db);
-			if (!epic) return void ctx.ui.notify("No epic is active, so no checkpoints are being taken.", "warning");
+			const epic = sessionEpic();
+			if (!epic) {
+				return void ctx.ui.notify(
+					"This session is not working on an epic, so no checkpoints are being taken.",
+					"warning",
+				);
+			}
 
 			const result = await serializeGit(async () => {
 				const cwd = epicCwd(tracked, epic);
 				// Names are millisecond timestamps, so they are fixed width and
 				// sort newest-first by name alone.
 				const refs = await tracked.git(
-					["for-each-ref", "--sort=-refname", "--format=%(objectname)", `refs/pi/checkpoint/${epic.epic_id}`],
+					["for-each-ref", "--sort=-refname", "--format=%(objectname)", checkpointRefPrefix(epic.epic_id)],
 					{ cwd },
 				);
 				const newest = refs.stdout.trim().split("\n").filter(Boolean)[0];
@@ -1725,7 +2065,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async () => {
 		const tracked = tracker;
 		if (!tracked) return;
-		const epic = getActiveEpicBranch(tracked.db);
+		const epic = sessionEpic();
 		if (!epic) return;
 
 		await serializeGit(async () => {
@@ -1733,7 +2073,10 @@ export default function (pi: ExtensionAPI) {
 			const created = await tracked.git(["stash", "create"], { cwd });
 			const sha = created.stdout.trim();
 			if (created.code !== 0 || !sha) return; // clean tree — nothing to checkpoint
-			await tracked.git(["update-ref", `refs/pi/checkpoint/${epic.epic_id}/${tracked.now()}`, sha], { cwd });
+			await tracked.git(["update-ref", `${checkpointRefPrefix(epic.epic_id)}/${tracked.now()}`, sha], { cwd });
+			// One ref per turn adds up over a day-long epic and only the newest is
+			// ever read, so the tail is pruned here rather than by a sweeper.
+			await pruneCheckpoints(tracked, epic, CHECKPOINT_RETENTION);
 		});
 	});
 
@@ -1744,7 +2087,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName !== "bash") return;
 		const tracked = tracker;
 		if (!tracked) return;
-		const epic = getActiveEpicBranch(tracked.db);
+		const epic = sessionEpic();
 		if (!epic) return;
 
 		const command = (event.input as { command?: unknown } | undefined)?.command;

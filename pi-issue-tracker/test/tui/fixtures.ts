@@ -19,7 +19,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { resolvePaths } from "../../src/config.ts";
 import type { GitResult, TrackerContext } from "../../src/context.ts";
-import { createStory, getEpicBranch, openDb, setAppState } from "../../src/database.ts";
+import { createStory, getEpicBranch, getStoryById, openDb, setAppState } from "../../src/database.ts";
 import {
 	commitStory,
 	mergeIntoBase,
@@ -41,6 +41,8 @@ export interface Facts {
 	looseId?: number;
 	/** A second epic — a parent with children — that is *not* the active one. */
 	otherEpicId?: number;
+	/** Where a worktree epic's checkout lives. Absolute, as git resolved it. */
+	worktreePath?: string;
 	dirtyFile?: string;
 	conflictFile?: string;
 	storyCommit?: string;
@@ -58,6 +60,8 @@ export type Shape =
 	| "detached"
 	| "notRepo"
 	| "epicActive"
+	| "epicWorktreeActive"
+	| "epicWorktreeOneCommit"
 	| "twoEpicsOneActive"
 	| "epicOneCommit"
 	| "epicTwoCommits"
@@ -256,6 +260,48 @@ const shapes: Record<Shape, ShapeBuilder> = {
 			secondId: seeded.second.id,
 			looseId: seeded.loose.id,
 		};
+	},
+
+	/**
+	 * An epic running in a worktree of its own, nothing committed to it yet.
+	 *
+	 * The main checkout stays on the base branch, which is the difference that
+	 * matters: a session started here is *not* in the epic, and has to resolve
+	 * that from its own directory.
+	 */
+	async epicWorktreeActive({ initRepo, tracker, seedStories }) {
+		await initRepo();
+		const { db, ctx } = await tracker();
+		const seeded = seedStories(db);
+		const started = await startEpic(ctx, { story: seeded.epic, mode: "worktree" });
+		if (!started.ok || !started.epic) throw new Error(`startEpic failed: ${started.note}`);
+		await recordStoryStartCommit(ctx, seeded.first, started.epic);
+		db.close();
+		return {
+			branch: started.epic.base_branch,
+			baseBranch: started.epic.base_branch,
+			worktreePath: started.epic.path ?? undefined,
+			epicId: seeded.epic.id,
+			firstId: seeded.first.id,
+			secondId: seeded.second.id,
+			looseId: seeded.loose.id,
+		};
+	},
+
+	/** A worktree epic with one story committed — ready to merge. */
+	async epicWorktreeOneCommit(tools) {
+		const facts = await shapes.epicWorktreeActive(tools);
+		const { db, ctx } = await tools.tracker();
+		const epic = getEpicBranch(db, facts.epicId!);
+		if (!epic?.path) throw new Error("the worktree fixture recorded no path");
+
+		writeFileSync(join(epic.path, "widget.ts"), "export const widget = true;\n");
+		const first = getStoryById(db, facts.firstId!);
+		if (!first) throw new Error("the fixture's first story vanished");
+		const committed = await commitStory(ctx, first, epic);
+		if (!committed.ok) throw new Error(`commitStory failed: ${committed.note}`);
+		db.close();
+		return { ...facts, storyCommit: committed.sha };
 	},
 
 	/**

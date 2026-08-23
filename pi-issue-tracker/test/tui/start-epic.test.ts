@@ -68,11 +68,14 @@ describe("/start-epic", () => {
 		assert.equal(s.db((db) => rowCount(db, "epic_branches")), 0, "no epic was recorded");
 	});
 
-	it("D6 refuses while another epic is active", async (t) => {
+	it("D6 refuses a second branch-mode epic and points at the mode that works", async (t) => {
 		const s = await session(t, "twoEpicsOneActive");
 		const before = await s.branch();
 		await s.command(`/start-epic ${s.facts.otherEpicId}`);
-		await s.expect(`epic #${s.facts.epicId} is still active — merge or cancel it first`);
+		await s.expect(`epic #${s.facts.epicId} is still active on this checkout`);
+		// The refusal is about the main checkout, not about epics in general —
+		// see W3, which starts this very epic in a worktree instead.
+		await s.expect("--worktree");
 		await s.close();
 
 		assert.equal(await s.branch(), before, "still on the first epic's branch");
@@ -110,10 +113,14 @@ describe("/start-epic", () => {
 		);
 	});
 
-	it("D9 --worktree reports not-implemented and does nothing", async (t) => {
+	/**
+	 * The id used to be read as `args.split(/\s+/)[0]`, so a flag written first
+	 * would have been parsed as the story id the moment worktree mode existed.
+	 */
+	it("D9 rejects a missing story id whichever side the flag is on", async (t) => {
 		const s = await session(t, "stories");
-		await s.command(`/start-epic ${s.facts.epicId} --worktree`);
-		await s.expect("Worktree mode is not implemented yet");
+		await s.command("/start-epic --worktree");
+		await s.expect("Usage: /start-epic <story_id>");
 		await s.close();
 
 		assert.equal(await s.branch(), "feat/work", "no branch was created");

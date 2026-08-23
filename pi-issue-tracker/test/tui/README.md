@@ -46,9 +46,10 @@ than skipping quietly; `PI_TUI_SKIP_LIVE=1` is the explicit opt-out, used by the
 |---|---|---|
 | [board.test.ts](board.test.ts) | A1–A5 | `/stories`: rendering, arrows, `r` `s` `d` `x`, `escape`. A5 is the important one — closing a story inside an active epic is the only route from a keystroke to a git commit |
 | [commands.test.ts](commands.test.ts) | B2, C1–C5 | `/plan-stories` usage, `/top-story`, `/export-stories` |
-| [start-epic.test.ts](start-epic.test.ts) | D1–D9 | One case per refusal in `checkCanStartEpic`, plus the dirty-tree prompt both ways and `--worktree` |
+| [start-epic.test.ts](start-epic.test.ts) | D1–D9 | One case per refusal in `checkCanStartEpic`, plus the dirty-tree prompt both ways and flag parsing |
 | [merge-epic.test.ts](merge-epic.test.ts) | E1–E5, F1–F2 | `/merge-epic` confirm, decline, base-moved, conflict, already-merged; `/cancel-epic` |
 | [undo.test.ts](undo.test.ts) | G1–G4, H1–H2, I2–I3 | `/undo-story` reset and revert paths, `/undo-merge`, `/undo-turn` |
+| [worktree.test.ts](worktree.test.ts) | W1–W8 | `/start-epic --worktree` and pi's session relocation, concurrent epics, worktree-aware merge and cancel, session scoping |
 | [live.test.ts](live.test.ts) | B1, B3, I1 | The three that need a model turn. Costs a little money |
 
 ## How a case is built
@@ -102,12 +103,15 @@ node --input-type=module -e 'import {DatabaseSync} from "node:sqlite";
 
 ## Deliberate omissions
 
-**`/undo-merge` with no argument, against more than one merged epic.** `epic_branches.created_at`
-defaults to `strftime('%s', 'now') * 1000` — millisecond scale, second resolution — so two epics
-created in the same second tie, and `getEpicBranchesByState`'s `ORDER BY created_at` falls back
-to rowid. Which epic the no-argument form selects then depends on sub-second timing. That is a
-unit test about ordering, and it should be written after the ordering is fixed. STATUS.md gap 11
-has the detail.
+**`/undo-merge` with no argument, against more than one merged epic.** The ordering it depends on
+is now correct — timestamps are written from `ctx.now` at millisecond resolution and selection is
+by `updated_at`, so "the last epic to merge" is a real answer rather than a coin toss between rows
+sharing a second. But asserting it needs a controlled clock, which makes it a unit test, not an
+interactive one. It lives in [../database.test.ts](../database.test.ts) as "picks the last merged
+epic by when it merged, not by when it started".
 
-**Worktree mode** (`/start-epic --worktree`) is covered only by D9, which asserts it declines and
-changes nothing. Phase 2 will need its own cases.
+**A second concurrent session.** W3 proves the *rule* — a second epic that branch mode refuses is
+accepted with `--worktree` — but it does so from one pi session. Two sessions running at the same
+time against one repository, which is how concurrency is actually used, is covered by
+[../worktree.test.ts](../worktree.test.ts) at the library level and by the manual check in the
+package README. Driving two ptys at once from one case is possible and has not been worth it.

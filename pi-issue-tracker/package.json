@@ -17,14 +17,23 @@
     "test:container": "test/container/run.sh",
     "test:tui": "npm --prefix test/tui install --no-audit --no-fund --silent && node --test 'test/tui/*.test.ts'"
   },
-  "author": "",
+  "author": "Marco Zocca",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/ocramz/pi-agent-experiments.git",
+    "directory": "pi-issue-tracker"
+  },
+  "homepage": "https://github.com/ocramz/pi-agent-experiments/tree/main/pi-issue-tracker#readme",
+  "bugs": {
+    "url": "https://github.com/ocramz/pi-agent-experiments/issues"
+  },
+  "engines": {
+    "node": ">=24"
   },
   "files": [
     "extensions/",
     "src/",
+    "LICENSE",
     "README.md",
     "package.json"
   ],
@@ -38,5 +47,11 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
   }
 }

@@ -7,10 +7,12 @@ import {
 	closeDb,
 	createEpicBranch,
 	createStory,
-	getActiveEpicBranch,
+	getActiveBranchModeEpic,
+	getActiveEpicBranches,
 	getEpicBranch,
 	getEpicBranchByPath,
 	getEpicBranchesByState,
+	getLastMergedEpicBranch,
 	getStoryCommit,
 	getStoryCommitsForEpic,
 	openDb,
@@ -94,14 +96,87 @@ describe("epic_branches", () => {
 		assert.deepEqual(getEpicBranch(db, 12)?.setup, {});
 	});
 
-	it("finds the active epic and stops finding it once merged", () => {
+	it("finds the active branch-mode epic and stops finding it once merged", () => {
 		const db = tempDb();
 		createEpicBranch(db, input);
-		assert.equal(getActiveEpicBranch(db)?.epic_id, 12);
+		assert.equal(getActiveBranchModeEpic(db)?.epic_id, 12);
 
 		updateEpicBranch(db, 12, { state: "merged" });
-		assert.equal(getActiveEpicBranch(db), null);
+		assert.equal(getActiveBranchModeEpic(db), null);
 		assert.equal(getEpicBranchesByState(db, "merged").length, 1);
+	});
+
+	/**
+	 * The whole point of worktree mode. A branch-mode epic owns the main
+	 * checkout's HEAD so only one can exist, but it must not hide the worktree
+	 * epics running beside it — and they must not be mistaken for it.
+	 */
+	it("lists every active epic while reporting only one as holding the main checkout", () => {
+		const db = tempDb();
+		createEpicBranch(db, input, 1_000);
+		createEpicBranch(
+			db,
+			{ ...input, epic_id: 13, mode: "worktree", branch: "epic/13-b", path: "/wt/epic-13-b" },
+			2_000,
+		);
+		createEpicBranch(
+			db,
+			{ ...input, epic_id: 14, mode: "worktree", branch: "epic/14-c", path: "/wt/epic-14-c" },
+			3_000,
+		);
+
+		assert.deepEqual(
+			getActiveEpicBranches(db).map((epic) => epic.epic_id),
+			[12, 13, 14],
+		);
+		assert.equal(getActiveBranchModeEpic(db)?.epic_id, 12);
+	});
+
+	/**
+	 * `created_at` and `updated_at` used to default to
+	 * `strftime('%s','now') * 1000` — millisecond scale at second resolution —
+	 * so two epics created in the same second tied and the order fell back to
+	 * rowid. Writing the value from the caller's clock is what makes this
+	 * answerable at all.
+	 */
+	it("takes its timestamps from the caller, at millisecond resolution", () => {
+		const db = tempDb();
+		const created = createEpicBranch(db, input, 1_700_000_000_001);
+		assert.equal(created.created_at, 1_700_000_000_001);
+		assert.equal(created.updated_at, 1_700_000_000_001);
+
+		const updated = updateEpicBranch(db, 12, { state: "merged" }, 1_700_000_000_002);
+		assert.equal(updated?.created_at, 1_700_000_000_001, "created_at must not move");
+		assert.equal(updated?.updated_at, 1_700_000_000_002);
+	});
+
+	/**
+	 * `/undo-merge` with no id wants the epic that merged *last*, which is a
+	 * question about `updated_at`. Ordering by `created_at` answers "which
+	 * started last" and gives a different epic the moment two of them run
+	 * concurrently.
+	 */
+	it("picks the last merged epic by when it merged, not by when it started", () => {
+		const db = tempDb();
+		createEpicBranch(db, input, 1_000);
+		createEpicBranch(db, { ...input, epic_id: 13, branch: "epic/13-b" }, 2_000);
+
+		// The one started first is merged second.
+		updateEpicBranch(db, 13, { state: "merged" }, 3_000);
+		updateEpicBranch(db, 12, { state: "merged" }, 4_000);
+
+		assert.equal(getLastMergedEpicBranch(db)?.epic_id, 12);
+		assert.deepEqual(
+			getEpicBranchesByState(db, "merged").map((epic) => epic.epic_id),
+			[13, 12],
+			"oldest merge first",
+		);
+	});
+
+	it("has no last merged epic before anything has merged", () => {
+		const db = tempDb();
+		createEpicBranch(db, input);
+		assert.equal(getLastMergedEpicBranch(db), null);
 	});
 
 	it("looks a worktree up by path, so a session can tell where it is", () => {

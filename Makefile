@@ -1,13 +1,18 @@
 ENGINE      ?= podman
 DEV_IMAGE   ?= localhost/pi-dev:local
 DEV_NAME    ?= pi-dev
-TEST_IMAGE  ?= ghcr.io/ocramz/pi-container-distroless-node24:latest
+# Pinned by digest, not by :latest. The git capability probe asserts what this
+# userland's perl-less git can do, and that claim is only worth anything against
+# a known image — on a moving tag a base-image change would alter the result
+# silently. Keep in step with IMAGE in .github/workflows/test.yml; re-pin with
+#   podman pull ghcr.io/ocramz/pi-container-distroless-node24:latest
+#   podman inspect ... --format '{{index .RepoDigests 0}}'
+TEST_IMAGE  ?= ghcr.io/ocramz/pi-container-distroless-node24@sha256:46bbab3a97cbcfeb89fe362c60ab8f589510354b2fe86d0b177f063b8f5810bf
 ENV_FILE    ?= .env
 CONFIG_VOL  ?= pi-config
 STORAGE_VOL ?= pi-dev-storage
 PKG         ?= pi-issue-tracker
-# The live suite spends money, and the answer to that is a cheaper model rather
-# than a way to skip it — the live tier is the only coverage extensions/index.ts
+# The live suite spends money, and the live tier is the only coverage extensions/index.ts
 # has. deepseek-v4-flash is the cheapest model in the catalog that still drives
 # tool calls reliably: the suite needs the model to actually call the story tool
 # and the bash tool, and weaker ones narrate instead. A concrete id, not the
@@ -16,15 +21,14 @@ PKG         ?= pi-issue-tracker
 PI_PROVIDER ?= openrouter
 PI_MODEL    ?= deepseek/deepseek-v4-flash
 
-# What a nested podman needs, and nothing more. Each flag was chosen by removing
-# it and reading the failure:
+# Minimal security flags for nested podman. 
 #   unmask=/proc/*      podman masks paths inside /proc; the kernel then refuses
 #                       to mount a fresh procfs in the inner userns, and crun
 #                       cannot write net.ipv4.ping_group_range.
 #   seccomp=unconfined  the inner crun calls sethostname().
 #   label=disable       the podman machine VM is SELinux-enforcing Fedora CoreOS.
 #   /dev/net/tun        slirp4netns opens it to build the inner netns. This is
-#                       the device STATUS.md recorded as missing.
+#                       Its absence was long mistaken for a hard sandbox limit.
 # Note the quotes on unmask: unquoted, /proc/* globs on a Linux host.
 # --cap-add SYS_ADMIN is deliberately absent — it makes the inner podman try to
 # manage cgroups and fail on a read-only /sys/fs/cgroup.

@@ -71,10 +71,11 @@ jobs:
       run:
         working-directory: pi-issue-tracker
     env:
-      # Pin the image. On :latest a base-image change could alter results
+      # Pinned by digest. On :latest a base-image change could alter results
       # silently, and the git capability probe is only meaningful against a
-      # known userland.
-      IMAGE: ghcr.io/ocramz/pi-container-distroless-node24:latest
+      # known userland. Keep in step with TEST_IMAGE in the root Makefile, which
+      # documents how to re-pin.
+      IMAGE: ghcr.io/ocramz/pi-container-distroless-node24@sha256:46bbab3a97cbcfeb89fe362c60ab8f589510354b2fe86d0b177f063b8f5810bf
       ENGINE: podman
       # The live tier is the only coverage extensions/index.ts has; without a key
       # run.sh refuses to start rather than quietly skipping it.

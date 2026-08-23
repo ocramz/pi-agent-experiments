@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -16,12 +16,27 @@ import { keywordStrategy } from "../../src/related.ts";
  * `commit.gpgsign` or a custom `init.defaultBranch` would make results depend
  * on whose machine they ran on.
  */
+/**
+ * A clock the test drives.
+ *
+ * Timestamps are written by the caller through `ctx.now`, so ordering between
+ * two epics is only testable if a test can put a known gap between them. Real
+ * time cannot: two rows created in the same millisecond tie, and the tie-break
+ * is rowid.
+ */
+export interface TestClock {
+	now(): number;
+	advance(ms: number): void;
+	set(value: number): void;
+}
+
 export interface TempRepo {
 	dir: string;
 	git: GitRunner;
 	shell: ShellRunner;
 	db: DatabaseSync;
 	ctx: TrackerContext;
+	clock: TestClock;
 	/** Commit everything currently in the tree. Returns the new sha. */
 	commit(message: string): Promise<string>;
 	write(relativePath: string, contents: string): void;
@@ -33,7 +48,12 @@ export async function createTempRepo(
 	opts: { branch?: string; initialCommit?: boolean } = {},
 ): Promise<TempRepo> {
 	const branch = opts.branch ?? "feat/test";
-	const dir = mkdtempSync(join(tmpdir(), "pi-tracker-"));
+	// realpath, because on macOS `tmpdir()` is /var/... which is a symlink to
+	// /private/var/.... git always reports the resolved path, so without this
+	// every comparison between a path we constructed and one git printed fails —
+	// in the tests, and in `resolveSessionEpic`, which matches a worktree row by
+	// string equality against `rev-parse --show-toplevel`.
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-tracker-")));
 
 	const env: NodeJS.ProcessEnv = {
 		...process.env,
@@ -67,18 +87,30 @@ export async function createTempRepo(
 	const paths = await resolvePaths({ cwd: dir, git, overrides: { repoRoot: dir }, env: {} });
 	const db = openDb(paths.dbPath);
 
+	let time = 1_700_000_000_000;
+	const clock: TestClock = {
+		now: () => time,
+		advance: (ms) => {
+			time += ms;
+		},
+		set: (value) => {
+			time = value;
+		},
+	};
+
 	return {
 		dir,
 		git,
 		shell,
 		db,
+		clock,
 		ctx: {
 			paths,
 			db,
 			git,
 			shell,
 			related: keywordStrategy,
-			now: () => 1_700_000_000_000,
+			now: clock.now,
 			notify: () => {},
 		},
 		write(relativePath, contents) {

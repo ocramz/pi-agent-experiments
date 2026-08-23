@@ -20,10 +20,15 @@ describe("/merge-epic", () => {
 		await s.expect(`Merge epic/${epic}-ship-the-widget into ${base}?`);
 		await s.choose(0); // "Yes, fast-forward <base>"
 		await s.expect(`merged epic/${epic}-ship-the-widget into ${base}`);
+		await s.choose(0); // "No, keep them" — the ref-pruning offer that follows
 		await s.close();
 
 		assert.equal(await s.git("rev-parse", base!), tip, "the base branch fast-forwarded to the epic tip");
 		assert.equal(s.db((db) => getEpicBranch(db, epic!)?.state), "merged", "the epic is recorded as merged");
+		assert.ok(
+			(await s.piRefs("backup")).includes(`refs/pi/backup/${epic}/pre-merge`),
+			"declining the offer keeps every ref",
+		);
 	});
 
 	it("E2 leaves everything alone when declined", async (t) => {
@@ -49,6 +54,7 @@ describe("/merge-epic", () => {
 		await s.expect(`Merge epic/${epic}-ship-the-widget into ${base}?`);
 		await s.choose(0);
 		await s.expect(`merged epic/${epic}-ship-the-widget into ${base}`);
+		await s.choose(0); // the ref-pruning offer
 		await s.close();
 
 		assert.equal(s.db((db) => getEpicBranch(db, epic!)?.state), "merged", "the epic is recorded as merged");
@@ -100,6 +106,7 @@ describe("/cancel-epic", () => {
 
 		await s.command(`/cancel-epic ${epic}`);
 		await s.expect(`epic #${epic} cancelled, back on ${base}`);
+		await s.choose(0); // the ref-pruning offer
 		await s.close();
 
 		assert.equal(s.db((db) => getEpicBranch(db, epic!)?.state), "cancelled", "the epic is recorded as cancelled");
@@ -110,7 +117,7 @@ describe("/cancel-epic", () => {
 	it("F2 reports when there is no epic to cancel", async (t) => {
 		const s = await session(t, "stories");
 		await s.command("/cancel-epic");
-		await s.expect("no epic is active — pass an id, or start one with /start-epic");
+		await s.expect("this session is not working on an epic — pass an id, or start one with /start-epic");
 		await s.close();
 	});
 });

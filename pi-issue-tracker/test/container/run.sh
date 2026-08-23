@@ -13,7 +13,11 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
-export IMAGE="${IMAGE:-ghcr.io/ocramz/pi-container-distroless-node24:latest}"
+# Pinned by digest, like TEST_IMAGE in the root Makefile and IMAGE in
+# .github/workflows/test.yml — all three must move together. The capability probe
+# asserts what this userland's perl-less git can do, and on a moving tag a base
+# image change would alter that silently.
+export IMAGE="${IMAGE:-ghcr.io/ocramz/pi-container-distroless-node24@sha256:46bbab3a97cbcfeb89fe362c60ab8f589510354b2fe86d0b177f063b8f5810bf}"
 export ENGINE="${ENGINE:-podman}"
 export PI_PROVIDER="${PI_PROVIDER:-openrouter}"
 export PI_MODEL="${PI_MODEL:-deepseek/deepseek-v4-flash}"

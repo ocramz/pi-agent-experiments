@@ -80,21 +80,20 @@ describe("/undo-merge", () => {
 		await s.close();
 	});
 
-	// There is deliberately no case for /undo-merge's no-argument epic selection
-	// against more than one merged epic. Building one showed the outcome is not
-	// stable enough to assert: epic_branches timestamps default to
-	// strftime('%s','now') * 1000, which is second resolution, so two epics
-	// created in the same second tie on created_at and getEpicBranchesByState's
-	// ORDER BY falls back to rowid. A case whose result depends on sub-second
-	// timing is worse than no case — see STATUS.md gap 11, and fix the ordering
-	// before writing a test for it.
+	// There is deliberately no case here for /undo-merge's no-argument epic
+	// selection against more than one merged epic. The ordering it depends on is
+	// correct now — timestamps come from ctx.now at millisecond resolution and
+	// selection is by updated_at, so "the epic that merged last" is a real answer
+	// rather than a tie broken by rowid — but asserting it needs a controlled
+	// clock, which makes it a unit test. It is in ../database.test.ts as "picks
+	// the last merged epic by when it merged, not by when it started".
 });
 
 describe("/undo-turn", () => {
-	it("I2 warns when no epic is active", async (t) => {
+	it("I2 warns when this session is not working on an epic", async (t) => {
 		const s = await session(t, "stories");
 		await s.command("/undo-turn");
-		await s.expect("No epic is active, so no checkpoints are being taken.");
+		await s.expect("This session is not working on an epic, so no checkpoints are being taken.");
 		await s.close();
 
 		assert.deepEqual(await s.piRefs("checkpoint"), [], "no checkpoint refs exist");

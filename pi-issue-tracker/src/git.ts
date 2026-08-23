@@ -62,6 +62,41 @@ export function createLocalShellRunner(
 		});
 }
 
+/**
+ * Retry a git command that lost a race for a lock file.
+ *
+ * Git work inside one process is serialized through a single promise chain, but
+ * concurrent epics mean concurrent *processes*: one pi session per worktree, all
+ * against one repository. Most operations touch only their own worktree's index,
+ * so they cannot collide — but `worktree add`, ref updates and the main
+ * checkout's index are shared, and git's answer to a contended lock is to fail.
+ *
+ * This is mitigation, not coordination. It turns a rare hard failure into a
+ * pause; it does not make two sessions agree about anything. Nothing here
+ * retries a command that failed for any other reason, so a genuine error still
+ * surfaces on the first attempt.
+ */
+export function withLockRetry(
+	git: GitRunner,
+	opts: { attempts?: number; delayMs?: number } = {},
+): GitRunner {
+	const attempts = opts.attempts ?? 4;
+	const delayMs = opts.delayMs ?? 120;
+
+	return async (args, options) => {
+		let result = await git(args, options);
+		for (let attempt = 1; attempt < attempts; attempt++) {
+			// Git's message is "Unable to create '...index.lock': File exists."
+			// Matching the path rather than the prose keeps this working across
+			// locales and the several wordings git uses for different lock files.
+			if (result.code === 0 || !/\.lock'?:/.test(result.stderr)) return result;
+			await new Promise((done) => setTimeout(done, delayMs * attempt));
+			result = await git(args, options);
+		}
+		return result;
+	};
+}
+
 export interface RepoInfo {
 	isRepo: boolean;
 	/** Main working tree, even when called from inside a linked worktree. */

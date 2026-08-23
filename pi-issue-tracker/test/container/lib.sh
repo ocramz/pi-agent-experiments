@@ -4,7 +4,7 @@
 # test time. The harness is short and stable; re-sync it if upstream changes.
 #
 #   ENGINE     container engine (default: podman)
-#   IMAGE      image to test against — pin a tag, never :latest
+#   IMAGE      image to test against — pin a digest, never :latest
 #   FIXTURES   fixture directory, mounted read-only
 #   RUN_FLAGS  extra engine flags for one call (e.g. --network=none, -v ...)
 set -uo pipefail
@@ -13,7 +13,7 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/assert.sh"
 
 ENGINE="${ENGINE:-podman}"
-IMAGE="${IMAGE:?IMAGE must be set (e.g. ghcr.io/ocramz/pi-container-distroless-node24:latest)}"
+IMAGE="${IMAGE:?IMAGE must be set — see run.sh for the pinned digest}"
 FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/fixtures" 2>/dev/null && pwd)}"
 USER_FLAGS="${USER_FLAGS:-}"
 
