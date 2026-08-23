@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { getEpicBranch } from "../../src/database.ts";
-import { session } from "./pi-session.ts";
+import { session } from "./session.ts";
 
 describe("/merge-epic", () => {
 	it("E1 fast-forwards the base branch when confirmed", async (t) => {

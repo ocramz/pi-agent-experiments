@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { describe, it } from "node:test";
 import { getEpicBranch, getStoryById } from "../../src/database.ts";
 import { rowCount } from "./inspect.ts";
-import { session } from "./pi-session.ts";
+import { session } from "./session.ts";
 
 describe("/start-epic --worktree", () => {
 	it("W1 creates the worktree, records it, and leaves the main checkout alone", async (t) => {

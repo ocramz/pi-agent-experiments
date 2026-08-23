@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { getAllStories, getEpicBranch } from "../../src/database.ts";
 import { rowCount } from "./inspect.ts";
-import { session, sessionFileExists, sessionFilesFor, type Session } from "./pi-session.ts";
+import { session, sessionFileExists, sessionFilesFor, type Session } from "./session.ts";
 
 const SKIP = process.env.PI_TUI_SKIP_LIVE === "1";
 if (!SKIP && !process.env.OPENROUTER_API_KEY) {

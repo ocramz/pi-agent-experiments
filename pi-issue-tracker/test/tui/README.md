@@ -17,8 +17,24 @@ through the library alone lands in exactly the mode that cannot run a command. `
 between the two: it allocates a pty, runs pi inside it, and copies the master end to and from
 the pipes the library holds. pi sees a terminal; the library sees a stream.
 
-The rest follows from that. See the header of [pi-session.ts](pi-session.ts) for why `COLUMNS`
-is load-bearing and why assertions go through `screen()` rather than the library's `findByText`.
+The rest follows from that. See the header of
+[shared/test/tui/pi-session.ts](../../../shared/test/tui/pi-session.ts) for why `COLUMNS` is
+load-bearing and why assertions go through `screen()` rather than the library's `findByText`.
+
+## Where the harness lives
+
+The pty machinery is shared by every extension in the repo and sits in
+[shared/test/tui/pi-session.ts](../../../shared/test/tui/pi-session.ts). It knows how to get pi
+running under a pty and how to read its screen; it knows nothing about this extension.
+
+[session.ts](session.ts) is this package's binding to it — a ~25-line wrapper that builds a
+fixture, calls `startPi`, and mixes in [inspect.ts](inspect.ts). That is what a case imports, and
+why `session(t, "stories")` still returns one object carrying `facts`, `db()` and `expect()`
+together.
+
+The wrapper also owns the fixture directory, and hands `startPi` an `afterExit` callback to
+delete it. That is deliberate rather than a second `t.after`: deleting the tree while pi still
+held the database open is a race, and hook-unwind order is not something to infer.
 
 ## Running it
 
@@ -32,11 +48,19 @@ npm run test:tui                 # all 38
 node --test test/tui/start-epic.test.ts    # one group
 ```
 
-`npm run test:tui` installs this directory's own `node_modules` first. That scope is deliberate:
-the package's `node_modules/@earendil-works/*` are symlinks into the container's global pi
-install, and an `npm install` at the package root would reify that tree and prune them.
-`npm run typecheck` installs it too — the root `tsconfig.json` type-checks these files, so the
-compiler needs the same scope Node does.
+`npm run test:tui` installs the shared `shared/test/tui/node_modules` first, and loads
+`PI_PROVIDER`/`PI_MODEL` from `shared/versions.env` on the way through
+`shared/with-versions.sh` — a live case asserts on their presence rather than falling back to a
+literal. Running `node --test` directly, as the one-group form above does, means exporting them
+yourself if the group contains a live case.
+
+That dependency scope is deliberately not in any package: a package's
+`node_modules/@earendil-works/*` are symlinks into the container's global pi install, and an
+`npm install` at a package root would reify that tree and prune them. It sits next to
+`pi-session.ts`, the only file that imports from it, because node resolves those imports by
+walking up from the importing file. `npm run typecheck` installs it too — this package's
+`tsconfig.json` type-checks the shared harness along with these files, so the compiler needs the
+same scope node does.
 
 Three cases — B1, B3 and I1 — drive a real model and need `OPENROUTER_API_KEY`, which
 `make test-tui` passes from `.env`. Without it [live.test.ts](live.test.ts) fails the run rather

@@ -1,40 +1,26 @@
 ENGINE      ?= podman
 DEV_IMAGE   ?= localhost/pi-dev:local
 DEV_NAME    ?= pi-dev
-# Pinned by digest, not by :latest. The git capability probe asserts what this
-# userland's perl-less git can do, and that claim is only worth anything against
-# a known image — on a moving tag a base-image change would alter the result
-# silently. Keep in step with IMAGE in .github/workflows/test.yml.
-#
-# It must be the digest of the multi-arch *index* — the one whose manifests[]
-# lists both linux/amd64 and linux/arm64. CI runs amd64 and the dev machines are
-# arm64, and a per-platform digest satisfies only one of them: `podman pull` by
-# digest does not enforce a platform, so the wrong one pulls fine and then dies
-# at `podman run` with "Exec format error". `podman inspect --format '{{index
-# .RepoDigests 0}}'` reports the per-platform digest on Apple silicon, which is
-# exactly how this pin was once broken. Re-pin with the index digest instead:
-#   skopeo inspect --raw docker://ghcr.io/ocramz/pi-container-distroless-node24:latest \
-#     | skopeo manifest-digest /dev/stdin
-# or, with no skopeo, straight from the registry:
-#   TOKEN=$(curl -s 'https://ghcr.io/token?scope=repository:ocramz/pi-container-distroless-node24:pull' | jq -r .token)
-#   curl -sI -H "Authorization: Bearer $TOKEN" \
-#     -H 'Accept: application/vnd.oci.image.index.v1+json' \
-#     https://ghcr.io/v2/ocramz/pi-container-distroless-node24/manifests/latest \
-#     | grep -i docker-content-digest
-# Then check it with `podman manifest inspect <ref>`: two platforms, not one.
-TEST_IMAGE  ?= ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b
 ENV_FILE    ?= .env
 CONFIG_VOL  ?= pi-config
 STORAGE_VOL ?= pi-dev-storage
-PKG         ?= pi-issue-tracker
-# The live suite spends money, and the live tier is the only coverage extensions/index.ts
-# has. deepseek-v4-flash is the cheapest model in the catalog that still drives
-# tool calls reliably: the suite needs the model to actually call the story tool
-# and the bash tool, and weaker ones narrate instead. A concrete id, not the
-# `-latest` alias, so a catalog change cannot move it underneath the tests.
-# Override with `make check PI_MODEL=...` to compare.
-PI_PROVIDER ?= openrouter
-PI_MODEL    ?= deepseek/deepseek-v4-flash
+
+# The image digest, the live model and the pi release, pinned once for the whole
+# repo. Everything here and in the shell suites reads them from that one file;
+# see the comments there for how to re-pin the digest. The DEFAULT_ prefix is
+# what keeps `make check PI_MODEL=...` working — a command-line variable beats
+# the `?=` below, which in turn beats the file.
+include shared/versions.env
+TEST_IMAGE  ?= $(DEFAULT_TEST_IMAGE)
+PI_PROVIDER ?= $(DEFAULT_PI_PROVIDER)
+PI_MODEL    ?= $(DEFAULT_PI_MODEL)
+
+# Every extension in the repo. `make check` runs the lot; PKG=... narrows any
+# target to one. Adding an extension is a one-line edit here and one in
+# .github/workflows/test.yml — see "Adding an extension" in the README.
+PKGS        ?= pi-issue-tracker
+# What the test targets iterate over: PKG if it was given, otherwise all of them.
+TARGETS      = $(if $(PKG),$(PKG),$(PKGS))
 
 # Minimal security flags for nested podman. 
 #   unmask=/proc/*      podman masks paths inside /proc; the kernel then refuses
@@ -90,32 +76,56 @@ shell:
 dev-stop:
 	- $(ENGINE) rm -f $(DEV_NAME)
 
+# Run one npm script in every target package, stopping at the first failure.
+#
+# `npm run <script> --if-present` rather than `npm run <script>` is the whole of
+# the multi-package story: an extension with no interactive tier and no container
+# tier simply has no such script, and the loop skips it instead of failing. No
+# discovery, no per-package configuration, no manifest.
+#
+# The `set -e` matters: each recipe line is one shell, and without it a failing
+# package would be reported and the loop would carry on to the next.
+define for_each_pkg
+	@set -e; for pkg in $(TARGETS); do \
+	  printf '\n=== %s: %s ===\n' "$$pkg" "$(1)"; \
+	  $(ENGINE) run --rm $(RUN_FLAGS) -w /workspace/$$pkg $(DEV_IMAGE) \
+	    bash -lc 'npm run $(1) --if-present'; \
+	done
+endef
+
 # One-shot and disposable, so a laptop and CI run the same thing. Includes the
 # live suite, which calls a model API and costs money.
 test-container: image $(ENV_FILE)
-	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace/$(PKG) $(DEV_IMAGE) \
-	  bash -lc 'IMAGE=$(TEST_IMAGE) npm run test:container'
+	$(call for_each_pkg,test:container)
 
 test: image $(ENV_FILE)
-	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace/$(PKG) $(DEV_IMAGE) bash -lc 'npm test'
+	$(call for_each_pkg,test)
 
 # Needs no key, but $(RUN_FLAGS) carries --env-file, so $(ENV_FILE) is still a
 # prerequisite. Runs equally well on the host: `cd $(PKG) && npm run typecheck`.
 typecheck: image $(ENV_FILE)
-	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace/$(PKG) $(DEV_IMAGE) bash -lc 'npm run typecheck'
+	$(call for_each_pkg,typecheck)
 
 # The interactive tier. Runs in this image rather than the distroless test image
 # because it needs pi on PATH, npm to install its own dependencies, and `script`
-# to give pi a pty — none of which the distroless userland has. The three
+# to give pi a pty — none of which the distroless userland has. The
 # model-driven cases use $(PI_MODEL), same as the live container suite.
 test-tui: image $(ENV_FILE)
-	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace/$(PKG) $(DEV_IMAGE) bash -lc 'npm run test:tui'
+	$(call for_each_pkg,test:tui)
 
-check: test typecheck test-tui test-container
+# The image's own suite: the git capability probe. A property of the pinned
+# digest, not of any package, so it runs once for the repo rather than once per
+# extension — and it runs first, because every design here assumes worktrees and
+# `stash create` exist.
+test-image: image $(ENV_FILE)
+	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace $(DEV_IMAGE) \
+	  bash -lc 'IMAGE=$(TEST_IMAGE) shared/test/container/run-image-tests.sh'
+
+check: test-image test typecheck test-tui test-container
 
 # The inner image cache and the dev container. Leaves $(CONFIG_VOL) alone — that
 # is the pi login.
 clean: dev-stop
 	- $(ENGINE) volume rm $(STORAGE_VOL)
 
-.PHONY: image dev shell dev-stop test typecheck test-tui test-container check clean
+.PHONY: image dev shell dev-stop test typecheck test-tui test-container test-image check clean

@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { session } from "./pi-session.ts";
+import { session } from "./session.ts";
 
 describe("/undo-story", () => {
 	it("G1 resets when the story commit is at the tip", async (t) => {

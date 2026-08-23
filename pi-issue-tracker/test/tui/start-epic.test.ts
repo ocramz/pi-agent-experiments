@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { getEpicBranch, getStoryById } from "../../src/database.ts";
 import { rowCount } from "./inspect.ts";
-import { session } from "./pi-session.ts";
+import { session } from "./session.ts";
 
 describe("/start-epic", () => {
 	it("D1 creates the branch, backup ref and in_progress status", async (t) => {

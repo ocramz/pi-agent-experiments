@@ -18,7 +18,7 @@
 # user, the copy failed silently, and `node --test` over an empty tree still
 # reports "fail 0". A copy error is now fatal, and the pass count has a floor.
 # stage_pkg is what stops it happening in the first place.
-source "$(dirname "$0")/lib.sh"
+source "$(dirname "$0")/../../../shared/test/container/lib.sh"
 
 PKG="$(cd "$(dirname "$0")/../.." && pwd)"
 STAGED="$(stage_pkg "$PKG")" || { echo "could not stage the package for the image user" >&2; exit 1; }

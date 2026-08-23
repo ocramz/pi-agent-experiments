@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Assertion vocabulary shared by every shell-based suite in this package.
+# Assertion vocabulary shared by every shell-based suite in every package.
 #
-# Originally part of test/container/lib.sh, which cannot be sourced outside a
+# Originally part of container/lib.sh, which cannot be sourced outside a
 # container run — it opens by requiring IMAGE. Kept here so any shell-based suite
 # can produce the same `  ok` / `FAIL` output; container/lib.sh sources it.
 #

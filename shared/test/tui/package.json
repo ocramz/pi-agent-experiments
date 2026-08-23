@@ -1,0 +1,11 @@
+{
+	"name": "pi-tui-tests",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Dependency scope for the interactive tier, shared by every package. Deliberately separate from any package's own node_modules: node_modules/@earendil-works/* there are symlinks into the container's global pi install, and an `npm install` at a package root would reify that tree and prune them. It sits next to pi-session.ts on purpose — that file is the only importer of these two packages, and node resolves them by walking up from the importing file, so a package's test files never need to see this scope at all.",
+	"dependencies": {
+		"cli-testing-library": "4.0.0",
+		"strip-ansi": "7.2.0"
+	}
+}

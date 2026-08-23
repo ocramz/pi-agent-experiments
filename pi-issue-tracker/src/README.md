@@ -20,6 +20,13 @@ pi-issue-tracker/
   test/                → node --test suites; test/container/ runs them in the image
 ```
 
+The tooling this package is built and tested with is not in here: the compiler and pi's
+type declarations, the shell assertion vocabulary, the container harness and the pty
+harness all live in [`shared/`](../../shared/) and are used by every extension in the
+repo. What stays package-local is what encodes *this* extension's semantics — the
+fixtures, the inspector, the live suite. See "Adding an extension" in the
+[top-level README](../../README.md).
+
 **`src/` must not import from `@earendil-works/*`.** `extensions/index.ts` is the only
 pi-aware file: it builds a `TrackerContext` and delegates. That boundary is what lets
 everything below it run under plain `node --test` against a temp repository, with no pi

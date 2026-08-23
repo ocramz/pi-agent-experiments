@@ -13,9 +13,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test 'test/*.test.ts'",
-    "typecheck": "npm --prefix tools/typecheck install --no-audit --no-fund --silent && npm --prefix test/tui install --no-audit --no-fund --silent && node tools/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "typecheck": "npm --prefix ../shared/typecheck install --no-audit --no-fund --silent && npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && node ../shared/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
     "test:container": "test/container/run.sh",
-    "test:tui": "npm --prefix test/tui install --no-audit --no-fund --silent && node --test 'test/tui/*.test.ts'"
+    "test:tui": "npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && ../shared/with-versions.sh node --test 'test/tui/*.test.ts'"
   },
   "author": "Marco Zocca",
   "repository": {

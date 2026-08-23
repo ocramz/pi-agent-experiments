@@ -6,12 +6,51 @@ on:
   pull_request:
 
 jobs:
+  # Whether this run can see the repository's secrets. A pull request from a fork
+  # cannot, and two jobs need to know: the interactive tier opts out of its live
+  # cases, and the container tier does not run at all.
+  #
+  # It is a job rather than a top-level `env:` because a job-level `if:` cannot
+  # read the `env` context — only `needs`, which is what this exists to provide.
+  gate:
+    name: secrets available?
+    runs-on: ubuntu-24.04
+    outputs:
+      has_secrets: ${{ steps.check.outputs.has_secrets }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] || \
+             [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            echo "has_secrets=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secrets=0" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The image's own suite: the git capability probe. A property of the pinned
+  # digest, not of any package, so it runs once rather than once per extension —
+  # outside the matrix for exactly that reason. Needs no key: nothing here drives
+  # a model, so it runs on fork pull requests too.
+  image:
+    name: image userland (git capabilities)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The digest comes from shared/versions.env, the one place it is pinned.
+      - run: SHARED_DIR=shared . shared/versions.sh && podman pull "$IMAGE"
+      - run: shared/test/container/run-image-tests.sh
+
   unit:
     name: unit + types (host)
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # Adding an extension: one entry here, and one in PKGS in the Makefile.
+      matrix:
+        pkg: [pi-issue-tracker]
     defaults:
       run:
-        working-directory: pi-issue-tracker
+        working-directory: ${{ matrix.pkg }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,81 +58,88 @@ jobs:
           # Node 24 strips TypeScript types natively, so there is no build step
           # and no test-framework dependency to install.
           node-version: "24"
-          # The type-check is the only step here that installs anything, but it
-          # installs two scopes: the compiler and pi's declarations, which are
-          # large, and the interactive tier's own dependencies, which are small
-          # but which tsconfig.json's `include` reaches — see the note there.
+          # The type-check is the only step here that installs anything, and both
+          # scopes it installs are now shared by the whole repo rather than owned
+          # by this package: the compiler and pi's declarations, which are large,
+          # and the interactive tier's own dependencies, which are small but which
+          # tsconfig.json's `include` reaches — see the note there.
           cache: npm
           cache-dependency-path: |
-            pi-issue-tracker/tools/typecheck/package-lock.json
-            pi-issue-tracker/test/tui/package-lock.json
-      - run: npm test
+            shared/typecheck/package-lock.json
+            shared/test/tui/package-lock.json
+      - run: npm run test --if-present
       # Type-checks the extension against pi's real declarations, which the
-      # script installs into tools/typecheck. Without them the pi types degrade
+      # script installs into shared/typecheck. Without them the pi types degrade
       # to `any` and the check passes without proving anything — see the note in
-      # tsconfig.json.
-      - run: npm run typecheck
+      # shared/tsconfig.base.json.
+      - run: npm run typecheck --if-present
 
   tui:
     name: interactive (pty)
     runs-on: ubuntu-24.04
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [pi-issue-tracker]
     defaults:
       run:
-        working-directory: pi-issue-tracker
+        working-directory: ${{ matrix.pkg }}
     env:
-      PI_PROVIDER: openrouter
-      # Kept in step with the Makefile default; see the comment there.
-      PI_MODEL: deepseek/deepseek-v4-flash
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      # Three of the 38 cases drive a real model, and a pull request from a fork
-      # gets no secrets. Opting out explicitly beats letting the suite fail on a
-      # missing key — and beats a silent skip, which is why test/tui/live.test.ts
-      # refuses to run without either the key or this flag.
-      PI_TUI_SKIP_LIVE: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '0' || '1' }}
+      # A few cases drive a real model, and a pull request from a fork gets no
+      # secrets. Opting out explicitly beats letting the suite fail on a missing
+      # key — and beats a silent skip, which is why test/tui/live.test.ts refuses
+      # to run without either the key or this flag.
+      PI_TUI_SKIP_LIVE: ${{ needs.gate.outputs.has_secrets == '1' && '0' || '1' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: pi-issue-tracker/test/tui/package-lock.json
-      # pi itself is under test here, so the version is pinned: a release that
-      # changed the TUI would otherwise turn into a mystery failure. Keep it in
-      # step with the version tsconfig type-checks against.
-      - run: npm i -g @earendil-works/pi-coding-agent@0.84.2
+          cache-dependency-path: shared/test/tui/package-lock.json
+      # pi itself is under test here, so the version is pinned — a release that
+      # changed the TUI would otherwise turn into a mystery failure. The pin is
+      # PI_VERSION in shared/versions.env, the same file the type-check's pi
+      # declarations are kept in step with.
+      - name: install the pinned pi
+        working-directory: .
+        run: SHARED_DIR=shared . shared/versions.sh && npm i -g @earendil-works/pi-coding-agent@"$PI_VERSION"
       # ubuntu-24.04 already carries util-linux, so `script` — the pty the suite
-      # runs pi in — needs no install step here.
-      - run: npm run test:tui
+      # runs pi inside — needs no install step here. PI_PROVIDER and PI_MODEL are
+      # not set here either: `npm run test:tui` loads them from versions.env.
+      - run: npm run test:tui --if-present
 
   container:
     name: container (image userland)
     runs-on: ubuntu-24.04
+    needs: gate
     # test_extension_live.sh calls a model API with the repository's key, and a
     # pull request from a fork gets no secrets — the suite would exit 78 there
     # rather than fail informatively.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: needs.gate.outputs.has_secrets == '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [pi-issue-tracker]
     defaults:
       run:
-        working-directory: pi-issue-tracker
+        working-directory: ${{ matrix.pkg }}
     env:
-      # Pinned by digest. On :latest a base-image change could alter results
-      # silently, and the git capability probe is only meaningful against a
-      # known userland. Keep in step with TEST_IMAGE in the root Makefile, which
-      # documents how to re-pin. The digest is the multi-arch index, not one of
-      # its members: this runner is amd64 and the dev machines are arm64, and a
-      # per-platform digest pulls fine on both but only runs on one.
-      IMAGE: ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b
-      ENGINE: podman
-      # The live tier is the only coverage extensions/index.ts has; without a key
-      # run.sh refuses to start rather than quietly skipping it.
+      # The live tier is the only coverage an extension's entry point has;
+      # without a key run.sh refuses to start rather than quietly skipping it.
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      PI_PROVIDER: openrouter
-      # Kept in step with the Makefile default; see the comment there.
-      PI_MODEL: deepseek/deepseek-v4-flash
+      ENGINE: podman
+      # IMAGE, PI_PROVIDER and PI_MODEL are deliberately absent: the shared
+      # driver loads them from shared/versions.env, which is the only place the
+      # digest and the model are written down.
     steps:
       - uses: actions/checkout@v4
-      - run: podman pull "$IMAGE"
-      # Runs the git capability probe first; it gates the suites that depend on
-      # worktree and stash-create actually existing in the perl-less git. The
-      # runner's podman is not nested, so none of the Makefile's flags apply.
-      - run: npm run test:container
+      - name: pull the pinned image
+        working-directory: .
+        run: SHARED_DIR=shared . shared/versions.sh && podman pull "$IMAGE"
+      # The runner's podman is not nested, so none of the Makefile's flags apply.
+      # The git capability probe is not run here — the `image` job covers it once
+      # for every package.
+      - run: npm run test:container --if-present

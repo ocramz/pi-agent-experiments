@@ -1,5 +1,10 @@
 // Drive a real pi TUI session from a test, and read what it printed.
 //
+// Shared by every package in this repo. It knows how to get pi running under a
+// pty and how to read its screen; it knows nothing about any one extension's
+// fixtures or state. A package supplies both through its own thin `session()`
+// wrapper — see pi-issue-tracker/test/tui/session.ts for the pattern.
+//
 // ── Why there is a pty in here ───────────────────────────────────────
 // cli-testing-library spawns with child_process.spawn and pipes; it allocates no
 // pty. pi picks its mode with `parsed.print || !stdinIsTTY || !stdoutIsTTY →
@@ -24,17 +29,14 @@
 // polling primitive, re-driven by its stdout observer — does the waiting.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { cleanup, configure, render, waitFor } from "cli-testing-library";
 import type { RenderResult } from "cli-testing-library";
 import stripAnsi from "strip-ansi";
-import { buildFixture, type Facts, type Shape } from "./fixtures.ts";
-import { inspector, type Inspector } from "./inspect.ts";
 
-const EXTENSION = resolve(import.meta.dirname, "..", "..", "extensions", "index.ts");
 const PI_BIN = process.env.PI_BIN ?? "pi";
 
 // Shared across the whole run, and across runs on the same machine. pi
@@ -89,8 +91,7 @@ configure({ asyncUtilTimeout: 30_000 });
 /** pi's footer hint. Present once the TUI has painted and is taking input. */
 const READY = "ctrl+o more";
 
-export interface Session extends Inspector {
-	facts: Facts;
+export interface PiSession {
 	dir: string;
 	/** Everything pi has printed since the last `clear()`, ANSI stripped. */
 	screen(): string;
@@ -113,22 +114,28 @@ export interface Session extends Inspector {
 const normalise = (text: string): string => stripAnsi(text).replace(/\s+/g, " ").trim();
 
 /**
- * Build a fixture, start pi in it, and wait until it is taking input.
+ * Start pi in an already-prepared directory and wait until it is taking input.
  *
- * Cleanup is registered on the test context, so a failing case cannot leak a pi
- * process or a temp directory. Set PI_TUI_KEEP=1 to keep the fixture for
- * post-mortem — the path is printed when a case fails.
+ * The fixture is the caller's business, deliberately: this file is shared by
+ * every package in the repo, and what a useful fixture looks like — which
+ * stories exist, which branch is checked out — is exactly what differs between
+ * them. A package wraps this in its own `session()` that builds a fixture, calls
+ * `startPi`, and mixes in its own inspector; see
+ * pi-issue-tracker/test/tui/session.ts.
+ *
+ * `extension` is likewise the caller's: it is the path to the package's
+ * extension entry point, passed to pi as `-e`.
+ *
+ * Cleanup of the pi process is registered on the test context, so a failing case
+ * cannot leak one. Removing the fixture directory belongs to whoever created it,
+ * and `afterExit` is where that runs — once pi is provably gone.
  */
-export async function session(
+export async function startPi(
 	t: TestContext,
-	shape: Shape,
-	opts: { live?: boolean; prepare?: (dir: string) => void } = {},
-): Promise<Session> {
+	dir: string,
+	opts: { extension: string; live?: boolean; afterExit?: () => void },
+): Promise<PiSession> {
 	mkdirSync(AGENT_DIR, { recursive: true });
-	const root = mkdtempSync(join(tmpdir(), "pi-tui-"));
-	const dir = join(root, "fx");
-	const facts = await buildFixture(shape, dir);
-	opts.prepare?.(dir);
 
 	const env: NodeJS.ProcessEnv = {
 		...process.env,
@@ -140,10 +147,21 @@ export async function session(
 		PI_CODING_AGENT_DIR: AGENT_DIR,
 	};
 
-	const flags = ["--tui-mode regular", "--approve", `-e ${EXTENSION}`];
+	const flags = ["--tui-mode regular", "--approve", `-e ${opts.extension}`];
 	if (opts.live) {
-		flags.push(`--provider ${process.env.PI_PROVIDER ?? "openrouter"}`);
-		flags.push(`--model ${process.env.PI_MODEL ?? "deepseek/deepseek-v4-flash"}`);
+		// No literal fallbacks. The provider and model are pinned once, in
+		// shared/versions.env, and `npm run test:tui` sources it — a default
+		// spelled out here would be a sixth copy of a value that used to live in
+		// five places and drift between them.
+		const provider = process.env.PI_PROVIDER;
+		const model = process.env.PI_MODEL;
+		assert.ok(
+			provider && model,
+			"a live case needs PI_PROVIDER and PI_MODEL. `npm run test:tui` sources them from " +
+				"shared/versions.env; running node --test directly means exporting them yourself.",
+		);
+		flags.push(`--provider ${provider}`);
+		flags.push(`--model ${model}`);
 	}
 	// `-q` no banner, `-f` flush every write so assertions see output as it
 	// happens, `-e` return pi's own exit status rather than script's.
@@ -173,9 +191,7 @@ export async function session(
 
 	const settle = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
-	const s: Session = {
-		...inspector(dir),
-		facts,
+	const s: PiSession = {
 		dir,
 		screen,
 		rawScreen,
@@ -240,8 +256,12 @@ export async function session(
 			await exited(pi, 5_000);
 		}
 		await cleanup().catch(() => {});
-		if (process.env.PI_TUI_KEEP) console.log(`fixture kept: ${dir}`);
-		else rmSync(root, { recursive: true, force: true });
+		// The fixture directory is not removed here — whoever created it owns it,
+		// and that is the package's wrapper. It hands in `afterExit` rather than
+		// registering a `t.after` of its own so the ordering is explicit: deleting
+		// the tree out from under a still-live pi is exactly the race that would
+		// otherwise depend on which way node --test unwinds its hooks.
+		opts.afterExit?.();
 	});
 
 	await expect(READY, { timeout: 60_000 });
