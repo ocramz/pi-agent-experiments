@@ -79,8 +79,10 @@ jobs:
       # Pinned by digest. On :latest a base-image change could alter results
       # silently, and the git capability probe is only meaningful against a
       # known userland. Keep in step with TEST_IMAGE in the root Makefile, which
-      # documents how to re-pin.
-      IMAGE: ghcr.io/ocramz/pi-container-distroless-node24@sha256:46bbab3a97cbcfeb89fe362c60ab8f589510354b2fe86d0b177f063b8f5810bf
+      # documents how to re-pin. The digest is the multi-arch index, not one of
+      # its members: this runner is amd64 and the dev machines are arm64, and a
+      # per-platform digest pulls fine on both but only runs on one.
+      IMAGE: ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b
       ENGINE: podman
       # The live tier is the only coverage extensions/index.ts has; without a key
       # run.sh refuses to start rather than quietly skipping it.

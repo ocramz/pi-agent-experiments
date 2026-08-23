@@ -16,8 +16,10 @@ cd "$(dirname "$0")"
 # Pinned by digest, like TEST_IMAGE in the root Makefile and IMAGE in
 # .github/workflows/test.yml — all three must move together. The capability probe
 # asserts what this userland's perl-less git can do, and on a moving tag a base
-# image change would alter that silently.
-export IMAGE="${IMAGE:-ghcr.io/ocramz/pi-container-distroless-node24@sha256:46bbab3a97cbcfeb89fe362c60ab8f589510354b2fe86d0b177f063b8f5810bf}"
+# image change would alter that silently. The digest is the multi-arch index, so
+# it resolves on an arm64 laptop and an amd64 runner alike — see the Makefile for
+# why a per-platform digest is the wrong thing to paste here.
+export IMAGE="${IMAGE:-ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b}"
 export ENGINE="${ENGINE:-podman}"
 export PI_PROVIDER="${PI_PROVIDER:-openrouter}"
 export PI_MODEL="${PI_MODEL:-deepseek/deepseek-v4-flash}"
@@ -67,6 +69,19 @@ fi
 # sends the reader after entirely the wrong problem.
 if ! smoke="$("$ENGINE" run --rm --entrypoint /bin/bash "$IMAGE" -c 'echo engine-ok' 2>&1)" ||
 	[ "${smoke#*engine-ok}" = "$smoke" ]; then
+	# An architecture mismatch fails here too, and it is not an engine fault: the
+	# engine is fine, the image is for another CPU. `podman pull` by digest does
+	# not enforce a platform, so a per-platform digest pulls cleanly and only dies
+	# at `run` — pointing the reader at their engine sends them nowhere.
+	case "$smoke" in
+	*"Exec format error"* | *"does not match the expected platform"*)
+		echo "the image is built for a different architecture than this host — the tests were not run." >&2
+		printf '%s\n' "$smoke" | head -3 >&2
+		echo "IMAGE must be pinned to the multi-arch index digest, not to one platform's" >&2
+		echo "manifest; see the TEST_IMAGE comment in the root Makefile for how to re-pin." >&2
+		exit 127
+		;;
+	esac
 	echo "container engine '$ENGINE' cannot run containers here — the tests were not run." >&2
 	printf '%s\n' "$smoke" | head -3 >&2
 	echo "Run these on a machine with a working engine, or in CI." >&2

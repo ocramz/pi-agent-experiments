@@ -4,10 +4,25 @@ DEV_NAME    ?= pi-dev
 # Pinned by digest, not by :latest. The git capability probe asserts what this
 # userland's perl-less git can do, and that claim is only worth anything against
 # a known image — on a moving tag a base-image change would alter the result
-# silently. Keep in step with IMAGE in .github/workflows/test.yml; re-pin with
-#   podman pull ghcr.io/ocramz/pi-container-distroless-node24:latest
-#   podman inspect ... --format '{{index .RepoDigests 0}}'
-TEST_IMAGE  ?= ghcr.io/ocramz/pi-container-distroless-node24@sha256:46bbab3a97cbcfeb89fe362c60ab8f589510354b2fe86d0b177f063b8f5810bf
+# silently. Keep in step with IMAGE in .github/workflows/test.yml.
+#
+# It must be the digest of the multi-arch *index* — the one whose manifests[]
+# lists both linux/amd64 and linux/arm64. CI runs amd64 and the dev machines are
+# arm64, and a per-platform digest satisfies only one of them: `podman pull` by
+# digest does not enforce a platform, so the wrong one pulls fine and then dies
+# at `podman run` with "Exec format error". `podman inspect --format '{{index
+# .RepoDigests 0}}'` reports the per-platform digest on Apple silicon, which is
+# exactly how this pin was once broken. Re-pin with the index digest instead:
+#   skopeo inspect --raw docker://ghcr.io/ocramz/pi-container-distroless-node24:latest \
+#     | skopeo manifest-digest /dev/stdin
+# or, with no skopeo, straight from the registry:
+#   TOKEN=$(curl -s 'https://ghcr.io/token?scope=repository:ocramz/pi-container-distroless-node24:pull' | jq -r .token)
+#   curl -sI -H "Authorization: Bearer $TOKEN" \
+#     -H 'Accept: application/vnd.oci.image.index.v1+json' \
+#     https://ghcr.io/v2/ocramz/pi-container-distroless-node24/manifests/latest \
+#     | grep -i docker-content-digest
+# Then check it with `podman manifest inspect <ref>`: two platforms, not one.
+TEST_IMAGE  ?= ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b
 ENV_FILE    ?= .env
 CONFIG_VOL  ?= pi-config
 STORAGE_VOL ?= pi-dev-storage
