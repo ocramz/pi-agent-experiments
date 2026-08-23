@@ -1,0 +1,113 @@
+# The interactive tier
+
+38 cases covering the ten slash commands and the story board — everything the other automated
+suites structurally cannot reach.
+
+## Why it needs a pty
+
+`make check`'s other tiers cover `extensions/index.ts`'s hooks and its `story` tool by driving a
+real model. They cannot reach the commands. Slash commands are dispatched by pi's TUI alone:
+print mode never parses them, RPC mode can `get_commands` but has no case to execute one, and
+`/plan-stories` refuses outright unless `ctx.mode` is `"tui"`. The board is a TUI component
+driven by keystrokes.
+
+`cli-testing-library` spawns with `child_process.spawn` and pipes — it allocates no pty. pi
+resolves its mode with `parsed.print || !stdinIsTTY || !stdoutIsTTY → "print"`, so driving it
+through the library alone lands in exactly the mode that cannot run a command. `script(1)` sits
+between the two: it allocates a pty, runs pi inside it, and copies the master end to and from
+the pipes the library holds. pi sees a terminal; the library sees a stream.
+
+The rest follows from that. See the header of [pi-session.ts](pi-session.ts) for why `COLUMNS`
+is load-bearing and why assertions go through `screen()` rather than the library's `findByText`.
+
+## Running it
+
+Needs pi on `PATH`, so it runs in the dev container:
+
+```bash
+make test-tui                    # from the repo root, one shot
+# or, inside `make shell`:
+cd /workspace/pi-issue-tracker
+npm run test:tui                 # all 38
+node --test test/tui/start-epic.test.ts    # one group
+```
+
+`npm run test:tui` installs this directory's own `node_modules` first. That scope is deliberate:
+the package's `node_modules/@earendil-works/*` are symlinks into the container's global pi
+install, and an `npm install` at the package root would reify that tree and prune them.
+
+Three cases — B1, B3 and I1 — drive a real model and need `OPENROUTER_API_KEY`, which
+`make test-tui` passes from `.env`. Without it [live.test.ts](live.test.ts) fails the run rather
+than skipping quietly; `PI_TUI_SKIP_LIVE=1` is the explicit opt-out, used by the fork CI job.
+
+## The groups
+
+| File | Cases | Covers |
+|---|---|---|
+| [board.test.ts](board.test.ts) | A1–A5 | `/stories`: rendering, arrows, `r` `s` `d` `x`, `escape`. A5 is the important one — closing a story inside an active epic is the only route from a keystroke to a git commit |
+| [commands.test.ts](commands.test.ts) | B2, C1–C5 | `/plan-stories` usage, `/top-story`, `/export-stories` |
+| [start-epic.test.ts](start-epic.test.ts) | D1–D9 | One case per refusal in `checkCanStartEpic`, plus the dirty-tree prompt both ways and `--worktree` |
+| [merge-epic.test.ts](merge-epic.test.ts) | E1–E5, F1–F2 | `/merge-epic` confirm, decline, base-moved, conflict, already-merged; `/cancel-epic` |
+| [undo.test.ts](undo.test.ts) | G1–G4, H1–H2, I2–I3 | `/undo-story` reset and revert paths, `/undo-merge`, `/undo-turn` |
+| [live.test.ts](live.test.ts) | B1, B3, I1 | The three that need a model turn. Costs a little money |
+
+## How a case is built
+
+Every case is the same four moves: build a fixture, drive pi, close it, assert on state.
+
+```ts
+it("D1 creates the branch, backup ref and in_progress status", async (t) => {
+  const s = await session(t, "stories");        // fixture + pi, cleaned up on exit
+  await s.command(`/start-epic ${s.facts.epicId}`);
+  await s.expect("epic #1 started on epic/1-ship-the-widget");
+  await s.close();                              // assert only after pi has gone
+  assert.equal(s.db((db) => getEpicBranch(db, 1)?.state), "active");
+});
+```
+
+Both halves matter, and for refusals they matter in different ways: `expect` proves the message
+was shown, and the state assertions prove no side effect fired. The manual suite this replaced
+could only machine-check the second half — it asked the operator `Did you see: "…"? [y/N]` for
+the first, sixteen times.
+
+Assert **after** `close()`. pi holds the database in WAL mode and serialises its git effects
+through a promise chain; reading either while the session is still alive races it.
+
+## Adding a case
+
+1. Pick the file for its command group, or start a new one.
+2. If it needs a repository state that does not exist yet, add a shape to
+   [fixtures.ts](fixtures.ts). Build fixtures by calling `src/` — `startEpic`, `commitStory`,
+   `mergeIntoBase` — rather than by scripting git, so a fixture cannot drift from the code path
+   it is setting up.
+3. Read state through [inspect.ts](inspect.ts) and the package's own accessors, not raw SQL.
+
+## Debugging a red case
+
+```bash
+PI_TUI_KEEP=1 node --test test/tui/merge-epic.test.ts   # keeps the fixture, prints its path
+```
+
+A failed `expect` already prints the last 2000 characters of what pi actually rendered. With the
+fixture kept, the rest is ordinary forensics:
+
+```bash
+cd /tmp/pi-tui-XXXX/fx
+git log --oneline --all --decorate
+git for-each-ref refs/pi
+node --input-type=module -e 'import {DatabaseSync} from "node:sqlite";
+  const d = new DatabaseSync(".pi/stories.db");
+  console.log(d.prepare("select * from epic_branches").all());'
+```
+
+## Deliberate omissions
+
+**`/undo-merge` with no argument, against more than one merged epic.** `epic_branches.created_at`
+defaults to `strftime('%s', 'now') * 1000` — millisecond scale, second resolution — so two epics
+created in the same second tie, and `getEpicBranchesByState`'s `ORDER BY created_at` falls back
+to rowid. Which epic the no-argument form selects then depends on sub-second timing. That is a
+unit test about ordering, and it should be written after the ordering is fixed. STATUS.md gap 11
+has the detail.
+
+**Worktree mode** (`/start-epic --worktree`) is covered only by D9, which asserts it declines and
+changes nothing. Phase 2 will need its own cases.

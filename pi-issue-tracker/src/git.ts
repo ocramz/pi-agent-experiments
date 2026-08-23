@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import type { GitResult, GitRunner } from "./context.ts";
+import type { GitResult, GitRunner, ShellRunner } from "./context.ts";
 
 /**
  * Git plumbing. Every call goes through a `GitRunner` so the caller decides
@@ -29,6 +30,30 @@ export function createLocalGitRunner(
 				(err, stdout, stderr) => {
 					// A missing binary (err.code === "ENOENT") and a non-zero exit both
 					// have to surface the same way, or the two runners would diverge.
+					const raw = (err as NodeJS.ErrnoException & { code?: number | string } | null)?.code;
+					const code = err ? (typeof raw === "number" ? raw : 1) : 0;
+					done({ stdout: stdout ?? "", stderr: stderr ?? "", code });
+				},
+			);
+		});
+}
+
+/** A `ShellRunner` backed by `bash -c`. Used by tests and any non-pi caller. */
+export function createLocalShellRunner(
+	defaults: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): ShellRunner {
+	return (command, opts) =>
+		new Promise<GitResult>((done) => {
+			execFile(
+				"bash",
+				["-c", command],
+				{
+					cwd: opts?.cwd ?? defaults.cwd,
+					timeout: opts?.timeout ?? 0,
+					env: { ...(defaults.env ?? process.env), ...(opts?.env ?? {}) },
+					maxBuffer: 32 * 1024 * 1024,
+				},
+				(err, stdout, stderr) => {
 					const raw = (err as NodeJS.ErrnoException & { code?: number | string } | null)?.code;
 					const code = err ? (typeof raw === "number" ? raw : 1) : 0;
 					done({ stdout: stdout ?? "", stderr: stderr ?? "", code });
@@ -119,6 +144,50 @@ export async function writeBackupRef(
 export async function listBackupRefs(git: GitRunner, prefix: string, cwd: string): Promise<string[]> {
 	const result = await git(["for-each-ref", "--format=%(refname)", prefix], { cwd });
 	return result.code === 0 ? trim(result).split("\n").filter(Boolean) : [];
+}
+
+export interface ChangeStats {
+	files: string[];
+	/** Sum of on-disk sizes. Deleted paths contribute nothing. */
+	totalBytes: number;
+}
+
+/**
+ * What `git add -A` would stage, and how big it is.
+ *
+ * Measured *before* staging so an oversized or suspicious change can be refused
+ * without having to unstage afterwards. Porcelain v1 lines are `XY path`, with
+ * renames written as `XY orig -> new`; only the destination matters here.
+ *
+ * `--untracked-files=all` is load-bearing: by default porcelain collapses an
+ * untracked directory into a single `?? dir/` entry, so a stray build directory
+ * of ten thousand files counts as one and walks straight past the size guard.
+ */
+export async function changeStats(git: GitRunner, cwd: string): Promise<ChangeStats> {
+	const result = await git(["status", "--porcelain", "--untracked-files=all"], { cwd });
+	if (result.code !== 0) return { files: [], totalBytes: 0 };
+
+	const files = result.stdout
+		.split("\n")
+		.filter((line) => line.length > 3)
+		.map((line) => {
+			const path = line.slice(3);
+			const renameArrow = path.indexOf(" -> ");
+			return renameArrow === -1 ? path : path.slice(renameArrow + 4);
+		})
+		// Porcelain quotes paths containing unusual characters; the quotes are
+		// not part of the name.
+		.map((path) => (path.startsWith('"') && path.endsWith('"') ? path.slice(1, -1) : path));
+
+	let totalBytes = 0;
+	for (const file of files) {
+		try {
+			totalBytes += statSync(resolve(cwd, file)).size;
+		} catch {
+			// Deleted, or a directory entry. Neither adds bytes to the commit.
+		}
+	}
+	return { files, totalBytes };
 }
 
 /** Paths left unmerged by a conflicting merge, for handing back to the agent. */

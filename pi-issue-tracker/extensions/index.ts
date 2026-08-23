@@ -16,6 +16,9 @@ import {
 	getMaxPriority,
 	getStoriesByStatus,
 	getStoryById,
+	getActiveEpicBranch,
+	getEpicBranch,
+	getEpicBranchesByState,
 	hasChildren,
 	openDb,
 	searchStories,
@@ -28,8 +31,23 @@ import type { Story } from "../src/types.ts";
 import { STORY_RESOLUTIONS } from "../src/types.ts";
 import { keywordStrategy } from "../src/related.ts";
 import { resolvePaths } from "../src/config.ts";
-import type { GitRunner, TrackerContext } from "../src/context.ts";
-import { probeRepo, type RepoInfo } from "../src/git.ts";
+import type { GitRunner, ShellRunner, TrackerContext } from "../src/context.ts";
+import { currentBranch, isDirty, probeRepo, revParse, type RepoInfo } from "../src/git.ts";
+import {
+	cancelEpic,
+	commitStory,
+	ensureDatabaseIgnored,
+	epicCwd,
+	findEpicForStory,
+	mergeIntoBase,
+	recordStoryStartCommit,
+	startEpic,
+	undoMerge,
+	undoStory,
+	updateFromBase,
+} from "../src/epic.ts";
+import { checkCanStartEpic, isBranchEscapingCommand } from "../src/rules.ts";
+import type { EpicBranch } from "../src/types.ts";
 
 // ─── State ──────────────────────────────────────────────────────────
 /**
@@ -40,6 +58,38 @@ import { probeRepo, type RepoInfo } from "../src/git.ts";
 let tracker: TrackerContext | null = null;
 /** Repository state as of session start. Null before the first probe. */
 let repo: RepoInfo | null = null;
+/** Set once at registration, so module-scope helpers can talk back to the agent. */
+let host: ExtensionAPI | null = null;
+
+/**
+ * Git work is serialized.
+ *
+ * Two transitions in flight at once — an agent tool call while the story board
+ * is open, say — would race on `.git/index.lock` and one would fail for no
+ * reason the user could act on.
+ */
+let gitQueue: Promise<unknown> = Promise.resolve();
+function serializeGit<T>(work: () => Promise<T>): Promise<T> {
+	const next = gitQueue.then(work, work);
+	gitQueue = next.then(
+		() => undefined,
+		() => undefined,
+	);
+	return next;
+}
+
+/**
+ * Notes produced by git side effects, waiting to be folded into whatever tool
+ * response or command output comes next. The transition itself is triggered
+ * from several places, so the note cannot simply be a return value.
+ */
+let gitNotes: string[] = [];
+function takeGitNotes(): string {
+	if (gitNotes.length === 0) return "";
+	const combined = `\n\n${gitNotes.join("\n")}`;
+	gitNotes = [];
+	return combined;
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────
 function ensureTracker(): TrackerContext {
@@ -55,6 +105,14 @@ function ensureDb() {
 function createExecGitRunner(pi: ExtensionAPI): GitRunner {
 	return async (args, opts) => {
 		const result = await pi.exec("git", args, { cwd: opts?.cwd, timeout: opts?.timeout });
+		return { stdout: result.stdout, stderr: result.stderr, code: result.code };
+	};
+}
+
+/** A `ShellRunner` over the host's exec. The manifest's commands need a shell. */
+function createExecShellRunner(pi: ExtensionAPI): ShellRunner {
+	return async (command, opts) => {
+		const result = await pi.exec("bash", ["-c", command], { cwd: opts?.cwd, timeout: opts?.timeout });
 		return { stdout: result.stdout, stderr: result.stderr, code: result.code };
 	};
 }
@@ -119,22 +177,86 @@ function refreshStatus(ctx: UiContext) {
 }
 
 /**
+ * Git side effects of a status change.
+ *
+ * Does nothing at all unless the story belongs to an epic that has been started
+ * with `/start-epic` — git integration is opt-in, and a tracker used without it
+ * behaves exactly as it did before.
+ */
+async function applyTransitionEffects(
+	ctx: TrackerContext,
+	before: Story | null,
+	after: Story,
+): Promise<void> {
+	const epic = findEpicForStory(ctx, after.id);
+	if (!epic) return;
+
+	const wasOpen = before ? isOpen(before) : true;
+	const isEpicItself = after.id === epic.epic_id;
+
+	// Starting work: remember where it began, so it can be undone later.
+	if (after.status === "in_progress" && before?.status !== "in_progress") {
+		await recordStoryStartCommit(ctx, after, epic);
+	}
+
+	// A unit of work closed: commit what it changed. Epics are containers and
+	// never carry a commit of their own.
+	if (wasOpen && !isOpen(after) && !isEpicItself && !hasChildren(ctx.db, after.id)) {
+		const committed = await commitStory(ctx, after, epic);
+		if (committed.note) gitNotes.push(committed.note);
+	}
+
+	// The epic itself closed. Bring the base branch in now, while the agent is
+	// still here to resolve conflicts; the merge into the base branch is a
+	// separate, user-confirmed step and never happens on the agent's say-so.
+	if (isEpicItself && wasOpen && !isOpen(after)) {
+		const updated = await updateFromBase(ctx, epic);
+		gitNotes.push(updated.note);
+		if (updated.ok) {
+			gitNotes.push(`Epic #${epic.epic_id} is ready to merge — run /merge-epic ${epic.epic_id}.`);
+		} else if (updated.conflicts.length > 0) {
+			void host?.sendUserMessage(
+				`Merging ${epic.base_branch} into ${epic.branch} left conflicts in:\n` +
+					updated.conflicts.map((file) => `  - ${file}`).join("\n") +
+					`\n\nResolve them, commit, then run /merge-epic ${epic.epic_id}.`,
+				{ deliverAs: "followUp" },
+			);
+		}
+	}
+}
+
+/**
  * The single write path for a story's status.
  *
  * Status used to be written from three unrelated places — the `mark_in_progress`
  * action, the ungated `update` action, and the board's key handler — so anything
  * that had to happen on a transition would have had to be repeated three times
  * and would still have been missed by the next new caller. Git side effects hang
- * off this function; nothing else may change `status`.
+ * off this function.
+ *
+ * Two callers deliberately bypass it — `simplify` and `/plan-stories` — because
+ * both write status inside a SQLite transaction, which cannot stay open across a
+ * git subprocess. Both are bookkeeping rather than work starting or finishing,
+ * so neither has a git effect to miss. Each says so at the call site.
  */
-function transitionStatus(
+async function transitionStatus(
 	storyId: number,
 	updates: Partial<Omit<Story, "id" | "created_at" | "updated_at">>,
 	uiCtx?: UiContext,
-): Story | null {
-	const updated = updateStory(ensureDb(), storyId, updates);
-	if (updated && uiCtx) refreshStatus(uiCtx);
-	return updated;
+): Promise<Story | null> {
+	const ctx = ensureTracker();
+	const before = getStoryById(ctx.db, storyId);
+	const after = updateStory(ctx.db, storyId, updates);
+	if (!after) return null;
+	if (uiCtx) refreshStatus(uiCtx);
+
+	try {
+		await serializeGit(() => applyTransitionEffects(ctx, before, after));
+	} catch (error) {
+		// A git failure must not lose the status change that already succeeded.
+		gitNotes.push(`git side effect failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	return after;
 }
 
 // ─── Usage accounting ───────────────────────────────────────────────
@@ -261,7 +383,7 @@ function repairStoryGraph(items: PlanItem[]): { items: PlanItem[]; warnings: str
  * Mirrors the existing next_id auto-promote: finishing work should move the
  * board without a second round-trip.
  */
-function closeCompletedParents(db: DatabaseSync, fromStoryId: number): Story[] {
+async function closeCompletedParents(db: DatabaseSync, fromStoryId: number): Promise<Story[]> {
 	const closed: Story[] = [];
 	const seen = new Set<number>();
 	let cursor = getStoryById(db, fromStoryId)?.parent_id ?? null;
@@ -273,7 +395,7 @@ function closeCompletedParents(db: DatabaseSync, fromStoryId: number): Story[] {
 		const children = getChildren(db, epic.id);
 		if (children.length === 0 || children.some(isOpen)) break;
 
-		const updated = transitionStatus(epic.id, {
+		const updated = await transitionStatus(epic.id, {
 			status: "done",
 			resolution: "completed",
 			resolution_note: `All ${children.length} child stories closed.`,
@@ -355,6 +477,8 @@ const StoryParams = Type.Object({
 
 // ─── Extension ──────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
+	host = pi;
+
 	// ── Session lifecycle ────────────────────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
 		// SessionStartEvent carries no cwd — the session's cwd is on the context.
@@ -373,12 +497,18 @@ export default function (pi: ExtensionAPI) {
 			paths,
 			db: openDb(paths.dbPath),
 			git,
+			shell: createExecShellRunner(pi),
 			related: keywordStrategy,
 			now: () => Date.now(),
 			notify: (message, level) => {
 				if (ctx.hasUI) ctx.ui.notify(message, level);
 			},
 		};
+
+		// The extension creates stories.db, so it takes responsibility for keeping
+		// it out of the user's `git status` — whether or not an epic is ever
+		// started. Idempotent, so running it every session costs one check-ignore.
+		if (repo.isRepo) await ensureDatabaseIgnored(tracker);
 
 		// session_start cannot be cancelled, so an unusable repo is reported
 		// rather than enforced here; /start-epic is the gate.
@@ -502,6 +632,14 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		const activeEpic = getActiveEpicBranch(db);
+		if (activeEpic) {
+			lines.push(`\n>>> EPIC BRANCH`);
+			lines.push(`Working on ${activeEpic.branch} (started from ${activeEpic.base_branch}).`);
+			lines.push(`Every story you close is committed automatically — do not commit by hand.`);
+			lines.push(`Do not switch branches, reset --hard, or delete branches; that would strand the epic.`);
+		}
+
 		return {
 			message: {
 				customType: "story-context",
@@ -569,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 						return { content: [{ type: "text", text: `Error: parenting #${params.story_id} to #${params.parent_story_id} would create a cycle` }], details: { action, error: "cycle" } };
 					}
 				}
-				const story = transitionStatus(params.story_id, {
+				const story = await transitionStatus(params.story_id, {
 					title: params.title,
 					sub_goal: params.sub_goal,
 					proposed_changes: params.proposed_changes,
@@ -586,7 +724,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				refreshStatus(ctx);
 				return {
-					content: [{ type: "text", text: `Updated story #${story.id}:\n${storyToText(story, false)}` }],
+					content: [{ type: "text", text: `Updated story #${story.id}:\n${storyToText(story, false)}${takeGitNotes()}` }],
 					details: { action, story },
 				};
 			}
@@ -640,13 +778,13 @@ export default function (pi: ExtensionAPI) {
 						details: { action, error: "unmet dependencies", unmet },
 					};
 				}
-				const updated = transitionStatus(params.story_id, { status: "in_progress" });
+				const updated = await transitionStatus(params.story_id, { status: "in_progress" });
 				if (!updated) {
 					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
 				}
 				refreshStatus(ctx);
 				return {
-					content: [{ type: "text", text: `✓ Story #${updated.id} is now IN PROGRESS\n${storyToText(updated, false)}` }],
+					content: [{ type: "text", text: `✓ Story #${updated.id} is now IN PROGRESS\n${storyToText(updated, false)}${takeGitNotes()}` }],
 					details: { action, story: updated },
 				};
 			}
@@ -724,7 +862,7 @@ export default function (pi: ExtensionAPI) {
 						details: { action, error: "open children", open: openKids.map((s) => s.id) },
 					};
 				}
-				const updated = transitionStatus(params.story_id, {
+				const updated = await transitionStatus(params.story_id, {
 					status: "done",
 					resolution: params.resolution,
 					resolution_note: params.resolution_note,
@@ -742,7 +880,7 @@ export default function (pi: ExtensionAPI) {
 					if (next && next.status !== "done" && next.status !== "cancelled") {
 						const nextUnmet = next.depends_on.filter((id) => getStoryById(db, id)?.status !== "done");
 						if (nextUnmet.length === 0 && next.status !== "in_progress") {
-							transitionStatus(next.id, { status: "ready" });
+							await transitionStatus(next.id, { status: "ready" });
 							nextMsg = `\n\n>>> NEXT UP: Story #${next.id} is now READY.\nTitle: ${next.title}\nSub-goal: ${next.sub_goal}\nProposed changes: ${next.proposed_changes}`;
 						} else if (nextUnmet.length > 0) {
 							nextMsg = `\n\nNext story #${next.id} (${next.title}) is still waiting on dependencies: ${nextUnmet.map((id) => `#${id}`).join(", ")}`;
@@ -751,14 +889,14 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Close any ancestor epic this completed
-				const closedParents = closeCompletedParents(db, updated.id);
+				const closedParents = await closeCompletedParents(db, updated.id);
 				const epicMsg = closedParents.length
 					? `\n\n>>> EPIC COMPLETE: ${closedParents.map((s) => `#${s.id} ${s.title}`).join(", ")}`
 					: "";
 
 				refreshStatus(ctx);
 				return {
-					content: [{ type: "text", text: `✓ Story #${updated.id} marked as DONE (${updated.resolution}).${epicMsg}${nextMsg}` }],
+					content: [{ type: "text", text: `✓ Story #${updated.id} marked as DONE (${updated.resolution}).${epicMsg}${nextMsg}${takeGitNotes()}` }],
 					details: { action, story: updated, nextMessage: nextMsg, closedEpics: closedParents },
 				};
 			}
@@ -858,7 +996,12 @@ export default function (pi: ExtensionAPI) {
 								updateStory(db, child.id, { parent_id: created.id });
 							}
 						}
-						transitionStatus(s.id, {
+						// Deliberately not transitionStatus: this runs inside a SQLite
+						// transaction, which cannot hold open across a git subprocess.
+						// It is also bookkeeping rather than work finishing — these
+						// stories never had a commit, so archiving them must not
+						// produce one out of whatever happens to be in the tree.
+						updateStory(db, s.id, {
 							status: "archived",
 							resolution: "superseded",
 							resolution_note: `Merged into #${created.id}`,
@@ -967,9 +1110,12 @@ export default function (pi: ExtensionAPI) {
 				function setStatus(index: number, updates: Partial<Story>) {
 					const row = rows[index];
 					if (!row) return;
-					const updated = transitionStatus(row.story.id, updates);
-					if (updated) rows[index] = { ...row, story: updated };
-					refresh();
+					// Key handlers are synchronous, but a transition now performs git
+					// work. Refresh when it lands rather than blocking the board.
+					void transitionStatus(row.story.id, updates).then((updated) => {
+						if (updated) rows[index] = { ...row, story: updated };
+						refresh();
+					});
 				}
 
 				function handleInput(data: string) {
@@ -1293,7 +1439,10 @@ export default function (pi: ExtensionAPI) {
 				// `draft` and the context injection reports NO ACTIVE WORK.
 				const firstReady = ids.find((id) => (getStoryById(db, id)?.depends_on.length ?? 0) === 0);
 				if (firstReady !== undefined) {
-					transitionStatus(firstReady, { status: "ready" });
+					// Plain updateStory for the same two reasons as `simplify` above:
+					// this is inside a transaction, and `ready` has no git effect —
+					// work starts at `in_progress`, which is where a commit is anchored.
+					updateStory(db, firstReady, { status: "ready" });
 				}
 
 				setAppState(db, "top_level_story_id", String(root.id));
@@ -1385,5 +1534,228 @@ export default function (pi: ExtensionAPI) {
 			writeFileSync(outPath, lines.join("\n"), "utf-8");
 			ctx.ui.notify(`Exported ${all.length} stories to ${outPath}`, "info");
 		},
+	});
+
+	// ── Git: epic lifecycle ─────────────────────────────────────────
+	// Starting and merging an epic are user actions, never the agent's. Merging
+	// rewrites the branch the user is sitting on, and pi can only relocate a
+	// session from a command handler, so both live here rather than in the tool.
+
+	/** Resolve an epic from an explicit id, or fall back to the active one. */
+	function resolveEpic(args: string): { epic?: EpicBranch; error?: string } {
+		const db = ensureDb();
+		const raw = args.trim().split(/\s+/)[0] ?? "";
+		if (raw) {
+			const id = Number(raw);
+			if (!Number.isInteger(id)) return { error: `"${raw}" is not a story id` };
+			const epic = getEpicBranch(db, id);
+			return epic ? { epic } : { error: `epic #${id} has no branch — start it with /start-epic ${id}` };
+		}
+		const active = getActiveEpicBranch(db);
+		return active ? { epic: active } : { error: "no epic is active — pass an id, or start one with /start-epic" };
+	}
+
+	pi.registerCommand("start-epic", {
+		description: "Start an epic on its own branch (usage: /start-epic <story_id>)",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const tracked = ensureTracker();
+			const db = tracked.db;
+
+			if (args.includes("--worktree")) {
+				return void ctx.ui.notify("Worktree mode is not implemented yet — /start-epic works on a branch in place.", "warning");
+			}
+
+			const id = Number(args.trim().split(/\s+/)[0]);
+			if (!Number.isInteger(id)) return void ctx.ui.notify("Usage: /start-epic <story_id>", "error");
+
+			const story = getStoryById(db, id);
+			const branch = await currentBranch(tracked.git, tracked.paths.repoRoot);
+			const dirty = await isDirty(tracked.git, tracked.paths.repoRoot);
+			const active = getActiveEpicBranch(db);
+
+			const input = {
+				isRepo: repo?.isRepo ?? false,
+				branch,
+				dirty,
+				story,
+				childCount: story ? getChildren(db, story.id).length : 0,
+				activeEpicId: active?.epic_id ?? null,
+			};
+
+			let carryDirty = false;
+			let check = checkCanStartEpic(input);
+			if (!check.ok && dirty && checkCanStartEpic({ ...input, carryDirty: true }).ok) {
+				// Refusing outright over a dirty tree is what makes people work
+				// around the tool, so offer to bring the changes along instead.
+				const choice = ctx.hasUI
+					? await ctx.ui.select("You have uncommitted changes. Carry them onto the epic branch?", [
+							"Yes, commit them as the epic's first commit",
+							"No, let me handle them first",
+						])
+					: undefined;
+				if (!choice?.startsWith("Yes")) {
+					return void ctx.ui.notify("Commit or stash your changes, then run /start-epic again.", "warning");
+				}
+				carryDirty = true;
+				check = checkCanStartEpic({ ...input, carryDirty: true });
+			}
+			if (!check.ok) return void ctx.ui.notify(`Cannot start epic: ${check.reason}`, "error");
+
+			const started = await serializeGit(() => startEpic(tracked, { story: story!, carryDirty }));
+			if (!started.ok || !started.epic) return void ctx.ui.notify(started.note, "error");
+
+			await transitionStatus(story!.id, { status: "in_progress" }, ctx);
+			ctx.ui.notify(started.note, "info");
+		},
+	});
+
+	pi.registerCommand("merge-epic", {
+		description: "Merge a finished epic into its base branch (usage: /merge-epic [story_id])",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const tracked = ensureTracker();
+			const { epic, error } = resolveEpic(args);
+			if (!epic) return void ctx.ui.notify(error!, "error");
+			if (epic.state !== "active") return void ctx.ui.notify(`Epic #${epic.epic_id} is already ${epic.state}.`, "warning");
+
+			// Re-run step 1 in case the base branch moved since the epic closed;
+			// step 2 is fast-forward-only and would otherwise refuse.
+			const updated = await serializeGit(() => updateFromBase(tracked, epic));
+			if (!updated.ok) return void ctx.ui.notify(updated.note, "error");
+
+			// Merging rewrites the branch the user is on, so it is always confirmed.
+			if (ctx.hasUI) {
+				const choice = await ctx.ui.select(`Merge ${epic.branch} into ${epic.base_branch}?`, [
+					`Yes, fast-forward ${epic.base_branch}`,
+					"No, leave the branch for me",
+				]);
+				if (!choice?.startsWith("Yes")) return void ctx.ui.notify("Left the epic branch as it is.", "info");
+			} else {
+				return void ctx.ui.notify(
+					`Epic #${epic.epic_id} is ready, but merging needs confirmation. Run /merge-epic interactively.`,
+					"warning",
+				);
+			}
+
+			const merged = await serializeGit(() => mergeIntoBase(tracked, epic));
+			ctx.ui.notify(merged.note, merged.ok ? "info" : "error");
+		},
+	});
+
+	pi.registerCommand("cancel-epic", {
+		description: "Stop an epic without merging; its branch is kept (usage: /cancel-epic [story_id])",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const tracked = ensureTracker();
+			const { epic, error } = resolveEpic(args);
+			if (!epic) return void ctx.ui.notify(error!, "error");
+
+			const result = await serializeGit(() => cancelEpic(tracked, epic));
+			ctx.ui.notify(result.note, result.ok ? "info" : "error");
+		},
+	});
+
+	pi.registerCommand("undo-story", {
+		description: "Reverse one story's commit (usage: /undo-story <story_id>)",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const tracked = ensureTracker();
+			const id = Number(args.trim().split(/\s+/)[0]);
+			if (!Number.isInteger(id)) return void ctx.ui.notify("Usage: /undo-story <story_id>", "error");
+
+			const epic = findEpicForStory(tracked, id);
+			if (!epic) return void ctx.ui.notify(`Story #${id} is not part of an active epic.`, "error");
+
+			const result = await serializeGit(() => undoStory(tracked, id, epic));
+			ctx.ui.notify(result.note, result.ok ? "info" : "error");
+		},
+	});
+
+	pi.registerCommand("undo-merge", {
+		description: "Put the base branch back where it was before /merge-epic (usage: /undo-merge [story_id])",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const tracked = ensureTracker();
+			const raw = args.trim().split(/\s+/)[0] ?? "";
+			const db = tracked.db;
+			// Unlike the others this defaults to the most recently merged epic,
+			// because by definition no epic is active once its merge has landed.
+			const epic = raw
+				? getEpicBranch(db, Number(raw))
+				: getEpicBranchesByState(db, "merged").slice(-1)[0] ?? null;
+			if (!epic) return void ctx.ui.notify("No merged epic to undo — pass a story id.", "error");
+
+			const result = await serializeGit(() => undoMerge(tracked, epic));
+			ctx.ui.notify(result.note, result.ok ? "info" : "error");
+		},
+	});
+
+	pi.registerCommand("undo-turn", {
+		description: "Restore the working tree to the last turn's checkpoint",
+		handler: async (_args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const tracked = ensureTracker();
+			const epic = getActiveEpicBranch(tracked.db);
+			if (!epic) return void ctx.ui.notify("No epic is active, so no checkpoints are being taken.", "warning");
+
+			const result = await serializeGit(async () => {
+				const cwd = epicCwd(tracked, epic);
+				// Names are millisecond timestamps, so they are fixed width and
+				// sort newest-first by name alone.
+				const refs = await tracked.git(
+					["for-each-ref", "--sort=-refname", "--format=%(objectname)", `refs/pi/checkpoint/${epic.epic_id}`],
+					{ cwd },
+				);
+				const newest = refs.stdout.trim().split("\n").filter(Boolean)[0];
+				if (!newest) return { ok: false, note: "No checkpoint recorded yet." };
+				const applied = await tracked.git(["stash", "apply", newest], { cwd });
+				return applied.code === 0
+					? { ok: true, note: `Restored the working tree from checkpoint ${newest.slice(0, 8)}.` }
+					: { ok: false, note: `Could not apply the checkpoint: ${applied.stderr.trim()}` };
+			});
+			ctx.ui.notify(result.note, result.ok ? "info" : "error");
+		},
+	});
+
+	// ── Per-turn checkpoints ────────────────────────────────────────
+	// `stash create` builds a commit object without touching the working tree or
+	// the index, so a checkpoint costs nothing and interrupts nothing. It would
+	// be a dangling commit, so a ref is written to keep it from being collected.
+	pi.on("turn_end", async () => {
+		const tracked = tracker;
+		if (!tracked) return;
+		const epic = getActiveEpicBranch(tracked.db);
+		if (!epic) return;
+
+		await serializeGit(async () => {
+			const cwd = epicCwd(tracked, epic);
+			const created = await tracked.git(["stash", "create"], { cwd });
+			const sha = created.stdout.trim();
+			if (created.code !== 0 || !sha) return; // clean tree — nothing to checkpoint
+			await tracked.git(["update-ref", `refs/pi/checkpoint/${epic.epic_id}/${tracked.now()}`, sha], { cwd });
+		});
+	});
+
+	// ── Branch guard ────────────────────────────────────────────────
+	// The agent cannot be stopped from leaving the epic branch, but the handful
+	// of commands that actually strand an epic are cheap to intercept.
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "bash") return;
+		const tracked = tracker;
+		if (!tracked) return;
+		const epic = getActiveEpicBranch(tracked.db);
+		if (!epic) return;
+
+		const command = (event.input as { command?: unknown } | undefined)?.command;
+		if (typeof command !== "string" || !isBranchEscapingCommand(command)) return;
+
+		return {
+			block: true,
+			reason:
+				`Epic #${epic.epic_id} is active on ${epic.branch}. Switching branches, hard-resetting or ` +
+				`deleting branches would strand its work. Use /merge-epic, /cancel-epic, /undo-story or ` +
+				`/undo-turn instead.`,
+		};
 	});
 }

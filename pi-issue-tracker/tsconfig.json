@@ -5,11 +5,41 @@
 		"module": "nodenext",
 		"moduleResolution": "nodenext",
 		"types": ["node"],
+		// Node's own types come from the same pinned scope, and at the major
+		// version this code actually runs on. Left to the default lookup they come
+		// from whatever @types/node the installed pi happens to bundle — 22.x
+		// today — so the compiler would be checking node 24 source against node 22
+		// declarations, and only inside the container, where that symlink resolves.
+		"typeRoots": ["./tools/typecheck/node_modules/@types"],
 		"strict": true,
 		"noEmit": true,
 		"allowImportingTsExtensions": true,
+		"forceConsistentCasingInFileNames": true,
+		// Skipping .d.ts checking keeps the compiler off pi's own declarations and
+		// the provider SDKs underneath them; this project's job is to type-check
+		// its own source against those declarations, not to audit them.
 		"skipLibCheck": true,
-		"forceConsistentCasingInFileNames": true
+		// Where pi's declarations come from. They are not in this package's
+		// node_modules because this package has no install step — see
+		// tools/typecheck/package.json for why they live off to one side. Only the
+		// compiler resolves through these; at runtime pi supplies its own modules
+		// to the extension, which is why the container suite can stage the package
+		// with no node_modules at all and still load it.
+		//
+		// Each entry points at a declaration *file*, not at the package directory.
+		// This package is `"type": "module"`, so nodenext resolves in ESM mode,
+		// where a directory does not resolve through package.json at all — mapping
+		// to the directory silently leaves every pi type as `any`, which type-checks
+		// clean and proves nothing. The paths mirror each package's own `types`
+		// field, and the versions that define that layout are pinned alongside them.
+		"paths": {
+			"@earendil-works/pi-ai": ["./tools/typecheck/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
+			"@earendil-works/pi-coding-agent": [
+				"./tools/typecheck/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+			],
+			"@earendil-works/pi-tui": ["./tools/typecheck/node_modules/@earendil-works/pi-tui/dist/index.d.ts"],
+			"typebox": ["./tools/typecheck/node_modules/typebox/build/index.d.mts"]
+		}
 	},
 	"include": ["src/**/*.ts", "extensions/**/*.ts", "test/**/*.ts"]
 }

@@ -32,6 +32,18 @@ export interface GitRunner {
 	(args: string[], opts?: GitOptions): Promise<GitResult>;
 }
 
+/**
+ * Runs a shell command string — the setup and verify commands declared in
+ * `.pi/epic.json`, which are authored by the user and need a shell.
+ *
+ * Same contract as `GitRunner`: resolves with a non-zero `code` rather than
+ * throwing. `env` is merged over the ambient environment, which is how the
+ * manifest's `caches` entries get pointed at a shared directory.
+ */
+export interface ShellRunner {
+	(command: string, opts?: GitOptions & { env?: Record<string, string> }): Promise<GitResult>;
+}
+
 export interface TrackerPaths {
 	/** Main repository working tree — git operations default here. */
 	repoRoot: string;
@@ -49,6 +61,7 @@ export interface TrackerContext {
 	paths: TrackerPaths;
 	db: DatabaseSync;
 	git: GitRunner;
+	shell: ShellRunner;
 	/** How "related stories" and "lessons" are chosen. Swappable for embeddings. */
 	related: RelatedStoriesStrategy;
 	/** Injectable so tests get deterministic timestamps. */

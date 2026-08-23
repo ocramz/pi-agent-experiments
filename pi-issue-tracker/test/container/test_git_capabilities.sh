@@ -8,9 +8,12 @@
 # Much cheaper to learn on day one than after the feature is written.
 #
 # Note for edits: userland is busybox — no `grep -P`, no GNU-only find predicates.
+# The snippet below is passed through `bash -c`, so anything the outer shell would
+# choke on has to be quoted — an unquoted `%(refname)` aborts the whole probe and
+# takes every assertion after it down with it.
 source "$(dirname "$0")/lib.sh"
 
-out="$(RUN_FLAGS="--network=none" in_image '
+out="$(in_image '
 	export GIT_CONFIG_GLOBAL=/tmp/gitconfig GIT_CONFIG_SYSTEM=/dev/null HOME=/tmp
 	git config --global user.email t@example.invalid
 	git config --global user.name Test
@@ -37,7 +40,7 @@ out="$(RUN_FLAGS="--network=none" in_image '
 
 	# Backup refs — the rule that nothing becomes unreachable.
 	git update-ref refs/pi/backup/1/pre-merge HEAD && echo "UPDATE_REF=ok"
-	echo "FOR_EACH_REF=$(git for-each-ref --format=%(refname) refs/pi/backup)"
+	echo "FOR_EACH_REF=$(git for-each-ref --format="%(refname)" refs/pi/backup)"
 
 	# Worktree mode.
 	git worktree add -q -b epic/1-x /tmp/wt feat/test 2>/dev/null && echo "WORKTREE_ADD=ok"

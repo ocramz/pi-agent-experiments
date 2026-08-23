@@ -1,0 +1,227 @@
+// Drive a real pi TUI session from a test, and read what it printed.
+//
+// ── Why there is a pty in here ───────────────────────────────────────
+// cli-testing-library spawns with child_process.spawn and pipes; it allocates no
+// pty. pi picks its mode with `parsed.print || !stdinIsTTY || !stdoutIsTTY →
+// "print"`, and print mode never parses a slash command. So driving pi through
+// the library directly cannot reach a single one of the commands under test.
+//
+// `script(1)` closes the gap: it allocates a pty, runs pi inside it, and copies
+// the master end to and from its own stdin and stdout — which are the pipes the
+// library holds. pi sees a terminal; the library sees a stream.
+//
+// The pty `script` builds this way has no window size, so `process.stdout.columns`
+// is 0 inside pi. pi-tui falls back to `Number(process.env.COLUMNS) || 80`, so
+// COLUMNS and LINES below are what actually set the render width. They are wide
+// on purpose: the story board truncates its rows to the terminal width, and a
+// truncated row is a failed assertion about text that was really there.
+//
+// ── Why `screen()` does not use findByText ──────────────────────────
+// The library's queries join the captured stdout chunks with "\n" before
+// matching. A chunk boundary can land mid-word, so a phrase that pi printed in
+// one piece can become unmatchable. `screen()` joins with "" instead and then
+// normalises, which is the same idea without the seam. `waitFor` — the library's
+// polling primitive, re-driven by its stdout observer — does the waiting.
+
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import type { TestContext } from "node:test";
+import { cleanup, configure, render, waitFor } from "cli-testing-library";
+import type { RenderResult } from "cli-testing-library";
+import stripAnsi from "strip-ansi";
+import { buildFixture, type Facts, type Shape } from "./fixtures.ts";
+import { inspector, type Inspector } from "./inspect.ts";
+
+const EXTENSION = resolve(import.meta.dirname, "..", "..", "extensions", "index.ts");
+const PI_BIN = process.env.PI_BIN ?? "pi";
+
+// Shared across the whole run, and across runs on the same machine. pi
+// downloads `fd` into this directory the first time it starts; a per-test
+// directory would pay for that download in every single case. Setting it also
+// suppresses pi's first-time-setup wizard, which would otherwise sit waiting for
+// a theme choice that nobody is there to make.
+const AGENT_DIR = process.env.PI_TUI_AGENT_DIR ?? join(tmpdir(), "pi-tui-agent");
+
+// Long enough for a git merge or a conflict report, nowhere near long enough to
+// hide a hang. Live cases raise it per call.
+configure({ asyncUtilTimeout: 30_000 });
+
+/** pi's footer hint. Present once the TUI has painted and is taking input. */
+const READY = "ctrl+o more";
+
+export interface Session extends Inspector {
+	facts: Facts;
+	dir: string;
+	/** Everything pi has printed since the last `clear()`, ANSI stripped. */
+	screen(): string;
+	/** The same, but with whitespace intact — for assertions about layout. */
+	rawScreen(): string;
+	/** Type a slash command and submit it. */
+	command(text: string): Promise<void>;
+	/** Send raw keys — "[ArrowDown]", "[Enter]", "[Escape]", "r", "d". */
+	press(keys: string, options?: { settle?: number }): Promise<void>;
+	/** Answer a `ctx.ui.select` prompt by option index; 0 is the default. */
+	choose(index: number): Promise<void>;
+	/** Wait until pi has printed `text`. Fails the test if it never does. */
+	expect(text: string, options?: { timeout?: number }): Promise<void>;
+	/** Assert pi has *not* printed `text` (checked immediately, no waiting). */
+	refute(text: string): void;
+	/** Exit pi and wait for the process to go. Assert state only after this. */
+	close(): Promise<void>;
+}
+
+const normalise = (text: string): string => stripAnsi(text).replace(/\s+/g, " ").trim();
+
+/**
+ * Build a fixture, start pi in it, and wait until it is taking input.
+ *
+ * Cleanup is registered on the test context, so a failing case cannot leak a pi
+ * process or a temp directory. Set PI_TUI_KEEP=1 to keep the fixture for
+ * post-mortem — the path is printed when a case fails.
+ */
+export async function session(
+	t: TestContext,
+	shape: Shape,
+	opts: { live?: boolean; prepare?: (dir: string) => void } = {},
+): Promise<Session> {
+	mkdirSync(AGENT_DIR, { recursive: true });
+	const root = mkdtempSync(join(tmpdir(), "pi-tui-"));
+	const dir = join(root, "fx");
+	const facts = await buildFixture(shape, dir);
+	opts.prepare?.(dir);
+
+	const env: NodeJS.ProcessEnv = {
+		...process.env,
+		COLUMNS: "200",
+		LINES: "50",
+		TERM: "xterm-256color",
+		GIT_CONFIG_GLOBAL: join(dir, ".gitconfig"),
+		GIT_CONFIG_SYSTEM: "/dev/null",
+		PI_CODING_AGENT_DIR: AGENT_DIR,
+	};
+
+	const flags = ["--tui-mode regular", "--approve", `-e ${EXTENSION}`];
+	if (opts.live) {
+		flags.push(`--provider ${process.env.PI_PROVIDER ?? "openrouter"}`);
+		flags.push(`--model ${process.env.PI_MODEL ?? "deepseek/deepseek-v4-flash"}`);
+	}
+	// `-q` no banner, `-f` flush every write so assertions see output as it
+	// happens, `-e` return pi's own exit status rather than script's.
+	const pi = await render("script", ["-q", "-f", "-e", "-c", `${PI_BIN} ${flags.join(" ")}`, "/dev/null"], {
+		cwd: dir,
+		spawnOpts: { env },
+	});
+
+	let closed = false;
+	const captured = (): string => pi.stdoutArr.map((chunk) => String(chunk.contents)).join("");
+	const screen = (): string => normalise(captured());
+	const rawScreen = (): string => stripAnsi(captured());
+
+	const expect = async (text: string, options: { timeout?: number } = {}): Promise<void> => {
+		const needle = normalise(text);
+		try {
+			await waitFor(
+				() => {
+					if (!screen().includes(needle)) throw new Error("not yet");
+				},
+				{ instance: pi, timeout: options.timeout },
+			);
+		} catch {
+			assert.fail(`pi never printed ${JSON.stringify(text)}\n\nlast output:\n${screen().slice(-2000)}`);
+		}
+	};
+
+	const settle = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+
+	const s: Session = {
+		...inspector(dir),
+		facts,
+		dir,
+		screen,
+		rawScreen,
+		expect,
+		refute(text) {
+			const needle = normalise(text);
+			assert.ok(
+				!screen().includes(needle),
+				`pi printed ${JSON.stringify(text)} and should not have\n\nlast output:\n${screen().slice(-2000)}`,
+			);
+		},
+		async command(text) {
+			pi.clear();
+			await pi.userEvent.keyboard(text, { delay: 5 });
+			// The slash autocomplete opens as the name is typed and closes again on
+			// the first space. Either way the highlighted entry is the command just
+			// spelled out in full, so Enter submits what was typed — but only once
+			// the popup has caught up with the keystrokes.
+			await settle(400);
+			await pi.userEvent.keyboard("[Enter]");
+			await settle(300);
+		},
+		async press(keys, options = {}) {
+			pi.clear();
+			await pi.userEvent.keyboard(keys, { delay: 30 });
+			await settle(options.settle ?? 700);
+		},
+		async choose(index) {
+			for (let i = 0; i < index; i++) await pi.userEvent.keyboard("[ArrowDown]", { delay: 30 });
+			await settle(200);
+			pi.clear();
+			await pi.userEvent.keyboard("[Enter]");
+			await settle(500);
+		},
+		async close() {
+			if (closed) return;
+			closed = true;
+			// ctrl+d is "clear or exit": it exits only on an empty input line, so a
+			// case that left text in the box gets a second press after the clear.
+			await pi.userEvent.keyboard("\x04");
+			if (!(await exited(pi, 8_000))) {
+				await pi.userEvent.keyboard("\x04");
+				assert.ok(await exited(pi, 8_000), `pi did not exit\n\nlast output:\n${screen().slice(-2000)}`);
+			}
+		},
+	};
+
+	t.after(async () => {
+		// A failing case never reaches close(), so teardown has to be able to kill
+		// pi on its own — and cannot lean on the library's cleanup() to do it.
+		// That path goes through tree-kill, which enumerates children by shelling
+		// out to `ps`; the debian-slim dev image has no procps, so the kill fails,
+		// the pty stays open, and node --test hangs on a still-live child rather
+		// than reporting the failure. Killing `script` directly drops the pty
+		// master, and pi exits on the hangup.
+		if (!pi.hasExit() && pi.process.pid) {
+			try {
+				process.kill(pi.process.pid, "SIGKILL");
+			} catch {
+				// Already gone between the check and the signal.
+			}
+			await exited(pi, 5_000);
+		}
+		await cleanup().catch(() => {});
+		if (process.env.PI_TUI_KEEP) console.log(`fixture kept: ${dir}`);
+		else rmSync(root, { recursive: true, force: true });
+	});
+
+	await expect(READY, { timeout: 60_000 });
+	await settle(500);
+	pi.clear();
+	return s;
+}
+
+async function exited(pi: RenderResult, timeout: number): Promise<boolean> {
+	try {
+		await waitFor(
+			() => {
+				if (!pi.hasExit()) throw new Error("still running");
+			},
+			{ instance: pi, timeout },
+		);
+		return true;
+	} catch {
+		return false;
+	}
+}

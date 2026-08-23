@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { resolvePaths } from "../../src/config.ts";
-import type { GitResult, GitRunner, TrackerContext } from "../../src/context.ts";
+import type { GitResult, GitRunner, ShellRunner, TrackerContext } from "../../src/context.ts";
 import { openDb } from "../../src/database.ts";
-import { createLocalGitRunner } from "../../src/git.ts";
+import { createLocalGitRunner, createLocalShellRunner } from "../../src/git.ts";
 import { keywordStrategy } from "../../src/related.ts";
 
 /**
@@ -19,6 +19,7 @@ import { keywordStrategy } from "../../src/related.ts";
 export interface TempRepo {
 	dir: string;
 	git: GitRunner;
+	shell: ShellRunner;
 	db: DatabaseSync;
 	ctx: TrackerContext;
 	/** Commit everything currently in the tree. Returns the new sha. */
@@ -45,6 +46,7 @@ export async function createTempRepo(
 		GIT_COMMITTER_EMAIL: "test@example.invalid",
 	};
 	const git = createLocalGitRunner({ cwd: dir, env });
+	const shell = createLocalShellRunner({ cwd: dir, env });
 
 	const must = async (args: string[]): Promise<GitResult> => {
 		const result = await git(args);
@@ -68,11 +70,13 @@ export async function createTempRepo(
 	return {
 		dir,
 		git,
+		shell,
 		db,
 		ctx: {
 			paths,
 			db,
 			git,
+			shell,
 			related: keywordStrategy,
 			now: () => 1_700_000_000_000,
 			notify: () => {},

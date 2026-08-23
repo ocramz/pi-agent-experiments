@@ -7,7 +7,7 @@ on:
 
 jobs:
   unit:
-    name: unit (host)
+    name: unit + types (host)
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -19,11 +19,54 @@ jobs:
           # Node 24 strips TypeScript types natively, so there is no build step
           # and no test-framework dependency to install.
           node-version: "24"
+          # Only the type-check installs anything, and what it installs is large.
+          cache: npm
+          cache-dependency-path: pi-issue-tracker/tools/typecheck/package-lock.json
       - run: npm test
+      # Type-checks the extension against pi's real declarations, which the
+      # script installs into tools/typecheck. Without them the pi types degrade
+      # to `any` and the check passes without proving anything — see the note in
+      # tsconfig.json.
+      - run: npm run typecheck
+
+  tui:
+    name: interactive (pty)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pi-issue-tracker
+    env:
+      PI_PROVIDER: openrouter
+      # Kept in step with the Makefile default; see the comment there.
+      PI_MODEL: deepseek/deepseek-v4-flash
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # Three of the 38 cases drive a real model, and a pull request from a fork
+      # gets no secrets. Opting out explicitly beats letting the suite fail on a
+      # missing key — and beats a silent skip, which is why test/tui/live.test.ts
+      # refuses to run without either the key or this flag.
+      PI_TUI_SKIP_LIVE: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '0' || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: pi-issue-tracker/test/tui/package-lock.json
+      # pi itself is under test here, so the version is pinned: a release that
+      # changed the TUI would otherwise turn into a mystery failure. Keep it in
+      # step with the version tsconfig type-checks against.
+      - run: npm i -g @earendil-works/pi-coding-agent@0.84.2
+      # ubuntu-24.04 already carries util-linux, so `script` — the pty the suite
+      # runs pi in — needs no install step here.
+      - run: npm run test:tui
 
   container:
     name: container (image userland)
     runs-on: ubuntu-24.04
+    # test_extension_live.sh calls a model API with the repository's key, and a
+    # pull request from a fork gets no secrets — the suite would exit 78 there
+    # rather than fail informatively.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     defaults:
       run:
         working-directory: pi-issue-tracker
@@ -33,9 +76,16 @@ jobs:
       # known userland.
       IMAGE: ghcr.io/ocramz/pi-container-distroless-node24:latest
       ENGINE: podman
+      # The live tier is the only coverage extensions/index.ts has; without a key
+      # run.sh refuses to start rather than quietly skipping it.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      PI_PROVIDER: openrouter
+      # Kept in step with the Makefile default; see the comment there.
+      PI_MODEL: deepseek/deepseek-v4-flash
     steps:
       - uses: actions/checkout@v4
       - run: podman pull "$IMAGE"
       # Runs the git capability probe first; it gates the suites that depend on
-      # worktree and stash-create actually existing in the perl-less git.
+      # worktree and stash-create actually existing in the perl-less git. The
+      # runner's podman is not nested, so none of the Makefile's flags apply.
       - run: npm run test:container
