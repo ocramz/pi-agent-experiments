@@ -190,6 +190,23 @@ class TestVersionedNamespaces(unittest.TestCase):
         self.assertTrue(nb.stateful(acc))
         self.assertFalse(nb.stateful(plain))
 
+    def test_a_trailing_display_expression_is_not_a_self_edge(self):
+        # `x = 1` then a bare `x` is the display idiom the kernel recommends,
+        # and symtable sees x as both assigned and referenced — the same shape
+        # as `x = x + 1`. But the tail runs after the body against the same
+        # namespace, so it reads back what the body just wrote. Only the body
+        # proper makes a self-edge temporal.
+        nb = Notebook(seed=1)
+        display, _ = nb.add("shown = 1\nshown", run=False)
+        self.assertFalse(nb.stateful(display))
+        # ...while the accumulator keeps its flag when it displays too.
+        both, _ = nb.add(f"{self.COUNTER}\ncount", run=False)
+        self.assertTrue(nb.stateful(both))
+        # An augmented assignment binds without a Load node; displaying it is
+        # what puts it in refs, and the body is still where it is read.
+        aug, _ = nb.add("try:\n    n += 1\nexcept NameError:\n    n = 0\nn", run=False)
+        self.assertTrue(nb.stateful(aug))
+
     def test_failure_restores_committed_version(self):
         nb = Notebook(seed=1)
         acc, _ = nb.add(self.COUNTER)

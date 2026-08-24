@@ -73,6 +73,16 @@ deliberately not shipped.
   (`None` is the neutral "nothing yet"; pick whatever initial value the
   cell should start from.) The try/except structure is what makes it
   converge between incremental runs and `run_all` replays.
+
+  `stateful` is asked of the cell body with the trailing display
+  expression split off. `x = 1` followed by a bare `x` is the display
+  idiom, not an accumulator: symtable sees x assigned *and* referenced,
+  exactly as in `x = x + 1`, but the tail runs after the body against the
+  same namespace and reads back what the body just wrote. Only a read in
+  the body proper makes the self-edge temporal. Note that `refs` still
+  keeps both — the dependency graph and the cache key are unchanged — so
+  a cell that displays its own global has that global in its own key, and
+  re-runs once before it can report `cached`.
 - **Builtin shadowing.** If a cell defines `len`, dependents of `len` get
   a real DAG edge and re-run when it changes.
 - **Failure isolation.** A cell that raises leaves its dependents

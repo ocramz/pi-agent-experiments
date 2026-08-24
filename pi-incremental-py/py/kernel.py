@@ -367,6 +367,49 @@ def analyze(src: str) -> tuple[frozenset[str], frozenset[str]]:
     return defs, refs
 
 
+def _temporal(body: ast.AST, self_refs: frozenset[str]) -> bool:
+    """Whether a self-edge is a real read of the *previous* value.
+
+    `refs` deliberately keeps self-defs, but symtable cannot tell
+    `x = x + 1` from `x = 1` followed by a bare `x`: in both, x is assigned
+    and referenced, so both land in `refs & defs`. Only the first is
+    temporal. The second is the display idiom this kernel recommends, and
+    its trailing expression runs *after* the body against the same
+    namespace — it reads back what the body just wrote, never the previous
+    committed version.
+
+    So the question is asked of the body with the tail already split off.
+    Over-inclusive on purpose in one direction: a read inside a nested
+    function counts, even though it happens at call time. Claiming a
+    history that turns out to be one value is harmless; the reverse is not.
+
+    Reporting only. The graph and the cache key are built from `refs`,
+    which is unchanged — this decides what `inspect` flags and what a
+    context filter downstream is allowed to collapse.
+    """
+    if not self_refs:
+        return False
+    reads: set[str] = set()
+    for node in ast.walk(body):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            reads.add(node.id)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            # `x += 1` binds x through a Store with no Load node anywhere,
+            # and is as temporal as `x = x + 1`. This is what classifies
+            # `x += 1` followed by a bare `x`, where the only Load is in the
+            # tail we just split off.
+            #
+            # A cell that is *only* `x += 1` still comes out False, because
+            # symtable reports x as assigned and not referenced, so it never
+            # reaches `refs` and there is no self-edge to qualify. That gap
+            # is upstream in `_analyze` and predates this: it costs the same
+            # cell its edge in the dependency graph and its own value in the
+            # cache key. Fixing it means changing `refs`, which moves every
+            # cache key in the notebook — a separate change from this one.
+            reads.add(node.target.id)
+    return bool(self_refs & reads)
+
+
 def brief(value: object, limit: int = 120) -> str:
     """One-line value summary. Agents need shape, not contents."""
     if value is None:
@@ -399,11 +442,7 @@ class Cell:
     body: types.CodeType
     tail: types.CodeType | None
     imports: bool  # edge from the synthetic environment root
-
-    @property
-    def stateful(self) -> bool:
-        """Reads something it also defines: a temporal self-edge."""
-        return bool(self.refs & self.defs)
+    stateful: bool  # reads one of its own defs in the body proper — see _temporal
 
     @classmethod
     def of(cls, src: str, name: str | None) -> Cell:
@@ -420,9 +459,11 @@ class Cell:
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             tail_expr = ast.Expression(tree.body.pop().value)
             ast.copy_location(tail_expr, tail_expr.body)
+        # `tree` has had the tail popped off it, so this asks the body alone.
+        stateful = _temporal(tree, defs & refs)
         body = compile(tree, "<cell>", "exec")
         tail = compile(tail_expr, "<cell>", "eval") if tail_expr is not None else None
-        return cls(src, name, defs, refs, body, tail, imports)
+        return cls(src, name, defs, refs, body, tail, imports, stateful)
 
 
 @dataclass

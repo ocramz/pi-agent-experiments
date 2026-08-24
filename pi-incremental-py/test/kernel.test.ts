@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { Kernel, MIN_PYTHON, interpreterVersion, resolvePython } from "../src/kernel.ts";
+import { Kernel, MIN_PYTHON, interpreterVersion, resolvePython, type KernelResponse } from "../src/kernel.ts";
 import { formatEval, formatInspect, formatResults } from "../src/format.ts";
+import { filterPyContext, type ContextMessage } from "../src/context-filter.ts";
 
 // These tests drive the real Python kernel (stdlib-only python3, venv module).
 
@@ -168,6 +169,55 @@ test("cell stdout is captured, the wire stays clean", async (t) => {
 		k.kill();
 	}
 });
+
+// ── the kernel/filter join ──────────────────────────────────────
+//
+// `stateful` is derived in py/protocol.py, rides on the tool result's `details`
+// and is read by src/context-filter.ts. The Python suite checks it is on the
+// wire; test/context-filter.test.ts drives the filter with results it wrote
+// itself. Neither notices if the two ends stop agreeing about the name, so
+// this runs one real response through the real filter.
+
+test("a real kernel response filters by the statefulness the kernel reported", async (t) => {
+	const { k } = kernelIn(t);
+	try {
+		const plain = await k.call({ tool: "add_cell", src: "p = 1\np" });
+		const acc = await k.call({ tool: "add_cell", src: "c = c + 1 if 'c' in dir() else 0\nc" });
+		const plainId = plain.id as string;
+		const accId = acc.id as string;
+		// Advance both, so each has an earlier value that a later one could bury.
+		const reruns = [
+			await k.call({ tool: "rerun_cell", id: plainId }),
+			await k.call({ tool: "rerun_cell", id: accId }),
+		];
+
+		const out = filterPyContext([plain, acc, ...reruns].map(asToolResult), { gen: 0, mut: 0 });
+		const shown = (i: number) =>
+			((out[i] as unknown as { content: { text: string }[] }).content[0].text);
+
+		// An ordinary cell: one truth, and the kernel has already recomputed it.
+		assert.match(shown(0), new RegExp(`- superseded: ${plainId}`));
+		// An accumulator: 0 then 1 is the record of it advancing, not a stale copy.
+		assert.match(shown(1), new RegExp(`^\\* ${accId} ran .*\\s0$`, "m"));
+		assert.match(shown(3), new RegExp(`^\\* ${accId} ran .*\\s1$`, "m"));
+	} finally {
+		k.kill();
+	}
+});
+
+/** The tool result the extension would have written for a kernel response. */
+function asToolResult(response: KernelResponse, i: number): ContextMessage {
+	const details = { kind: "py.cells" as const, gen: 0, mut: 0, response };
+	return {
+		role: "toolResult",
+		toolCallId: `call_${i}`,
+		toolName: "py_cell",
+		content: [{ type: "text", text: formatResults(response) }],
+		details,
+		isError: false,
+		timestamp: 0,
+	} as unknown as ContextMessage;
+}
 
 // ── formatting ──────────────────────────────────────────────────
 
