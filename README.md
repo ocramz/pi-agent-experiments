@@ -9,15 +9,23 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 | [pi-incremental-py/](pi-incremental-py/) | An incremental computing kernel for Python, plus the pi extension that drives it |
 | [shared/](shared/) | Version pins, the tsconfig base, and the shell + pty test harnesses |
 
-# Dev set up
+# Development
+
+## Secrets
+
+These extensions assume their secrets are in the environment. If they are not, start pi with the `.env` file sourced:
+      
+ ```bash
+   set -a && . ./.env && set +a && pi                                        
+ ```          
+
+## Container tests
 
 For security, we run pi inside a container, and the test suite starts containers of
 its own, so the outer one needs a handful of flags to make nested podman work.
 The Makefile specifies all the flags.
 
 ```bash
-cp env.example .env       # then set OPENROUTER_API_KEY
-
 make dev                  # build + start the dev container, detached
 make shell                # a shell in it (or attach VS Code to "pi-dev")
 ```

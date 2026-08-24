@@ -5,7 +5,9 @@ A monorepo of extensions for the [Pi coding agent](https://pi.dev): one director
 ## Commands
 
 All test targets run in the dev container (`make dev` starts it detached; `make shell` gets a shell
-in it). `.env` with `OPENROUTER_API_KEY` is a prerequisite for every target.
+in it). `.env` contains **SECRETS**, do not open it or print it. `.env` with `OPENROUTER_API_KEY` is a prerequisite for every target that makes LLM calls.
+`.env` may contain other secret keys.
+
 
 ```bash
 make check          # test-image, test, typecheck, test-tui, test-container — in that order
