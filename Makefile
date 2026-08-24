@@ -12,6 +12,9 @@ STORAGE_VOL ?= pi-dev-storage
 # the `?=` below, which in turn beats the file.
 include shared/versions.env
 TEST_IMAGE  ?= $(DEFAULT_TEST_IMAGE)
+# The dev image takes its interpreter from this one, so pi-incremental-py's
+# unit and TUI tiers have a python to spawn in here.
+PY_TEST_IMAGE ?= $(DEFAULT_PY_TEST_IMAGE)
 PI_PROVIDER ?= $(DEFAULT_PI_PROVIDER)
 PI_MODEL    ?= $(DEFAULT_PI_MODEL)
 # Empty by default: shared/versions.sh then falls back to the working model
@@ -60,20 +63,15 @@ MOUNTS = \
 # command line is confusing to read even though podman takes the last.
 RUN_FLAGS = $(NEST_FLAGS) $(MOUNTS) --env-file $(ENV_FILE) \
             -e PI_PROVIDER=$(PI_PROVIDER) -e PI_MODEL=$(PI_MODEL) \
-            -e PI_REVIEW_PROVIDER=$(PI_REVIEW_PROVIDER) -e PI_REVIEW_MODEL=$(PI_REVIEW_MODEL) \
-            -e PI_TUI_SKIP_LIVE=$(PI_TUI_SKIP_LIVE)
-
-# The documented opt-out from the money-spending interactive cases. It is read
-# inside the container by test/tui/live.test.ts, so it has to be forwarded —
-# `make test-tui PI_TUI_SKIP_LIVE=1` silently ran them before this existed.
-PI_TUI_SKIP_LIVE ?=
+            -e PI_REVIEW_PROVIDER=$(PI_REVIEW_PROVIDER) -e PI_REVIEW_MODEL=$(PI_REVIEW_MODEL)
 
 $(ENV_FILE):
 	@echo "$(ENV_FILE) is missing. cp env.example $(ENV_FILE) and set OPENROUTER_API_KEY." >&2
 	@exit 1
 
 image:
-	$(ENGINE) build -t $(DEV_IMAGE) -f .devcontainer/Dockerfile .devcontainer
+	$(ENGINE) build -t $(DEV_IMAGE) --build-arg PY_IMAGE=$(PY_TEST_IMAGE) \
+	  -f .devcontainer/Dockerfile .devcontainer
 
 # Long-lived and detached, so VS Code can attach and the container outlives the
 # terminal that started it.

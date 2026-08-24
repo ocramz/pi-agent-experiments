@@ -5,10 +5,9 @@ description = "Incremental reactive notebook kernel for agent-driven Python sess
 requires-python = ">=3.12"
 
 # No runtime dependencies: the kernel is stdlib-only (ast, symtable, importlib).
-# The unittest suite runs on a bare interpreter; the property suite needs
-# hypothesis and skips itself without it.
-#     python3 -m unittest discover -s test-py
-# With uv available:
+# Its tests are not — test_properties.py imports hypothesis unconditionally, so
+# the dev group is required to run the suite at all, not an optional extra.
+#     uv sync --group dev
 #     uv run python -m unittest discover -s test-py
 #     uvx ruff check py test-py
 

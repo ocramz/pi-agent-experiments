@@ -220,6 +220,16 @@ upgrade invalidates everybody's importing cells at once, coherently and without 
 The upside is real, though — `env.lock` stops being a hope about reproducibility and
 becomes a fact, because there is one environment and it is the one everything ran in.
 
+**Does the remote interpreter start with `PYTHONHASHSEED=0`?** It has to. Cache keys are
+content addresses, and a key computed on one machine has to equal the key computed on
+another or nothing about shared caching works. `digest` canonicalises a set it is handed
+directly, but a set *nested* inside a pickled structure is serialised in iteration order,
+and for `str` and `bytes` members that order follows the hash seed. Locally the extension
+sets it at spawn; remotely it becomes part of the contract for what a conforming kernel
+process is, alongside the interpreter version floor. The failure mode is quiet — every
+dependent of a set-holding cell looks invalidated, so the graph recomputes work it already
+had and nobody sees an error.
+
 **What happens to operations that are not idempotent?** Advancing a stateful cell is a
 deliberate feature locally. Shared, it is a mutation with no author. Either such operations
 acquire an owner or they need to be confined to a private namespace — which is most of the

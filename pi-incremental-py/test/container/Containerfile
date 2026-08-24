@@ -21,6 +21,13 @@
 ARG BASE=ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.2
 ARG PY_VERSION=3.13
+# test-py/test_properties.py imports hypothesis unconditionally: the property
+# cases are the ones that check the laws the kernel is sold on, and a suite that
+# skips itself when a dependency is missing reports success while covering
+# nothing. Pinned for the same reason the interpreter is — a strategy change
+# upstream should not turn into a mystery failure here. Keep it in step with
+# pyproject.toml's [dependency-groups] dev and uv.lock.
+ARG HYPOTHESIS_VERSION=6.165.10
 
 FROM ${UV_IMAGE} AS uvbin
 
@@ -39,10 +46,20 @@ COPY --from=uvbin /uv /usr/local/bin/uv
 # independent libraries" — so resolvePython's venv bootstrap fails at exactly
 # the step py_install depends on. Moving the prefix keeps bin/python3 a relative
 # symlink inside its own tree, which is the layout CPython expects.
+#
+# hypothesis goes in with the interpreter's own pip: uv refuses to install into
+# a Python it manages, and the standalone build carries an EXTERNALLY-MANAGED
+# marker, hence --break-system-packages. That is the point of this image, not a
+# workaround around it. Note site-packages was never empty — the build ships pip
+# — which is why test_kernel_in_image.sh asserts stdlib-only with `python3 -S`
+# rather than trusting the image to have nothing in it.
+ARG HYPOTHESIS_VERSION
 RUN UV_PYTHON_INSTALL_DIR=/opt/staging uv python install "${PY_VERSION}" \
 	&& mv /opt/staging/cpython-*-linux-*-gnu /opt/python3 \
+	&& /opt/python3/bin/python3 -m pip install --no-cache-dir \
+		--break-system-packages "hypothesis==${HYPOTHESIS_VERSION}" \
 	&& chmod -R a+rX /opt/python3 \
-	&& /opt/python3/bin/python3 -c 'import venv, ensurepip, symtable'
+	&& /opt/python3/bin/python3 -c 'import venv, ensurepip, symtable, hypothesis'
 
 FROM ${BASE}
 COPY --from=py /opt/python3 /opt/python3
