@@ -125,8 +125,13 @@ assert_contains "the trailing expression is still the value"  "PRINT_VALUE=7"   
 # processes, which is why function digests walk nested code objects instead of
 # repr-ing them." Two pristine interpreters, different hash seeds, nothing warm
 # carried between them — this is the only place in the repo where that sentence
-# can actually be tested. The cell under test reads a closure, so the
-# address-free code fingerprint is what the key is made of.
+# can actually be tested.
+#
+# Two cells, because the claim has two halves that fail for different reasons. A
+# cell reading a closure keys on the code fingerprint, which must be address-free
+# or it moves every process. A cell reading a *set* keys on a digest that pickle
+# would build in iteration order, which follows the hash seed for str members —
+# so a pickled set moves between processes even though its content did not.
 key_of() {
 	RUN_FLAGS="-v $STAGED:/pkg:ro -e PYTHONHASHSEED=$1" in_image '
 		mkdir -p /tmp/pkg && cp -r /pkg/py /tmp/pkg/ || { echo "COPY_FAILED"; exit 1; }
@@ -137,25 +142,38 @@ from kernel import Notebook
 
 nb = Notebook()
 nb.add(\"def make(n):\n    def inner(x):\n        return x * n\n    return inner\nadder = make(3)\")
-cid, _ = nb.add(\"total = adder(14)\")
-print(\"KEY=\" + nb._key(cid))
+closure_cell, _ = nb.add(\"total = adder(14)\")
+print(\"CLOSURE_KEY=\" + nb._key(closure_cell))
 print(\"TOTAL=\" + str(nb.ns.get(\"total\")))
+
+nb.add(\"tags = {\\\"alpha\\\", \\\"beta\\\", \\\"gamma\\\", \\\"delta\\\", \\\"epsilon\\\"}\")
+set_cell, _ = nb.add(\"tag_count = len(tags)\")
+print(\"SET_KEY=\" + nb._key(set_cell))
+print(\"COUNT=\" + str(nb.ns.get(\"tag_count\")))
 "
 	'
 }
 
 first="$(key_of 1)"
 second="$(key_of 4242)"
-key1="$(printf '%s\n' "$first" | sed -n 's/^KEY=//p')"
-key2="$(printf '%s\n' "$second" | sed -n 's/^KEY=//p')"
 
 assert_contains "the closure cell actually computed" "TOTAL=42" "$first"
-if [ -n "$key1" ] && [ "$key1" = "$key2" ]; then
-	ok "the cache key is identical in two fresh processes ($key1)"
-else
-	fail "the cache key is identical in two fresh processes" \
-		"PYTHONHASHSEED=1    -> ${key1:-none reported}" \
-		"PYTHONHASHSEED=4242 -> ${key2:-none reported}"
-fi
+assert_contains "the set cell actually computed"     "COUNT=5"  "$first"
+
+for label in CLOSURE SET; do
+	key1="$(printf '%s\n' "$first" | sed -n "s/^${label}_KEY=//p")"
+	key2="$(printf '%s\n' "$second" | sed -n "s/^${label}_KEY=//p")"
+	case "$label" in
+	CLOSURE) what="a cell reading a closure" ;;
+	SET) what="a cell reading a set" ;;
+	esac
+	if [ -n "$key1" ] && [ "$key1" = "$key2" ]; then
+		ok "$what keys identically in two fresh processes ($key1)"
+	else
+		fail "$what keys identically in two fresh processes" \
+			"PYTHONHASHSEED=1    -> ${key1:-none reported}" \
+			"PYTHONHASHSEED=4242 -> ${key2:-none reported}"
+	fi
+done
 
 summary

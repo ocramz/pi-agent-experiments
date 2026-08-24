@@ -111,22 +111,25 @@ for tests.
 
 ## Tooling
 
-The kernel is stdlib-only:
+The kernel is stdlib-only — `python3 -S -c "import kernel, protocol"` is
+part of the container tier, so the claim is checked rather than asserted.
+Its *tests* are not: hypothesis is a dev dependency, and the suite needs
+it.
 
 ```bash
-python3 -m unittest discover -s test-py    # kernel tests (50)
+uv sync --group dev                        # ruff + hypothesis
+uv run python -m unittest discover -s test-py   # kernel tests (72)
+uvx ruff check py test-py
 python3 py/protocol.py                     # speak the protocol on stdin/stdout
 ```
 
-`test-py/test_properties.py` adds property-based tests (hypothesis, a dev
-dependency) for the laws the unit suite only spot-checks: incremental
-edits reach the same namespace as a from-scratch replay, early cutoff is
-invisible, a rejected batch changes nothing, `plan` bounds `apply`,
-failures isolate, and keys are content addresses. It skips itself when
-hypothesis is absent, so a bare interpreter still runs the other 50.
-
-With uv: `uv run python -m unittest discover -s test-py` (72 tests),
-`uvx ruff check py test-py`.
+`test-py/test_properties.py` adds property-based tests for the laws the
+unit suite only spot-checks: incremental edits reach the same namespace as
+a from-scratch replay, early cutoff is invisible, a rejected batch changes
+nothing, `plan` bounds `apply`, failures isolate, and keys are content
+addresses. It imports hypothesis unconditionally — these are the cases
+that check the laws, so a missing dependency fails the run instead of
+silently removing 21 tests from it.
 
 Extension side (this repo's standard tiers):
 

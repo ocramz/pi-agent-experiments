@@ -161,6 +161,13 @@ export class Kernel {
 		const proc = spawn(this.python, [this.script, "--serve"], {
 			stdio: ["pipe", "pipe", "inherit"],
 			cwd: this.cwd,
+			// Cache keys are content addresses and have to survive a restart.
+			// digest() canonicalises a set it is handed directly, but one nested
+			// inside a pickled structure is still serialised in iteration order,
+			// which follows the hash seed for str and bytes members. Fixing the
+			// seed costs nothing and closes that at every depth. A remote kernel
+			// must do the same — see docs/remote.md.
+			env: { ...process.env, PYTHONHASHSEED: "0" },
 		});
 		this.proc = proc;
 		this.buffer = "";

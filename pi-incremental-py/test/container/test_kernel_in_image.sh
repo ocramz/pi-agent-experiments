@@ -7,10 +7,12 @@
 #     plus a property module, and until now the only thing that ran them was a
 #     human typing the command from the README. Neither `npm test`, `make check`
 #     nor CI touched them.
-#   - "The kernel is stdlib-only" is honest. On a dev machine the claim is
-#     unfalsifiable: the interpreter has a site-packages full of things the
-#     kernel might be leaning on without anyone noticing. This interpreter has
-#     nothing in it, so an accidental dependency is an ImportError.
+#   - "The kernel is stdlib-only" is asserted rather than assumed. It used to
+#     rest on the image having an empty site-packages, which was never quite
+#     true (the interpreter ships pip) and stopped being true at all once
+#     hypothesis was added for the property suite. `python3 -S` skips
+#     site-packages outright, so importing the kernel under it proves the claim
+#     no matter what else is installed alongside.
 set -uo pipefail
 
 # The kernel needs an interpreter, so this suite runs against the derived image
@@ -36,7 +38,15 @@ out="$(RUN_FLAGS="-v $STAGED:/pkg:ro" in_image '
 
 	echo "USER_ID=$(id -u)"
 	echo "PYVER=$(python3 -c "import sys; print(\"%d.%d\" % sys.version_info[:2])")"
-	echo "SITE=$(python3 -c "import sys; print(len([p for p in sys.path if \"site-packages\" in p]))")"
+
+	# -S drops site-packages, so this passes only if the kernel really does
+	# import out of the standard library alone.
+	if python3 -S -c "import sys; sys.path.insert(0, \"py\"); import kernel, protocol" 2>/dev/null; then
+		echo "STDLIB_ONLY=yes"
+	else
+		echo "STDLIB_ONLY=no"
+		python3 -S -c "import sys; sys.path.insert(0, \"py\"); import kernel, protocol" 2>&1 | tail -3
+	fi
 
 	python3 -m unittest discover -s test-py 2>&1 | tail -12
 ')"
@@ -58,19 +68,20 @@ fi
 # A pass count, not just a green light: the suite once reported success in a
 # sibling package while running nothing at all, which is what the floor is for.
 ran="$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9][0-9]*\) test.*/\1/p' | tail -1)"
-if [ "${ran:-0}" -ge 50 ] 2>/dev/null; then
+if [ "${ran:-0}" -ge 77 ] 2>/dev/null; then
 	ok "the kernel suite actually ran ($ran tests)"
 else
-	fail "the kernel suite actually ran" "expected at least 50 tests" "actual: ${ran:-none reported}"
+	fail "the kernel suite actually ran" "expected at least 77 tests" "actual: ${ran:-none reported}"
 fi
 
 assert_contains     "the kernel suite passed" "OK"     "$out"
 assert_not_contains "no test failures"        "FAILED" "$out"
 
-# hypothesis is a dev dependency the image does not have, so test_properties
-# skips itself. Asserting the skip is *counted* is what keeps that module from
-# quietly disappearing: a silent zero and a deliberate skip look identical in a
-# green run otherwise.
-assert_contains "the property module skipped itself, visibly" "skipped=1" "$out"
+# The property module imports hypothesis unconditionally, so it cannot skip
+# itself any more — the floor above counts its cases. Anything skipping here is
+# a case quietly removing itself from the run, which is what this catches.
+assert_not_contains "nothing skipped itself out of the run" "skipped" "$out"
+
+assert_contains "the kernel imports from the standard library alone" "STDLIB_ONLY=yes" "$out"
 
 summary

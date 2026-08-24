@@ -4,8 +4,10 @@ The unit suite checks named scenarios; these check the laws. Run with:
 
     uv run python -m unittest discover -s test-py
 
-hypothesis is a dev dependency, not a runtime one — without it this
-module skips itself so a bare interpreter still runs the rest.
+hypothesis is imported unconditionally. It is a dev dependency, not a
+runtime one — the kernel itself stays stdlib-only — but these cases are
+the ones that check the laws, so a missing dependency has to fail the run
+rather than quietly remove them from it.
 """
 
 import os
@@ -14,13 +16,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
-try:
-    from hypothesis import HealthCheck, given, settings
-    from hypothesis import strategies as st
-
-    HAVE_HYPOTHESIS = True
-except ImportError:  # pragma: no cover
-    HAVE_HYPOTHESIS = False
+from hypothesis import HealthCheck, given, settings  # noqa: E402
+from hypothesis import strategies as st  # noqa: E402
 
 from kernel import (  # noqa: E402
     CycleError,
@@ -31,10 +28,6 @@ from kernel import (  # noqa: E402
     analyze,
     digest,
 )
-
-if not HAVE_HYPOTHESIS:  # pragma: no cover
-    raise unittest.SkipTest("hypothesis not installed")
-
 
 # ----------------------------------------------------------- strategies
 
@@ -170,6 +163,34 @@ class TestIncrementalEqualsFromScratch(unittest.TestCase):
 
         fresh, _ = build(list(sources.items()))
         self.assertEqual(ns_digests(nb), ns_digests(fresh))
+
+    # A closure carries state the code object does not, so a digest built
+    # from the code alone calls `make(a)` and `make(b)` the same function
+    # and leaves every dependent holding a stale value. The generated DAGs
+    # above never produce one, which is how this survived: it is a wrong
+    # answer, not a crash, and only a value comparison catches it.
+    @given(st.integers(-50, 50), st.integers(-50, 50))
+    def test_a_changed_capture_reaches_dependents(self, before, after):
+        maker = "def make(n):\n    def inner(x):\n        return x * n\n    return inner\n"
+        nb = Notebook(seed=1)
+        cid, _ = nb.add(f"{maker}adder = make({before})")
+        nb.add("total = adder(14)")
+        nb.set(cid, f"{maker}adder = make({after})")
+
+        fresh = Notebook(seed=2)
+        fresh.add(f"{maker}adder = make({after})")
+        fresh.add("total = adder(14)")
+
+        self.assertEqual(nb.ns["total"], fresh.ns["total"])
+        self.assertEqual(nb.ns["total"], 14 * after)
+
+    @given(st.integers(-50, 50), st.integers(-50, 50))
+    def test_a_changed_default_reaches_dependents(self, before, after):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add(f"def scaled(x, k={before}):\n    return x * k\n")
+        nb.add("total = scaled(3)")
+        nb.set(cid, f"def scaled(x, k={after}):\n    return x * k\n")
+        self.assertEqual(nb.ns["total"], 3 * after)
 
     @SLOW
     @given(dags())
@@ -371,6 +392,15 @@ class TestDigestStability(unittest.TestCase):
                 "def f():\n    def inner():\n        return 8\n    return inner",
             ),
             ("f = lambda: [i for i in range(3)]", "f = lambda: [i for i in range(4)]"),
+            # Neither of these edits the code object at all: the pair below
+            # differs only in a captured cell, and the one after it only in a
+            # default. A code-only digest calls both pairs identical.
+            (
+                "def _mk(n):\n    def g():\n        return n\n    return g\nf = _mk(1)",
+                "def _mk(n):\n    def g():\n        return n\n    return g\nf = _mk(2)",
+            ),
+            ("def f(k=1):\n    return k", "def f(k=2):\n    return k"),
+            ("def f(*, k=1):\n    return k", "def f(*, k=2):\n    return k"),
         ]
     )
 
@@ -392,6 +422,46 @@ class TestDigestStability(unittest.TestCase):
         before = digest(nb.ns["f"])
         nb.set(cid, edited)
         self.assertNotEqual(digest(nb.ns["f"]), before)
+
+    @given(st.sets(st.text(max_size=8), max_size=12))
+    def test_a_set_digests_independently_of_iteration_order(self, members):
+        """Sets pickle in iteration order, which follows the hash seed for
+        str members — so a pickled digest is not the same in two processes.
+        Building the same set from a different insertion order is the
+        in-process shadow of that, and must not move the digest."""
+        forward = set(members)
+        backward = set(reversed(sorted(members)))
+        self.assertEqual(digest(forward), digest(backward))
+        self.assertNotEqual(digest(forward), digest(frozenset(members)))
+
+    def test_an_undigestable_capture_makes_the_function_uncacheable(self):
+        """A capture that cannot be digested has to poison the function,
+        not be skipped: skipping it is what makes a stale value look
+        fresh. The cost is real — such cells stop caching entirely — so
+        it is asserted here rather than discovered."""
+        import socket
+
+        sock = socket.socket()
+        self.addCleanup(sock.close)
+
+        def holding_a_socket():
+            return sock
+
+        self.assertIsNone(digest(sock))
+        self.assertIsNone(digest(holding_a_socket))
+
+    def test_a_self_capturing_closure_stays_cacheable(self):
+        """A recursive closure holds itself, so the walk has to break the
+        cycle rather than recurse forever — and it should still produce a
+        key, not give up on caching."""
+
+        def outer():
+            def loop(n):
+                return n if n <= 0 else loop(n - 1)
+
+            return loop
+
+        self.assertIsNotNone(digest(outer()))
 
 
 if __name__ == "__main__":

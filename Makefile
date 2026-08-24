@@ -12,6 +12,9 @@ STORAGE_VOL ?= pi-dev-storage
 # the `?=` below, which in turn beats the file.
 include shared/versions.env
 TEST_IMAGE  ?= $(DEFAULT_TEST_IMAGE)
+# The dev image takes its interpreter from this one, so pi-incremental-py's
+# unit and TUI tiers have a python to spawn in here.
+PY_TEST_IMAGE ?= $(DEFAULT_PY_TEST_IMAGE)
 PI_PROVIDER ?= $(DEFAULT_PI_PROVIDER)
 PI_MODEL    ?= $(DEFAULT_PI_MODEL)
 # Empty by default: shared/versions.sh then falls back to the working model
@@ -73,7 +76,8 @@ $(ENV_FILE):
 	@exit 1
 
 image:
-	$(ENGINE) build -t $(DEV_IMAGE) -f .devcontainer/Dockerfile .devcontainer
+	$(ENGINE) build -t $(DEV_IMAGE) --build-arg PY_IMAGE=$(PY_TEST_IMAGE) \
+	  -f .devcontainer/Dockerfile .devcontainer
 
 # Long-lived and detached, so VS Code can attach and the container outlives the
 # terminal that started it.
