@@ -1,0 +1,156 @@
+# Publish one extension to npm, driven by a git tag.
+#
+# Tag convention: <directory>-v<version>, e.g. pi-issue-tracker-v1.0.0. The
+# prefix is the directory name — which is also the PKGS entry in the Makefile
+# and the matrix.pkg entry in test.yml — rather than the scoped package name,
+# because a git ref cannot contain `@` or `/`.
+#
+# Releasing is therefore:
+#
+#   git tag pi-web-search-v0.2.0 && git push --tags
+#
+# The tag is the single source of truth: the job refuses to publish if the
+# version in it disagrees with the one in package.json, so a forgotten version
+# bump fails loudly instead of republishing the old contents under a new tag.
+#
+# FIRST PUBLISH OF A NEW PACKAGE IS MANUAL. npm's trusted-publisher setting
+# lives on an existing package, so there is nothing to configure until the
+# package exists. Publish it once by hand from a clean checkout of the tag —
+#     npm publish --dry-run   # read the file list
+#     npm publish --access public
+# — then, on npmjs.com, Settings → Trusted Publisher → GitHub Actions, with
+# repository ocramz/pi-agent-experiments and workflow publish-npm.yml. Every
+# release after that comes through here, with no long-lived token in the repo.
+name: publish to npm
+
+on:
+  push:
+    tags: ["pi-*-v*"]
+  workflow_dispatch:
+    inputs:
+      pkg:
+        description: package directory (e.g. pi-web-search)
+        required: true
+      dry_run:
+        description: pack and check, but do not publish
+        type: boolean
+        default: true
+
+# Two tags pushed together are two independent releases and may both run, but
+# the same tag must never race itself.
+concurrency:
+  group: publish-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # OIDC. This is what lets npm trust the workflow instead of a stored token,
+  # and what attaches the provenance attestation to the published version.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag carries both facts; a manual dispatch carries only the package, so
+      # the version is read back from the manifest and the equality check below
+      # is trivially satisfied. That asymmetry is deliberate — dispatch is for
+      # dry runs and for re-driving a release, not for inventing a version.
+      - id: target
+        name: resolve package and version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PKG="${{ inputs.pkg }}"
+            VERSION="$(node -p "require('./$PKG/package.json').version")"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            PKG="${TAG%-v*}"
+            VERSION="${TAG##*-v}"
+          fi
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "resolved $PKG @ $VERSION"
+
+      # Three ways a release can be wrong before it starts: a tag naming a
+      # directory that is not a package, a tag whose version the manifest does
+      # not share, and a package whose name does not match the directory the tag
+      # named. All three publish something plausible and wrong if unchecked.
+      - name: check the tag against the manifest
+        working-directory: ${{ steps.target.outputs.pkg }}
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "${{ steps.target.outputs.version }}" ]; then
+            echo "::error::tag says ${{ steps.target.outputs.version }}, package.json says $VERSION — bump one of them" >&2
+            exit 1
+          fi
+          if [ "$NAME" != "@ocramz/${{ steps.target.outputs.pkg }}" ]; then
+            echo "::error::tag names directory ${{ steps.target.outputs.pkg }}, but its package is $NAME" >&2
+            exit 1
+          fi
+          echo "$NAME@$VERSION"
+
+      - uses: actions/setup-node@v4
+        with:
+          # Same 24 the packages require, and the same registry npm publishes
+          # to — setup-node writes the .npmrc that points at it.
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: |
+            shared/typecheck/package-lock.json
+            shared/test/tui/package-lock.json
+
+      # Trusted publishing needs a recent npm; the one bundled with the runner's
+      # node may lag it.
+      - run: npm i -g npm@latest
+
+      # The free tiers only. test:tui and test:container each drive a real model
+      # and cost money per run, and they already gated the merge that produced
+      # this commit — re-paying for them on a tag push buys nothing. What these
+      # two do buy is a guarantee that the tag is not pointing at a commit that
+      # never passed anything.
+      - name: re-run the free tiers
+        working-directory: ${{ steps.target.outputs.pkg }}
+        run: |
+          npm run test --if-present
+          npm run typecheck --if-present
+
+      # The last look at what is about to be uploaded, and the reason it lands
+      # in the step summary: a published version cannot be replaced, so the file
+      # list is worth keeping next to the run that produced it.
+      - name: check and record the tarball
+        working-directory: ${{ steps.target.outputs.pkg }}
+        run: |
+          {
+            echo '## `${{ steps.target.outputs.pkg }}` @ ${{ steps.target.outputs.version }}'
+            echo
+            echo '```'
+            ../shared/check-tarball.mjs
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: publish
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        working-directory: ${{ steps.target.outputs.pkg }}
+        # --access public is also in each manifest's publishConfig; it is
+        # repeated here because a scoped package that reaches the registry
+        # private is a mistake with no undo.
+        run: npm publish --access public --provenance
+
+      - name: dry run
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        working-directory: ${{ steps.target.outputs.pkg }}
+        run: npm publish --dry-run --access public
+
+      - name: how to install it
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: |
+          {
+            echo
+            echo '```'
+            echo 'pi install npm:@ocramz/${{ steps.target.outputs.pkg }}@${{ steps.target.outputs.version }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

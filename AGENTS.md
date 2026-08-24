@@ -10,12 +10,13 @@ in it). `.env` contains **SECRETS**, do not open it or print it. `.env` with `OP
 
 
 ```bash
-make check          # test-image, test, typecheck, test-tui, test-container — in that order
+make check          # test-image, test, typecheck, pack, test-tui, test-container — in that order
 make test           # host unit suites (node --test)
 make typecheck      # tsc against pi's real declarations
 make test-tui       # interactive suites: pi's real TUI, driven in a pty
 make test-container # container suites, including the live model-driven tier
 make test-image     # the pinned image's git capability probe — once for the repo, not per package
+make pack           # what each package would publish — host only, no container, no key
 ```
 
 Narrow any target except `test-image` to one package with `PKG=`:
@@ -72,6 +73,12 @@ no second pin; set them to review with something genuinely different.
   `shared/test/container/lib.sh` copies and normalises modes before mounting.
 - **Every live pi call has a time budget** (`PI_TIMEOUT`, 240s). A model holding a bash tool has no
   natural stopping point; an unbounded live test is one curious model away from wedging CI.
+- **`files` in package.json is the only thing between the working tree and the registry.** There are
+  no `.npmignore` backstops, and a *directory* entry matches everything the toolchain left under it —
+  `files: ["py/"]` once made five `__pycache__/*.pyc` into 77% of pi-incremental-py's tarball. Prefer
+  a glob (`py/*.py`) over a directory whenever the directory is also a build target.
+  `shared/check-tarball.mjs` enforces both directions: nothing on the denylist ships, and everything
+  `pi.extensions` names does.
 
 ## Adding an extension
 
@@ -80,6 +87,12 @@ Registration is two lines: `PKGS` in the [Makefile](Makefile) and `matrix.pkg` i
 `../shared/tsconfig.base.json` with nothing but `include`, whichever npm scripts it wants (every
 target uses `npm run … --if-present`, so omitted tiers are skipped, not failed), and optionally a
 three-line `test/container/run.sh` delegating to `shared/test/container/run-suites.sh`.
+
+If it is meant to reach npm, copy the publishing metadata from
+[pi-web-search/package.json](pi-web-search/package.json) — the smallest complete manifest: an
+`@ocramz/`-scoped name, `publishConfig.access: "public"`, `homepage`/`bugs`, `files`,
+`pi.extensions`, the `pi-package` keyword, the core pi packages as *optional* peer dependencies, and
+a `pack-check` script. See "Releasing" in the [README](README.md) for the tag convention.
 
 Keep fixtures, inspectors and live suites local to a package: they encode one extension's semantics and
 are cheaper duplicated than abstracted. `shared/` is only for common infrastructure.

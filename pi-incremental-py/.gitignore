@@ -1,1 +1,8 @@
 node_modules/
+
+# Bytecode beside the kernel sources. The root .gitignore covers this too, but
+# `files` in package.json is an allowlist and `py/` once matched __pycache__
+# along with the two .py files it meant — 180 kB of stale bytecode for three
+# CPython versions, in a published tarball. The allowlist is now `py/*.py`;
+# this line is the second lock on the same door.
+**/__pycache__/

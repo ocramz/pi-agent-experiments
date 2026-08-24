@@ -103,6 +103,23 @@ define for_each_pkg
 	done
 endef
 
+# The same loop on the host. Only for scripts that need nothing the container
+# provides — no pi on PATH, no pinned userland, no key. `pack` is the one such
+# target: it reads package.json and asks npm what it would ship, and making that
+# depend on podman and a populated .env would put friction in front of the one
+# command a release is supposed to be preceded by.
+define for_each_pkg_host
+	@set -e; for pkg in $(TARGETS); do \
+	  printf '\n=== %s: %s ===\n' "$$pkg" "$(1)"; \
+	  (cd $$pkg && npm run $(1) --if-present); \
+	done
+endef
+
+# What each package would publish. See the header of shared/check-tarball.mjs
+# for why this is a test and not a convenience.
+pack:
+	$(call for_each_pkg_host,pack-check)
+
 # One-shot and disposable, so a laptop and CI run the same thing. Includes the
 # live suite, which calls a model API and costs money.
 test-container: image $(ENV_FILE)
@@ -131,11 +148,11 @@ test-image: image $(ENV_FILE)
 	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace $(DEV_IMAGE) \
 	  bash -lc 'IMAGE=$(TEST_IMAGE) shared/test/container/run-image-tests.sh'
 
-check: test-image test typecheck test-tui test-container
+check: test-image test typecheck pack test-tui test-container
 
 # The inner image cache and the dev container. Leaves $(CONFIG_VOL) alone — that
 # is the pi login.
 clean: dev-stop
 	- $(ENGINE) volume rm $(STORAGE_VOL)
 
-.PHONY: image dev shell dev-stop test typecheck test-tui test-container test-image check clean
+.PHONY: image dev shell dev-stop test typecheck test-tui test-container test-image check pack clean
