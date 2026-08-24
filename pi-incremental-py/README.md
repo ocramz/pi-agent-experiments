@@ -138,6 +138,38 @@ mid-line).
 creating a cell; `/py add [name] <src>`, `/py rerun <id>`, `/py run-all`,
 `/py inspect`. Humans and the agent share one namespace.
 
+**Context.** A pi transcript only grows, but the kernel recomputes, so a
+cell re-run ten times would otherwise leave ten values in the model's
+context, nine of them wrong. The extension registers a `context` hook that
+re-renders its own past tool results before each LLM call: the newest run
+of a cell keeps its value, earlier ones collapse to `- superseded: c3`,
+and whole-kernel snapshots (the `globals`/`pending`/`failing` tails, an
+`inspect` dump) survive only on the newest message carrying one. Two things
+are deliberately exempt — a **stateful** cell's successive values are the
+record of an accumulator advancing rather than stale copies of one truth,
+and an **error** is a fact about an attempt that, unlike a value, cannot be
+recovered by asking the kernel again. Both keep their line and lose only
+their captured stdout. A kernel restart voids everything before it, and a
+mutation made through a `/py` command — which leaves nothing in the
+transcript — appends a note telling the agent to re-inspect.
+
+The hook works on a copy that pi hands it for that one request: the session
+file, the transcript and what you see in the TUI are unaffected. The cost
+is prompt-cache locality, since rewriting a message invalidates the
+provider's cached prefix from that point on. The re-render is a pure
+function of what the kernel returned, so that happens once per *new*
+supersession rather than on every call. Turn it off with:
+
+```jsonc
+// .pi/settings.json
+{ "incrementalPy": { "contextFilter": false } }
+```
+
+or `PI_PY_CONTEXT_FILTER=0` in the environment, which wins over the file.
+Off is the old behaviour exactly — the hook returns pi's no-op and the
+messages are never touched. Project-local settings are honoured only for a
+trusted project.
+
 **Environment.** By default the extension creates and owns a
 project-scoped venv at `.incremental/venv` (`.incremental/` gets a
 `.gitignore`), so `py_install` never touches the user's interpreters.
@@ -155,7 +187,7 @@ it.
 
 ```bash
 uv sync --group dev                        # ruff + hypothesis
-uv run python -m unittest discover -s test-py   # kernel tests (72)
+uv run python -m unittest discover -s test-py   # kernel tests (79)
 uvx ruff check py test-py
 python3 py/protocol.py                     # speak the protocol on stdin/stdout
 ```

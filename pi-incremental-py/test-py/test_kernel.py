@@ -416,6 +416,25 @@ class TestProtocol(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertIn(resp["id"], resp["pending"])
 
+    def test_results_carry_statefulness(self):
+        # A consumer holding only results has no other way to tell a history
+        # (an accumulator advancing) from stale copies of one value.
+        nb = Notebook(seed=1)
+        plain = handle(nb, {"tool": "add_cell", "src": "x = 1"})
+        self.assertFalse(plain["results"][0]["stateful"])
+        src = "c = c + 1 if 'c' in dir() else 0"
+        acc = handle(nb, {"tool": "add_cell", "src": src})
+        self.assertTrue(acc["results"][0]["stateful"])
+
+    def test_deleting_a_cell_still_serialises_its_dependents(self):
+        # `stateful` is asked of the notebook, which no longer holds the cell.
+        nb = Notebook(seed=1)
+        a = handle(nb, {"tool": "add_cell", "src": "a = 1"})["id"]
+        handle(nb, {"tool": "add_cell", "src": "b = a + 1"})
+        resp = handle(nb, {"tool": "delete_cell", "id": a})
+        self.assertTrue(resp["ok"])
+        self.assertTrue(all("stateful" in r for r in resp["results"]))
+
     def test_run_all_and_rerun_verbs(self):
         nb = Notebook(seed=1)
         cid = handle(nb, {"tool": "add_cell", "src": "x = 1"})["id"]

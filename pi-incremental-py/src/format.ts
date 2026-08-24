@@ -5,6 +5,13 @@
  * cell; cached cells collapse to a single count line (the agent already
  * knows their values); pending/failing/globals tails appear only when
  * non-empty.
+ *
+ * The same renderers run a second time from `context-filter.ts`, against
+ * the structured copy of a response kept in a tool result's `details`, to
+ * re-render an old message with everything the kernel has since recomputed
+ * stripped out. That is what `RenderOptions` is for — one renderer in two
+ * modes rather than two renderers, so the collapsed view cannot drift from
+ * the format the model already learned.
  */
 
 export interface CellResult {
@@ -14,9 +21,11 @@ export interface CellResult {
 	value?: string | null;
 	error?: string | null;
 	output?: string;
+	/** Reads something it also defines, so its successive values are a history. */
+	stateful?: boolean;
 }
 
-interface MutatingResponse {
+export interface MutatingResponse {
 	ok: boolean;
 	error?: string;
 	results?: CellResult[];
@@ -27,32 +36,66 @@ interface MutatingResponse {
 	created?: string[];
 }
 
+/**
+ * How much of a response is still worth showing.
+ *
+ * Must stay a pure function of its inputs: re-rendering an old message
+ * changes the provider's cached prefix from that point on, so anything
+ * that varies between calls (a clock, a live duration) would re-break the
+ * cache on every request rather than once per supersession.
+ */
+export interface RenderOptions {
+	/** Cells a later message has since re-run. Their values are stale. */
+	superseded?: ReadonlySet<string>;
+	/** Include the globals/pending/failing tails. False on all but the newest. */
+	tails?: boolean;
+}
+
+/** What an older `inspect` becomes once a newer one has replaced it wholesale. */
+export const SUPERSEDED_INSPECT = "- inspect (superseded)";
+
 const MARK: Record<string, string> = { ran: "*", cached: "-", error: "!" };
 
-export function formatResults(resp: MutatingResponse): string {
+export function formatResults(resp: MutatingResponse, opts: RenderOptions = {}): string {
 	if (!resp.ok) return `Error: ${resp.error ?? "unknown"}`;
 	const lines: string[] = [];
 	if (resp.id) lines.push(`id: ${resp.id}`);
 	if (resp.created?.length) lines.push(`created: ${resp.created.join(", ")}`);
 
 	let cached = 0;
+	const superseded: string[] = [];
 	for (const r of resp.results ?? []) {
 		if (r.status === "cached") {
 			cached++;
 			continue;
 		}
+		// Two kinds of superseded result keep their line and lose only their
+		// stdout. An *error* is a fact about an attempt rather than a snapshot
+		// of state: unlike a value, it cannot be recovered by asking the kernel
+		// again. A *stateful* cell's old values are the record of an accumulator
+		// advancing, which is exactly what the agent asked for by writing one.
+		const stale = opts.superseded?.has(r.cell) ?? false;
+		if (stale && r.status === "ran" && !r.stateful) {
+			superseded.push(r.cell);
+			continue;
+		}
 		const ms = (r.seconds * 1000).toFixed(1);
 		const tail = r.status === "error" ? (r.error ?? "") : (r.value ?? "");
 		lines.push(`${MARK[r.status]} ${r.cell} ${r.status} ${ms}ms${tail ? `  ${tail}` : ""}`);
-		if (r.output?.trim()) lines.push(indent(r.output.trimEnd()));
+		if (!stale && r.output?.trim()) lines.push(indent(r.output.trimEnd()));
 	}
 	if (cached) lines.push(`- ${cached} cell${cached === 1 ? "" : "s"} cached (unchanged)`);
+	// One line for the whole batch: a run_all over a 20-cell notebook that has
+	// since been re-run would otherwise leave 20 marker lines behind.
+	if (superseded.length) lines.push(`- superseded: ${superseded.join(", ")}`);
 
-	if (resp.failing?.length) lines.push(`failing: ${resp.failing.join(", ")}`);
-	if (resp.pending?.length) lines.push(`pending: ${resp.pending.join(", ")}`);
-	const globals = Object.entries(resp.globals ?? {});
-	if (globals.length) {
-		lines.push(`globals: ${globals.map(([k, v]) => `${k}=${v}`).join(", ")}`);
+	if (opts.tails ?? true) {
+		if (resp.failing?.length) lines.push(`failing: ${resp.failing.join(", ")}`);
+		if (resp.pending?.length) lines.push(`pending: ${resp.pending.join(", ")}`);
+		const globals = Object.entries(resp.globals ?? {});
+		if (globals.length) {
+			lines.push(`globals: ${globals.map(([k, v]) => `${k}=${v}`).join(", ")}`);
+		}
 	}
 	return lines.join("\n") || "ok (nothing to run)";
 }

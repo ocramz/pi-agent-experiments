@@ -9,7 +9,7 @@ import { startPi, type PiSession } from "../../../shared/test/tui/pi-session.ts"
 
 const EXTENSION = resolve(import.meta.dirname, "..", "..", "extensions", "index.ts");
 
-export { AGENT_DIR } from "../../../shared/test/tui/pi-session.ts";
+export { AGENT_DIR, sessionFilesFor } from "../../../shared/test/tui/pi-session.ts";
 
 export interface Session extends PiSession {}
 
