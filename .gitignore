@@ -1,5 +1,8 @@
-node_modules/
-**/node_modules/
+# Secrets
+.env
+
+##################
+# # specific to pi-issue-tracker
 
 # Tracker state. The database is per-checkout and binary — committing it would
 # conflict on every merge once stories start producing commits.
@@ -10,7 +13,15 @@ node_modules/
 # Epic worktrees, if worktreeRoot is ever pointed inside the repo.
 .pi-worktrees/
 
-# The API key the container suite runs against. env.example is the tracked
-# template; the real file never is.
-.env
+##################
+# # js
 
+node_modules/
+**/node_modules/
+
+##################
+# # python 
+
+**/.venv/
+**/__pycache__/
+**/.ruff_cache/
