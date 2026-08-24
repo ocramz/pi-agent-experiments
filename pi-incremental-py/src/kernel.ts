@@ -28,16 +28,16 @@ const PY_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "py");
  * Resolution order:
  *  1. `PI_PYTHON` env var (escape hatch, e.g. tests).
  *  2. A preexisting interpreter/venv pinned by the user in
- *     `<cwd>/.pi/incremental-python` (one line: a python binary or a venv
+ *     `<cwd>/.incremental/python-pin` (one line: a python binary or a venv
  *     directory). Written by the `/py-python` command.
- *  3. A venv the extension creates and owns at `<cwd>/.pi/incremental-venv`,
+ *  3. A venv the extension creates and owns at `<cwd>/.incremental/venv`,
  *     bootstrapped from `python3` on PATH and kept out of the user's way
- *     (`.pi/` gets a `.gitignore` covering it).
+ *     (`.incremental/` gets a `.gitignore` covering it).
  */
 export function resolvePython(cwd: string): string {
 	if (process.env.PI_PYTHON) return process.env.PI_PYTHON;
 
-	const pinFile = join(cwd, ".pi", "incremental-python");
+	const pinFile = join(cwd, ".incremental", "python-pin");
 	if (existsSync(pinFile)) {
 		const pin = readFileSync(pinFile, "utf8").trim();
 		if (pin) {
@@ -46,14 +46,14 @@ export function resolvePython(cwd: string): string {
 		}
 	}
 
-	const venvPython = join(cwd, ".pi", "incremental-venv", "bin", "python");
+	const venvPython = join(cwd, ".incremental", "venv", "bin", "python");
 	if (!existsSync(venvPython)) {
 		const base = basePython();
 		if (!base) return "python3"; // nothing to build from; let spawn fail loudly
-		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		mkdirSync(join(cwd, ".incremental"), { recursive: true });
 		// Keep the venv (and the pin file) out of git and pi's file tools.
-		writeFileSync(join(cwd, ".pi", ".gitignore"), "incremental-venv/\nincremental-python\n");
-		const made = spawnSync(base, ["-m", "venv", join(cwd, ".pi", "incremental-venv")], {
+		writeFileSync(join(cwd, ".incremental", ".gitignore"), "venv/\npython-pin\n");
+		const made = spawnSync(base, ["-m", "venv", join(cwd, ".incremental", "venv")], {
 			encoding: "utf8",
 		});
 		if (made.status !== 0) return base; // venv unavailable: use the base as-is
@@ -62,8 +62,8 @@ export function resolvePython(cwd: string): string {
 }
 
 export function pinPython(cwd: string, interpreter: string): void {
-	mkdirSync(join(cwd, ".pi"), { recursive: true });
-	writeFileSync(join(cwd, ".pi", "incremental-python"), interpreter + "\n");
+	mkdirSync(join(cwd, ".incremental"), { recursive: true });
+	writeFileSync(join(cwd, ".incremental", "python-pin"), interpreter + "\n");
 }
 
 export function pythonCommand(): string {

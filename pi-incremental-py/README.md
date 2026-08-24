@@ -91,10 +91,10 @@ creating a cell; `/py add [name] <src>`, `/py rerun <id>`, `/py run-all`,
 `/py inspect`. Humans and the agent share one namespace.
 
 **Environment.** By default the extension creates and owns a
-project-scoped venv at `.pi/incremental-venv` (`.pi/` gets a
+project-scoped venv at `.incremental/venv` (`.incremental/` gets a
 `.gitignore`), so `py_install` never touches the user's interpreters.
 Pin a preexisting interpreter or venv with
-`/py-python /path/to/venv-or-python` (stored in `.pi/incremental-python`,
+`/py-python /path/to/venv-or-python` (stored in `.incremental/python-pin`,
 takes effect on kernel restart). `PI_PYTHON` overrides everything, e.g.
 for tests.
 

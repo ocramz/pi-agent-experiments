@@ -20,7 +20,7 @@ test("resolvePython creates a project-scoped venv on first use", async (t) => {
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	delete process.env.PI_PYTHON;
 	const py = resolvePython(dir);
-	assert.ok(py.includes(join(".pi", "incremental-venv")), `got ${py}`);
+	assert.ok(py.includes(join(".incremental", "venv")), `got ${py}`);
 	assert.equal(resolvePython(dir), py); // idempotent
 });
 

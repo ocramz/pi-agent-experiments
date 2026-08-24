@@ -214,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 				else console.log(msg);
 			};
 			if (!target) {
-				notify("Usage: /py-python /path/to/venv-or-python (pinned in .pi/incremental-python)");
+				notify("Usage: /py-python /path/to/venv-or-python (pinned in .incremental/python-pin)");
 				return;
 			}
 			pinPython(process.cwd(), target);

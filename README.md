@@ -6,6 +6,7 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 | | |
 |---|---|
 | [pi-issue-tracker/](pi-issue-tracker/) | Turns goals into linked, tracked user stories in a project-local SQLite database |
+| [pi-incremental-py/](pi-incremental-py/) | An incremental computing kernel for Python, plus the pi extension that drives it |
 | [shared/](shared/) | Version pins, the tsconfig base, and the shell + pty test harnesses |
 
 # Dev set up
