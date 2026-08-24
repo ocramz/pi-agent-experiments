@@ -26,11 +26,33 @@ curl --request POST \
   --data '{"query": "who is Leo Messi?", ...}'
 ```
 
+## Install
+
+```bash
+pi install npm:@ocramz/pi-web-search
+```
+
+Needs **Node 24 or later** — the package ships TypeScript and relies on
+Node's native type stripping, so there is no build step and nothing to
+compile.
+
+For local development, point pi at a checkout instead:
+
+```bash
+pi install /path/to/pi-web-search      # user settings, ~/.pi/agent/settings.json
+pi install -l /path/to/pi-web-search   # project settings, .pi/settings.json
+pi -e /path/to/pi-web-search           # this run only, nothing written
+```
+
+Project-scoped packages (`-l`) load only once the project is trusted; a
+user-scoped install has no such gate.
+
 ## Setup
 
-Export `TAVILY_API_KEY` before starting pi. A missing key is a readable
-tool result telling the model (and through it, you) what to set — never a
-crash.
+Export `TAVILY_API_KEY` before starting pi. Installing the package is not
+enough on its own: the key is a *runtime* requirement, read at tool-execute
+time rather than at load time. A missing key is a readable tool result
+telling the model (and through it, you) what to set — never a crash.
 
 ## Adding a backend
 

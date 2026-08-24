@@ -264,8 +264,8 @@ make the tier free, deterministic, and runnable on forked pull requests. It is n
 
 ## Packaging
 
-The package is installable with `pi install npm:pi-issue-tracker`. Three things about the
-manifest are easy to get wrong:
+The package is installable with `pi install npm:@ocramz/pi-issue-tracker`. Four things about
+the manifest are easy to get wrong:
 
 - **`pi.extensions` is the entry point**, not `main` or `exports`. There is no build step
   and nothing compiled: pi loads the raw `.ts` through jiti, and `engines.node >= 24`
@@ -274,8 +274,17 @@ manifest are easy to get wrong:
   `peerDependenciesMeta` as `optional`. Without the optional markers npm 7+ auto-installs
   them: a measured **239 MB** of `node_modules` beside a package that has no runtime
   dependencies at all. With them, nothing is installed.
-- **`files` is an allowlist.** `test/`, `tools/` and `tsconfig.json` are deliberately
-  outside it; the published tarball is fourteen files.
+- **The name is scoped, so `publishConfig.access` is mandatory.** npm defaults a scoped
+  package to `restricted`, and a package that reaches the registry private is a mistake with
+  no undo — you cannot re-publish a version. The scope exists because `pi-web-search` was
+  already taken on npm by an unrelated extension; scoping all three keeps the naming uniform
+  and makes that class of collision impossible.
+- **`files` is an allowlist**, with no `.npmignore` behind it. `test/`, `tools/` and
+  `tsconfig.json` are deliberately outside it; the published tarball is sixteen files. Note
+  that a *directory* entry matches everything beneath it, including whatever the toolchain
+  left there — `pi-incremental-py`'s `files: ["py/"]` silently shipped five
+  `__pycache__/*.pyc`, 77% of its tarball, before anyone looked. `shared/check-tarball.mjs`
+  is the check that now looks, on every CI run and via `make pack`.
 
 ## Token accounting
 

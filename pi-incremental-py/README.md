@@ -12,6 +12,43 @@ extension that drives it. One package, two halves:
   (`py_cell`, `py_kernel`, `py_install`) and the `/py` command family,
   backed by a long-lived kernel subprocess.
 
+## Install
+
+```bash
+pi install npm:@ocramz/pi-incremental-py
+```
+
+Needs **Node 24 or later** — the package ships TypeScript and relies on
+Node's native type stripping, so there is no build step and nothing to
+compile.
+
+It also needs a **CPython 3.12 or later** it can find, which the other
+extensions in this repo do not. That floor is not a preference: `py/kernel.py`
+reads comprehension scopes the way PEP 709 made them in 3.12, so on an older
+interpreter the dependency analysis is *wrong* rather than absent. The
+extension resolves one at first use, in this order — `PI_PYTHON`, an
+interpreter or venv pinned in `.incremental/python-pin` (set it with
+`/py-python`), or a venv it builds and owns at `.incremental/venv`,
+bootstrapped from a 3.12+ it finds on `PATH`. Nothing is installed into
+the user's own interpreters, and `.incremental/` is self-gitignoring.
+
+For local development, point pi at a checkout instead:
+
+```bash
+pi install /path/to/pi-incremental-py      # user settings, ~/.pi/agent/settings.json
+pi install -l /path/to/pi-incremental-py   # project settings, .pi/settings.json
+pi -e /path/to/pi-incremental-py           # this run only, nothing written
+```
+
+Project-scoped packages (`-l`) load only once the project is trusted; a
+user-scoped install has no such gate.
+
+The published tarball carries `py/kernel.py` and `py/protocol.py` — the
+kernel is resolved relative to the installed `src/`, so the Python half
+travels with the npm package and needs no separate install. `pyproject.toml`
+and `uv.lock` are for working *on* the kernel (ruff, hypothesis) and are
+deliberately not shipped.
+
 ## Kernel semantics
 
 - **Identity.** Cells get kernel-generated 6-char base32 ids. An optional

@@ -21,7 +21,7 @@ An extension for **pi** that turns a high-level goal into a linked, tracked set 
 ## Install
 
 ```bash
-pi install npm:pi-issue-tracker
+pi install npm:@ocramz/pi-issue-tracker
 ```
 
 Needs **Node 24 or later** — the package ships TypeScript and relies on Node's native type stripping, so there is no build step and nothing to compile.

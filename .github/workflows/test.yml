@@ -75,6 +75,12 @@ jobs:
       # to `any` and the check passes without proving anything — see the note in
       # shared/tsconfig.base.json.
       - run: npm run typecheck --if-present
+      # What `npm publish` would ship. `files` is an allowlist with no
+      # .npmignore behind it, and a directory entry there quietly matches
+      # whatever the toolchain left under it — which is how five .pyc files came
+      # to be 77% of pi-incremental-py's tarball. Runs here rather than in the
+      # release workflow as well as it: a tag is too late to find out.
+      - run: npm run pack-check --if-present
 
   tui:
     name: interactive (pty)

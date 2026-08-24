@@ -46,6 +46,7 @@ make test                 # host unit suites
 make typecheck            # types only, against pi's real declarations
 make test-tui             # interactive suites (pi's real TUI, in a pty)
 make test-container       # container suites
+make pack                 # what each package would publish (host only, no key)
 ```
 
 Every target except `test-image` runs over all of `PKGS`. Narrow any of them to one
@@ -95,9 +96,48 @@ quietly. `pi-web-search/test/tui/live.test.ts` does the same, and needs
    architecture diagnostics, the inner-store guard and the pinned digest. Set
    `REQUIRE_API_KEY=1` there only if one of those suites drives a model.
 
+5. **The publishing metadata**, if it is meant to reach npm: a `@ocramz/`-scoped `name`,
+   `publishConfig.access: "public"` (scoped packages default to private, and a published
+   version cannot be replaced), `homepage`/`bugs`, a `files` allowlist, `pi.extensions`, the
+   `pi-package` keyword, the four core pi packages as *optional* peer dependencies, and a
+   `pack-check` script. Copy [pi-web-search/package.json](pi-web-search/package.json) — it is
+   the smallest complete one. Then add an `## Install` section to its README.
+
 What is worth *not* sharing: fixtures, inspectors and live suites encode one extension's
 semantics, and are cheaper duplicated than abstracted. `shared/` is for things whose answer
 cannot differ between packages.
+
+## Releasing
+
+Each extension is published to npm independently, under the `@ocramz` scope.
+
+```bash
+make pack PKG=pi-web-search               # read the file list first
+$EDITOR pi-web-search/package.json        # bump "version"
+git commit -am "pi-web-search 0.2.0" && git push
+git tag pi-web-search-v0.2.0 && git push --tags
+```
+
+The tag is the release CI trigger :
+[.github/workflows/publish-npm.yml](.github/workflows/publish-npm.yml) parses
+`<directory>-v<version>` out of it, **refuses to publish if that version disagrees with
+package.json**, re-runs the two free tiers, checks the tarball, and publishes with a
+provenance attestation. The directory name is the tag prefix because a git ref cannot
+contain `@` or `/`.
+
+Two things to know:
+
+- **The first publish of a new package is manual.** npm's trusted-publisher setting lives on
+  an *existing* package, so there is nothing to configure until one exists. Publish it once
+  by hand (`npm publish --dry-run`, read the list, then `npm publish --access public`), then
+  set Trusted Publisher → GitHub Actions on npmjs.com for that package. Everything after
+  that goes through the tag, with no long-lived token stored in the repo.
+- **`files` is an allowlist and nothing else guards it.** A directory entry matches whatever
+  the toolchain left under it; `files: ["py/"]` once made five `__pycache__/*.pyc` into 77%
+  of a tarball. [shared/check-tarball.mjs](shared/check-tarball.mjs) runs on every CI run and
+  behind `make pack`, and also asserts the reverse — that everything `pi.extensions` names
+  actually survived into the tarball, since a package missing its own entry point installs
+  cleanly and fails at load.
 
 ## Where things live
 
