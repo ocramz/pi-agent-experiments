@@ -30,3 +30,8 @@ export PI_REVIEW_MODEL="${PI_REVIEW_MODEL:-${DEFAULT_PI_REVIEW_MODEL:-$PI_MODEL}
 # and both are load-bearing (lib.sh requires IMAGE; the Makefile exposes
 # TEST_IMAGE). Bridge them here rather than in each caller.
 export IMAGE="${IMAGE:-$TEST_IMAGE}"
+
+# pi-incremental-py's container tier runs against a second image: the one above
+# with a Python added. Empty until it is first published — run.sh builds locally
+# in that case, so an unset pin degrades to a slower run rather than a broken one.
+export PY_TEST_IMAGE="${PY_TEST_IMAGE:-$DEFAULT_PY_TEST_IMAGE}"

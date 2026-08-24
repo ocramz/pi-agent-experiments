@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(podman run *)",
+      "Bash(podman ps *)",
+      "Bash(podman exec *)",
+      "Bash(npm run *)",
+      "Bash(node -p \"JSON.stringify\\(\\(require\\('../shared/typecheck/node_modules/@earendil-works/pi-coding-agent/package.json'\\)\\),null,1\\)\")",
+      "WebFetch(domain:radicle.xyz)",
+      "WebFetch(domain:docs.radicle.xyz)"
+    ]
+  }
+}
