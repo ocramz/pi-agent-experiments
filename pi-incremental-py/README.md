@@ -1,17 +1,23 @@
 # pi-incremental-py
 
-An incremental computing kernel for Python, driven by the Pi agent over a
-JSON-lines protocol. The DAG is recovered statically with `symtable`
-(each cell's module-level defs and refs); editing a cell re-runs it and
-its downstream, with content-addressed early cutoff so a re-run that
-produces the same values recomputes nothing further.
+An incremental computing kernel for Python, plus the [Pi coding agent](https://pi.dev)
+extension that drives it. One package, two halves:
 
-## Semantics
+- **`py/`** — the kernel (stdlib-only Python 3.12+). Code is organised into
+  cells whose dependency graph is derived statically (`symtable`); editing a
+  cell re-runs it and its downstream, with content-addressed early cutoff,
+  versioned namespaces for stateful cells, and tracked package installs. A
+  JSON-lines protocol (`--serve`) exposes it to other processes.
+- **`extensions/`, `src/`** — the pi extension: three agent tools
+  (`py_cell`, `py_kernel`, `py_install`) and the `/py` command family,
+  backed by a long-lived kernel subprocess.
 
-- **Identity.** Cells get kernel-generated 6-char base32 ids (`k7x2qm`).
-  An optional `name` is display metadata, never a lookup key. Execution
-  order of independent cells is insertion order — never derived from ids.
-- **Create vs. modify.** `add_cell` always creates (and returns the id);
+## Kernel semantics
+
+- **Identity.** Cells get kernel-generated 6-char base32 ids. An optional
+  `name` is display metadata, never a lookup key. Execution order of
+  independent cells is insertion order.
+- **Create vs. modify.** `add_cell` always creates (returns the id);
   `set_cell` requires an existing id.
 - **Versioned namespaces.** A self-reference (`x = x + 1`) is a temporal
   edge: the cell reads the last committed version of its own defs, so
@@ -24,18 +30,20 @@ produces the same values recomputes nothing further.
   try:
       count = count + 1
   except NameError:
-      count = 0
+      count = None
   ```
 
-  converges between incremental runs and `run_all` replays.
-- **Builtin shadowing.** If a cell defines `len`, dependents of `len`
-  get a real DAG edge and re-run when it changes.
+  (`None` is the neutral "nothing yet"; pick whatever initial value the
+  cell should start from.) The try/except structure is what makes it
+  converge between incremental runs and `run_all` replays.
+- **Builtin shadowing.** If a cell defines `len`, dependents of `len` get
+  a real DAG edge and re-run when it changes.
 - **Failure isolation.** A cell that raises leaves its dependents
   `pending` (skipped, not poisoned); `failing` lists the broken ones.
   Cell stdout/stderr is captured into each result's `output` field and
   never touches the protocol stream.
 
-## Layout
+## Kernel layout
 
 - `py/reactive.py` — the core: `analyze` (symtable), `Notebook` (ids,
   staging with atomic rollback, versioned execution, topo-ordered run).
@@ -44,22 +52,6 @@ produces the same values recomputes nothing further.
 - `py/env_kernel.py` — `EnvNotebook`: the installed-distribution set as a
   synthetic root of the DAG (all-or-nothing by design), kernel-aware
   `install`.
-
-## Tooling
-
-Stdlib-only by design. With nothing but a Python 3.12+ interpreter:
-
-```bash
-python3 -m unittest discover -s tests     # run the tests
-python3 py/agent_kernel.py --serve        # speak the protocol on stdin/stdout
-```
-
-With [uv](https://docs.astral.sh/uv/) on the box:
-
-```bash
-uv run python -m unittest discover -s tests
-uvx ruff check py tests && uvx ruff format --check py tests
-```
 
 ## Protocol
 
@@ -79,12 +71,49 @@ mid-line).
                                   {"op": "delete", "id": "q3f9ma"}]}
 {"tool": "plan_edits", "edits": [{"op": "set", "id": "k7x2qm", "src": "..."}]}
 {"tool": "inspect"}
+{"tool": "eval", "src": "len(rows)"}        # no cell created; human-facing
 {"tool": "install", "packages": ["cowsay"], "upgrade": false}
 ```
 
-Mutating calls answer with `results` (per-cell `status` of
-`ran | cached | error`, plus `value`, `error`, `output`, `seconds`),
-`pending`, `failing`, and a `globals` summary; `add_cell`/`apply_edits`
-also return the generated `id`/`created` ids. `inspect` returns the full
-graph with `name`/`defines` beside every id, `stateful` flags, and the
-namespace summary.
+## The extension
+
+**Agent tools**
+
+- **`py_cell`** — create (omit `id`) or modify (`id` given) a cell;
+  `run: false` stages without executing.
+- **`py_kernel`** — `inspect` / `rerun` / `run_all` / `delete` /
+  `plan` / `apply` (atomic batches).
+- **`py_install`** — pip-install into the kernel's environment; importing
+  cells re-run automatically. Use instead of bash pip.
+
+**Human commands** — `/py <expr>` evaluates in the live namespace without
+creating a cell; `/py add [name] <src>`, `/py rerun <id>`, `/py run-all`,
+`/py inspect`. Humans and the agent share one namespace.
+
+**Environment.** By default the extension creates and owns a
+project-scoped venv at `.pi/incremental-venv` (`.pi/` gets a
+`.gitignore`), so `py_install` never touches the user's interpreters.
+Pin a preexisting interpreter or venv with
+`/py-python /path/to/venv-or-python` (stored in `.pi/incremental-python`,
+takes effect on kernel restart). `PI_PYTHON` overrides everything, e.g.
+for tests.
+
+## Tooling
+
+Python side is stdlib-only:
+
+```bash
+python3 -m unittest discover -s test-py    # kernel tests (46)
+python3 py/agent_kernel.py --serve         # speak the protocol on stdin/stdout
+```
+
+With uv: `uv run python -m unittest discover -s test-py`,
+`uvx ruff check py test-py`.
+
+Extension side (this repo's standard tiers):
+
+```bash
+npm test            # node unit tests (kernel subprocess, formatting)
+npm run typecheck   # tsc against pi's real declarations
+npm run test:tui    # pi's real TUI in a pty, incl. live model cases
+```

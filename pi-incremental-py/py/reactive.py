@@ -19,9 +19,16 @@ with an empty version store; the blessed accumulator idiom is
     try:
         x = x + 1
     except NameError:
-        x = 0
+        x = None
 
-which converges between incremental runs and full replays.
+`None` is the neutral "nothing yet" — the except branch exists so the
+cell is meaningful from scratch; pick whatever initial value the cell
+should start from. This converges between incremental runs and full
+replays.
+
+The kernel also supports `eval_src`: evaluate a snippet in the live
+namespace without creating a cell (no defs recorded, no graph impact) —
+used by human-facing `/py` interactions.
 """
 
 from __future__ import annotations
@@ -427,6 +434,37 @@ class Notebook:
         Jupyter cannot offer: there, a deleted cell's variables linger."""
         return self.apply([("delete", cid)], run=run)
 
+    # ---- side-effect-free evaluation
+
+    def eval_src(self, src: str) -> Result:
+        """Evaluate a snippet in the live namespace WITHOUT creating a
+        cell: nothing is staged, no defs are recorded, the graph is
+        untouched. A trailing expression becomes the value; defs the
+        snippet happens to make just land in ns (as in Jupyter), but no
+        cell owns them, so nothing depends on them."""
+        body, tail = compile_cell(src)
+        buf = io.StringIO()
+        started = perf_counter()
+        try:
+            with redirect_stdout(buf), redirect_stderr(buf):
+                exec(body, self.ns)
+                value = eval(tail, self.ns) if tail else None
+        except BaseException as exc:
+            return Result(
+                "<eval>",
+                "error",
+                perf_counter() - started,
+                error=f"{type(exc).__name__}: {exc}",
+                output=buf.getvalue(),
+            )
+        return Result(
+            "<eval>",
+            "ran",
+            perf_counter() - started,
+            value=brief(value),
+            output=buf.getvalue(),
+        )
+
     # ---- execution
 
     def _execute(self, cid: str) -> Result:
@@ -561,10 +599,18 @@ if __name__ == "__main__":
 
     print("\nstateful cell (versioned namespace):")
     acc, _ = nb.add(
-        "try:\n    count = count + 1\nexcept NameError:\n    count = 0", name="counter"
+        "try:\n    count = count + 1\nexcept NameError:\n    count = None",
+        name="counter",
     )
     nb.run()
     print(f"  after first run:  count={nb.ns['count']}")
+    nb.set(
+        acc,
+        "try:\n"
+        "    count = (0 if count is None else count + 1)\n"
+        "except NameError:\n"
+        "    count = 0",
+    )
     nb.rerun(acc)
     print(f"  after rerun:      count={nb.ns['count']}")
     nb.run_all()

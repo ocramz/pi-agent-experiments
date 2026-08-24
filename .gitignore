@@ -2,6 +2,7 @@
 .env
 
 ##################
+
 # # specific to pi-issue-tracker
 
 # Tracker state. The database is per-checkout and binary — committing it would

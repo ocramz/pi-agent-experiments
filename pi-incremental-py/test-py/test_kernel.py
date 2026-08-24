@@ -168,17 +168,19 @@ class TestNotebook(unittest.TestCase):
 
 
 class TestVersionedNamespaces(unittest.TestCase):
-    IDIOM = "try:\n    count = count + 1\nexcept NameError:\n    count = 0"
+    IDIOM = "try:\n    items = items + [1]\nexcept NameError:\n    items = None"
+    COUNTER = "try:\n    count = count + 1\nexcept NameError:\n    count = 0"
 
     def test_self_edge_advances_on_rerun(self):
         nb = Notebook(seed=1)
         acc, _ = nb.add(self.IDIOM, name="counter")
         nb.run()
-        self.assertEqual(nb.ns["count"], 0)
+        self.assertIsNone(nb.ns["items"])  # None: neutral "nothing yet"
+        nb.set(acc, "items = [] if items is None else items + [1]")
         nb.rerun(acc)
-        self.assertEqual(nb.ns["count"], 1)
+        self.assertEqual(nb.ns["items"], [1])
         nb.rerun(acc)
-        self.assertEqual(nb.ns["count"], 2)
+        self.assertEqual(nb.ns["items"], [1, 1])
 
     def test_stateful_flag(self):
         nb = Notebook(seed=1)
@@ -189,7 +191,7 @@ class TestVersionedNamespaces(unittest.TestCase):
 
     def test_failure_restores_committed_version(self):
         nb = Notebook(seed=1)
-        acc, _ = nb.add(self.IDIOM)
+        acc, _ = nb.add(self.COUNTER)
         nb.run()
         self.assertEqual(nb.ns["count"], 0)
         results = nb.set(acc, "count = count + 1 if count < 5 else boom")
@@ -200,7 +202,7 @@ class TestVersionedNamespaces(unittest.TestCase):
 
     def test_replay_converges(self):
         nb = Notebook(seed=1)
-        acc, _ = nb.add(self.IDIOM)
+        acc, _ = nb.add(self.COUNTER)
         nb.rerun(acc)
         nb.rerun(acc)
         self.assertEqual(nb.ns["count"], 2)
@@ -264,7 +266,7 @@ class TestCaching(unittest.TestCase):
 
     def test_stateful_cell_rekeys_on_rerun(self):
         nb = CachingNotebook(seed=1)
-        acc, _ = nb.add(self.IDIOM)
+        acc, _ = nb.add("try:\n    count = count + 1\nexcept NameError:\n    count = 0")
         nb.run()
         r1 = nb.rerun(acc)
         self.assertEqual(r1[0].status, "ran")  # key moved: previous version changed
@@ -283,6 +285,41 @@ class TestCaching(unittest.TestCase):
             sys.stdout = old
         self.assertEqual(out.getvalue(), "")
         self.assertIn("hello from cell", results[0].output)
+
+
+class TestEval(unittest.TestCase):
+    def test_eval_reads_namespace_without_creating_a_cell(self):
+        nb = CachingNotebook(seed=1)
+        nb.add("rows = [1, 2, 3]")
+        before = set(nb.cells)
+        r = nb.eval_src("len(rows)")
+        self.assertEqual(r.status, "ran")
+        self.assertEqual(r.value, "3")
+        self.assertEqual(set(nb.cells), before)
+        self.assertEqual(nb.pending, set())
+
+    def test_eval_defs_land_untracked(self):
+        nb = CachingNotebook(seed=1)
+        r = nb.eval_src("temp = 42")
+        self.assertEqual(r.status, "ran")
+        self.assertEqual(nb.ns["temp"], 42)
+        self.assertNotIn("temp", nb.provider)  # no cell owns it
+
+    def test_eval_error_shape(self):
+        nb = CachingNotebook(seed=1)
+        r = nb.eval_src("1/0")
+        self.assertEqual(r.status, "error")
+        self.assertIn("ZeroDivisionError", r.error)
+
+    def test_eval_via_protocol(self):
+        nb = CachingNotebook(seed=1)
+        handle(nb, {"tool": "add_cell", "src": "rows = [1]"})
+        resp = handle(nb, {"tool": "eval", "src": "len(rows)"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["value"], "1")
+        resp = handle(nb, {"tool": "eval", "src": "1/0"})
+        self.assertFalse(resp["ok"])
+        self.assertIn("ZeroDivisionError", resp["error"])
 
 
 class TestProtocol(unittest.TestCase):

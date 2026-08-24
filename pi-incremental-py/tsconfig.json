@@ -1,0 +1,10 @@
+{
+	// Everything but `include` lives in the shared base.
+	"extends": "../shared/tsconfig.base.json",
+	"include": [
+		"src/**/*.ts",
+		"extensions/**/*.ts",
+		"test/**/*.ts",
+		"../shared/test/tui/**/*.ts"
+	]
+}

@@ -199,6 +199,9 @@ def handle(nb: CachingNotebook, req: dict) -> dict:
                 return {"ok": True, "would_invalidate": sorted(nb.plan(edits))}
             case "inspect":
                 return {"ok": True, **nb.describe()}
+            case "eval":
+                r = nb.eval_src(req["src"])
+                return {"ok": r.status != "error", **asdict(r)}
             case "install":
                 install = getattr(nb, "install", None)
                 if install is None:
