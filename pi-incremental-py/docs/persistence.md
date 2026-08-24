@@ -24,9 +24,9 @@ derived optimisation.
   unit); per-notebook divergence is expressed as a separate notebook, not
   a branch.
 
-## The load-bearing observation
+## Lineage
 
-`CachingNotebook._key(cid)` is a hash of cell source plus the digests of all
+`Notebook._key(cid)` is a hash of cell source plus the digests of all
 inputs (transitively, via run-order key computation). **That key *is* the
 lineage.** Same key, same computation — across restarts, notebooks, and
 branches. Therefore:
@@ -37,6 +37,9 @@ branches. Therefore:
   don't touch its inputs.
 - Experiment branching needs only a commit DAG over cell-graph edits;
   values take care of themselves.
+
+"Across restarts" is a real constraint on `digest`: `digest` now walks nested code objects
+structurally, and must not process any memory addresses (otherwise digests change every time)
 
 ## Storage layout
 
@@ -132,7 +135,7 @@ poor cache, same reason pip/ccache don't use it) and every kernel semantic
 ## Layer 2 — persistent value cache (warm `run_all`)
 
 Nothing unpickles at restore. The cache hooks the existing freshness check
-in `CachingNotebook.run()`:
+in `Notebook.run()` (`_fresh`):
 
 - A pending cell whose key has `.incremental/cache/<key>.pkl` is **warm**:
   defs are loaded from pickle, result is `cached`, early cutoff propagates

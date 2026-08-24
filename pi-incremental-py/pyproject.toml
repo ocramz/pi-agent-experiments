@@ -5,21 +5,22 @@ description = "Incremental reactive notebook kernel for agent-driven Python sess
 requires-python = ">=3.12"
 
 # No runtime dependencies: the kernel is stdlib-only (ast, symtable, importlib).
-# Tests are stdlib unittest, so a bare interpreter works:
-#     python3 -m unittest discover -s tests
+# The unittest suite runs on a bare interpreter; the property suite needs
+# hypothesis and skips itself without it.
+#     python3 -m unittest discover -s test-py
 # With uv available:
-#     uv run python -m unittest discover -s tests
-#     uvx ruff check py tests
+#     uv run python -m unittest discover -s test-py
+#     uvx ruff check py test-py
 
 [dependency-groups]
-dev = ["ruff"]
+dev = ["ruff", "hypothesis"]
 
 [tool.ruff]
 target-version = "py312"
-src = ["py", "tests"]
+src = ["py", "test-py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["reactive", "agent_kernel", "env_kernel"]
+known-first-party = ["kernel", "protocol"]

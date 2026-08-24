@@ -45,13 +45,24 @@ extension that drives it. One package, two halves:
 
 ## Kernel layout
 
-- `py/reactive.py` — the core: `analyze` (symtable), `Notebook` (ids,
-  staging with atomic rollback, versioned execution, topo-ordered run).
-- `py/agent_kernel.py` — `CachingNotebook` (digest-keyed early cutoff),
-  the `handle`/`serve` JSON-lines protocol.
-- `py/env_kernel.py` — `EnvNotebook`: the installed-distribution set as a
-  synthetic root of the DAG (all-or-nothing by design), kernel-aware
-  `install`.
+Two modules, one `Notebook` class.
+
+- `py/kernel.py` — everything that determines a key or an edge: `analyze`
+  (symtable), `digest`/`env_digest`, and `Notebook` (ids, staging with
+  atomic rollback, versioned execution, topo-ordered run, digest-keyed
+  early cutoff, the installed-distribution set as a synthetic root of the
+  DAG).
+- `py/protocol.py` — the tool surface: the `handle`/`serve` JSON-lines
+  protocol, and `install` as a function over a notebook (pip acts on a
+  kernel; it is not part of one).
+
+A cell's cache key is a hash of its source plus the digests of every
+global it reads. Cells containing an `import` also mix in the digest of
+the installed distribution set, so `pip install` invalidates exactly the
+importing cells and their descendants — coarse, all-or-nothing, never
+wrong. Keys are pure content addresses: they must not vary between
+processes, which is why function digests walk nested code objects instead
+of `repr`-ing them.
 
 ## Protocol
 
@@ -100,14 +111,21 @@ for tests.
 
 ## Tooling
 
-Python side is stdlib-only:
+The kernel is stdlib-only:
 
 ```bash
-python3 -m unittest discover -s test-py    # kernel tests (46)
-python3 py/agent_kernel.py --serve         # speak the protocol on stdin/stdout
+python3 -m unittest discover -s test-py    # kernel tests (50)
+python3 py/protocol.py                     # speak the protocol on stdin/stdout
 ```
 
-With uv: `uv run python -m unittest discover -s test-py`,
+`test-py/test_properties.py` adds property-based tests (hypothesis, a dev
+dependency) for the laws the unit suite only spot-checks: incremental
+edits reach the same namespace as a from-scratch replay, early cutoff is
+invisible, a rejected batch changes nothing, `plan` bounds `apply`,
+failures isolate, and keys are content addresses. It skips itself when
+hypothesis is absent, so a bare interpreter still runs the other 50.
+
+With uv: `uv run python -m unittest discover -s test-py` (72 tests),
 `uvx ruff check py test-py`.
 
 Extension side (this repo's standard tiers):

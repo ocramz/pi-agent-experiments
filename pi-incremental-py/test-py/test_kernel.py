@@ -1,6 +1,6 @@
 """Stdlib-only tests for the reactive kernel. Run with:
 
-    python3 -m unittest discover -s tests
+    python3 -m unittest discover -s test-py
 
 No third-party packages required.
 """
@@ -11,14 +11,15 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
-from agent_kernel import CachingNotebook, handle  # noqa: E402
-from reactive import (  # noqa: E402
+from kernel import (  # noqa: E402
     CycleError,
     DuplicateNameError,
+    Edit,
     MultipleDefinitionError,
     Notebook,
     analyze,
 )
+from protocol import handle  # noqa: E402
 
 
 class TestAnalyze(unittest.TestCase):
@@ -140,7 +141,7 @@ class TestNotebook(unittest.TestCase):
 
     def test_plan_does_not_commit(self):
         nb, data, derived = self.build()
-        affected = nb.plan([("modify", data, "radius = 99")])
+        affected = nb.plan([Edit("set", id=data, src="radius = 99")])
         self.assertEqual(affected, {data, derived})
         self.assertEqual(nb.ns["radius"], 2)
 
@@ -220,7 +221,7 @@ class TestCaching(unittest.TestCase):
     IDIOM = "try:\n    count = count + 1\nexcept NameError:\n    count = 0"
 
     def build(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         config, _ = nb.add("source = 10", name="config")
         load, _ = nb.add("rows = [source, 2, 3]", name="load")
         report, _ = nb.add("sum(rows)", name="report")
@@ -265,7 +266,7 @@ class TestCaching(unittest.TestCase):
         self.assertIn(load, nb.pending)
 
     def test_stateful_cell_rekeys_on_rerun(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         acc, _ = nb.add("try:\n    count = count + 1\nexcept NameError:\n    count = 0")
         nb.run()
         r1 = nb.rerun(acc)
@@ -275,7 +276,7 @@ class TestCaching(unittest.TestCase):
     def test_stdout_captured_not_leaked(self):
         import io
 
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         out = io.StringIO()
         old = sys.stdout
         sys.stdout = out
@@ -287,9 +288,89 @@ class TestCaching(unittest.TestCase):
         self.assertIn("hello from cell", results[0].output)
 
 
+class TestEarlyCutoff(unittest.TestCase):
+    """A cached cell must not merely *report* `cached` — it must not run.
+
+    The side-effecting counter stands in for the expensive I/O this is
+    all for: a cell that costs 400ms should pay it once.
+    """
+
+    def test_refactor_with_same_value_does_not_re_execute(self):
+        nb = Notebook(seed=1)
+        counter = {"n": 0}
+        nb.ns["tick"] = counter
+        config, _ = nb.add("source = 10", name="config")
+        load, _ = nb.add("tick['n'] += 1\nrows = [source, 2, 3]", name="load")
+        self.assertEqual(counter["n"], 1)
+
+        # Same resulting value by a different route: `load` keeps its key.
+        results = nb.set(config, "base = 5\nsource = base * 2")
+        self.assertEqual({r.cell: r.status for r in results}[load], "cached")
+        self.assertEqual(counter["n"], 1)  # the work was genuinely skipped
+
+        # A genuinely different value moves the key and the work is paid.
+        nb.set(config, "source = 99")
+        self.assertEqual(counter["n"], 2)
+
+
+class TestEnvironmentIsATrackedInput(unittest.TestCase):
+    """The scenario env-tracking exists for: a cell whose source and
+    inputs never change still has to re-run when the environment moves.
+
+    Hermetic — `Notebook.env` is the whole interface to the installed
+    set, so moving it by hand is exactly what a pip install does."""
+
+    # Both branches bind both defs. A cell that leaves one of its defs
+    # unbound is never fresh (see `_fresh`), so it re-runs anyway and
+    # never goes stale — it is *this* well-behaved shape that needs the
+    # environment edge.
+    PROBE = (
+        "try:\n"
+        "    import cowsay\n"
+        "    backend = 'cowsay'\n"
+        "except ImportError:\n"
+        "    cowsay = None\n"
+        "    backend = 'plain'\n"
+    )
+
+    def build(self):
+        nb = Notebook(seed=1)
+        probe, _ = nb.add(self.PROBE, name="probe")
+        greet, _ = nb.add("message = f'rendering via {backend}'", name="greet")
+        plain, _ = nb.add("unrelated = 1", name="plain")
+        return nb, probe, greet, plain
+
+    def test_importing_cells_carry_an_environment_edge(self):
+        nb, probe, _, plain = self.build()
+        self.assertTrue(nb.cells[probe].imports)
+        self.assertFalse(nb.cells[plain].imports)
+
+    def test_environment_change_invalidates_exactly_the_importers(self):
+        nb, probe, greet, plain = self.build()
+        key_before = nb._key(probe)
+        nb.env = "pretend cowsay just landed"
+        self.assertNotEqual(nb._key(probe), key_before)
+        self.assertEqual(nb._key(plain), nb._key(plain))  # no env edge
+
+        # What install() does once the digest has moved.
+        nb.pending |= {probe} | nb.descendants(probe)
+        statuses = {r.cell: r.status for r in nb.run()}
+        self.assertEqual(statuses[probe], "ran")
+        self.assertNotIn(plain, statuses)  # untouched, not even considered
+
+    def test_a_still_environment_leaves_the_cell_cached(self):
+        # The hazard, stated positively: source and inputs never move, so
+        # without the env edge nothing would ever invalidate this cell.
+        nb, probe, _, _ = self.build()
+        before = nb._key(probe)
+        nb.pending.add(probe)
+        self.assertEqual({r.cell: r.status for r in nb.run()}[probe], "cached")
+        self.assertEqual(nb._key(probe), before)
+
+
 class TestEval(unittest.TestCase):
     def test_eval_reads_namespace_without_creating_a_cell(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         nb.add("rows = [1, 2, 3]")
         before = set(nb.cells)
         r = nb.eval_src("len(rows)")
@@ -299,20 +380,20 @@ class TestEval(unittest.TestCase):
         self.assertEqual(nb.pending, set())
 
     def test_eval_defs_land_untracked(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         r = nb.eval_src("temp = 42")
         self.assertEqual(r.status, "ran")
         self.assertEqual(nb.ns["temp"], 42)
         self.assertNotIn("temp", nb.provider)  # no cell owns it
 
     def test_eval_error_shape(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         r = nb.eval_src("1/0")
         self.assertEqual(r.status, "error")
         self.assertIn("ZeroDivisionError", r.error)
 
     def test_eval_via_protocol(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         handle(nb, {"tool": "add_cell", "src": "rows = [1]"})
         resp = handle(nb, {"tool": "eval", "src": "len(rows)"})
         self.assertTrue(resp["ok"])
@@ -324,19 +405,19 @@ class TestEval(unittest.TestCase):
 
 class TestProtocol(unittest.TestCase):
     def test_add_returns_generated_id(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         resp = handle(nb, {"tool": "add_cell", "src": "x = 1"})
         self.assertTrue(resp["ok"])
         self.assertRegex(resp["id"], r"^[a-z2-7]{6}$")
 
     def test_add_without_run_via_protocol(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         resp = handle(nb, {"tool": "add_cell", "src": "x = 1", "run": False})
         self.assertTrue(resp["ok"])
         self.assertIn(resp["id"], resp["pending"])
 
     def test_run_all_and_rerun_verbs(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         cid = handle(nb, {"tool": "add_cell", "src": "x = 1"})["id"]
         resp = handle(nb, {"tool": "rerun_cell", "id": cid})
         self.assertTrue(resp["ok"])
@@ -344,7 +425,7 @@ class TestProtocol(unittest.TestCase):
         self.assertTrue(resp["ok"])
 
     def test_apply_edits_dict_shape(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         resp = handle(
             nb,
             {
@@ -364,7 +445,7 @@ class TestProtocol(unittest.TestCase):
         self.assertTrue(resp["ok"])
 
     def test_plan_edits(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         a = handle(nb, {"tool": "add_cell", "src": "a = 1"})["id"]
         b = handle(nb, {"tool": "add_cell", "src": "b = a"})["id"]
         resp = handle(
@@ -374,7 +455,7 @@ class TestProtocol(unittest.TestCase):
         self.assertEqual(sorted(resp["would_invalidate"]), sorted([a, b]))
 
     def test_inspect_has_labels_and_pending(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         handle(nb, {"tool": "add_cell", "src": "x = 1", "name": "config"})
         resp = handle(nb, {"tool": "inspect"})
         self.assertIn("pending", resp)
@@ -382,7 +463,7 @@ class TestProtocol(unittest.TestCase):
         self.assertEqual(list(resp["names"].values()), ["config"])
 
     def test_expected_error_is_json_shaped(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         resp = handle(nb, {"tool": "nope"})
         self.assertFalse(resp["ok"])
         resp = handle(nb, {"tool": "set_cell", "id": "zzzzzz", "src": "x = 1"})
@@ -391,7 +472,7 @@ class TestProtocol(unittest.TestCase):
         self.assertNotIn("internal", resp)
 
     def test_unexpected_error_tagged_internal(self):
-        nb = CachingNotebook(seed=1)
+        nb = Notebook(seed=1)
         resp = handle(nb, {"tool": "apply_edits", "edits": None})
         self.assertFalse(resp["ok"])
         self.assertTrue(resp["internal"])

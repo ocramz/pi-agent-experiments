@@ -91,7 +91,7 @@ export class Kernel {
 	private readonly cwd: string;
 	private python: string | null = null;
 
-	constructor(script = join(PY_DIR, "agent_kernel.py"), cwd = process.cwd()) {
+	constructor(script = join(PY_DIR, "protocol.py"), cwd = process.cwd()) {
 		this.script = script;
 		this.cwd = cwd;
 	}
