@@ -131,7 +131,28 @@ With uv: `uv run python -m unittest discover -s test-py` (72 tests),
 Extension side (this repo's standard tiers):
 
 ```bash
-npm test            # node unit tests (kernel subprocess, formatting)
-npm run typecheck   # tsc against pi's real declarations
-npm run test:tui    # pi's real TUI in a pty, incl. live model cases
+npm test              # node unit tests (kernel subprocess, formatting)
+npm run typecheck     # tsc against pi's real declarations
+npm run test:tui      # pi's real TUI in a pty, incl. live model cases
+npm run test:container # the tiers below, in the image userland
 ```
+
+The container tier is offline — no model, no API key — because the live TUI
+cases already cover a model reaching `py_cell` and `py_install`. What it
+covers instead is the *environment*: a pristine filesystem with no
+`.incremental/`, an unprivileged uid, `HOME` on `/tmp`, and an interpreter
+with nothing in its site-packages.
+
+| suite | reaches |
+|---|---|
+| `test_kernel_in_image.sh` | `test-py/` on a bare interpreter — the only automated run it gets, and the only place "stdlib-only" is falsifiable |
+| `test_protocol_in_image.sh` | the JSON-lines protocol spoken over a pipe with no node in sight: early cutoff (with a control), failure isolation, surviving a bad request mid-stream, and the cache key being identical in two fresh processes |
+| `test_no_python.sh` | the pinned image, which has *no* Python: the kernel must answer with an actionable error instead of taking the pi session down |
+| `test_unit_in_image.sh` | the node unit suite where `resolvePython` has to build its venv from scratch as uid 65532 |
+| `test_install_in_image.sh` | a real PyPI install into a freshly built project venv, and the invalidation it implies — the importing cell re-runs, the plain one does not |
+
+It runs against a second image (the repo's pinned userland plus a 3.12+
+CPython), built from `test/container/Containerfile` and published by
+`.github/workflows/publish-py-image.yml`. Until `DEFAULT_PY_TEST_IMAGE` is
+pinned in [shared/versions.env](../shared/versions.env), `run.sh` builds it
+locally and says so.

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { Kernel, resolvePython } from "../src/kernel.ts";
+import { Kernel, MIN_PYTHON, interpreterVersion, resolvePython } from "../src/kernel.ts";
 import { formatEval, formatInspect, formatResults } from "../src/format.ts";
 
 // These tests drive the real Python kernel (stdlib-only python3, venv module).
@@ -70,6 +70,72 @@ test("kernel crash: next call respawns and flags lost state", async (t) => {
 		assert.equal(resp.ok, true);
 		assert.equal(k.lostState, true);
 		k.lostState = false;
+	} finally {
+		k.kill();
+	}
+});
+
+// A machine with no usable interpreter is not exotic — resolvePython falls
+// through to a bare "python3" when it finds nothing to build a venv from, and
+// the pinned container image has no Python at all. An ENOENT spawn emits
+// 'error' and never 'exit', so unhandled it is an uncaught exception that ends
+// the pi session, and the round trip would hang for the full timeout.
+test("a missing interpreter answers, promptly and by name", async (t) => {
+	const previous = process.env.PI_PYTHON;
+	process.env.PI_PYTHON = "/nonexistent/python";
+	t.after(() => {
+		if (previous === undefined) delete process.env.PI_PYTHON;
+		else process.env.PI_PYTHON = previous;
+	});
+
+	const { k } = kernelIn(t);
+	try {
+		const started = Date.now();
+		const resp = await k.call({ tool: "inspect" });
+		assert.equal(resp.ok, false);
+		assert.match(String(resp.error), /python not found: \/nonexistent\/python/);
+		// The way out has to be in the message: the agent sees only this text.
+		assert.match(String(resp.error), /py-python|PI_PYTHON/);
+		assert.ok(Date.now() - started < 5_000, "should not wait out the round-trip timeout");
+
+		// The failed handle keeps exitCode === null, so a second call must not
+		// be handed the same dead child and left waiting on a listener that
+		// will never fire again.
+		const again = await k.call({ tool: "inspect" });
+		assert.equal(again.ok, false);
+		assert.match(String(again.error), /python not found/);
+	} finally {
+		k.kill();
+	}
+});
+
+// The floor cannot be enforced from inside the Python: py/protocol.py uses
+// `match`, so on a pre-3.10 interpreter the module fails to parse and a
+// sys.version_info guard never runs. All the agent would see is a SyntaxError
+// on stderr and a kernel that exited. A stub interpreter stands in for the
+// conda/system 3.9 that is genuinely first on PATH on many machines.
+test("an interpreter below the floor is named, not left to SyntaxError", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-inc-old-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const stub = join(dir, "python3.9");
+	writeFileSync(stub, "#!/bin/sh\necho 3.9\n", { mode: 0o755 });
+
+	const previous = process.env.PI_PYTHON;
+	process.env.PI_PYTHON = stub;
+	t.after(() => {
+		if (previous === undefined) delete process.env.PI_PYTHON;
+		else process.env.PI_PYTHON = previous;
+	});
+
+	assert.deepEqual(interpreterVersion(stub), [3, 9]);
+	assert.equal(interpreterVersion(join(dir, "nope")), null);
+
+	const k = new Kernel(undefined, dir);
+	try {
+		const resp = await k.call({ tool: "inspect" });
+		assert.equal(resp.ok, false);
+		assert.match(String(resp.error), /python 3\.9 .* is too old/);
+		assert.match(String(resp.error), new RegExp(`${MIN_PYTHON[0]}\\.${MIN_PYTHON[1]}\\+`));
 	} finally {
 		k.kill();
 	}

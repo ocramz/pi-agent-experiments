@@ -1,0 +1,56 @@
+# The image the container tier runs in: the repo's pinned pi userland, plus a
+# Python the kernel can actually run under.
+#
+# Built and pushed by .github/workflows/publish-py-image.yml; consumed by digest
+# as DEFAULT_PY_TEST_IMAGE in shared/versions.env. Never referenced by a tag.
+#
+# Why a second image exists at all: the pinned test image has no Python — no
+# python3, no pip, no /usr/lib/python3*, nothing — so `py/protocol.py` cannot
+# start in it and every kernel semantic is unreachable. That absence is itself
+# worth testing (test_no_python.sh keeps running against the bare image), but it
+# cannot be the only thing the tier covers.
+#
+# Why this base and not the debian-slim one the dev image uses: that image is
+# published arm64-only, and CI is amd64. It also ships Debian 12's python3.11,
+# which is below this package's requires-python floor AND below PEP 709 — and
+# py/kernel.py's comprehension analysis is written against PEP 709 scoping, so
+# 3.11 would produce a subtly wrong dependency graph rather than an error.
+# Deriving from the distroless image the rest of the repo already tests against
+# means the tier exercises that exact userland, with one thing added.
+
+ARG BASE=ghcr.io/ocramz/pi-container-distroless-node24@sha256:597c258a8b963b975811c98b0a0a32a6faceb4bdd94b1c586e5db4797517512b
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.2
+ARG PY_VERSION=3.13
+
+FROM ${UV_IMAGE} AS uvbin
+
+# uv's standalone CPython builds are self-contained and glibc-compatible with
+# the distroless debian12 base, which is the only way to get a 3.12+ interpreter
+# into an image that has no package manager.
+FROM debian:bookworm-slim AS py
+ARG PY_VERSION
+COPY --from=uvbin /uv /usr/local/bin/uv
+
+# The interpreter is relocated to a fixed, arch-independent prefix rather than
+# symlinked onto PATH, and that is load-bearing: a PATH symlink makes
+# sys.executable land outside the interpreter's own prefix, and `python3 -m venv`
+# then builds a venv whose pyvenv.cfg home points at the symlink directory. The
+# venv is created, but ensurepip inside it dies with "Could not find platform
+# independent libraries" — so resolvePython's venv bootstrap fails at exactly
+# the step py_install depends on. Moving the prefix keeps bin/python3 a relative
+# symlink inside its own tree, which is the layout CPython expects.
+RUN UV_PYTHON_INSTALL_DIR=/opt/staging uv python install "${PY_VERSION}" \
+	&& mv /opt/staging/cpython-*-linux-*-gnu /opt/python3 \
+	&& chmod -R a+rX /opt/python3 \
+	&& /opt/python3/bin/python3 -c 'import venv, ensurepip, symtable'
+
+FROM ${BASE}
+COPY --from=py /opt/python3 /opt/python3
+
+# The base's PATH with one entry prepended. Spelled out because ENV replaces
+# rather than appends, and dropping /opt/pi/bin would take `pi` off PATH.
+ENV PATH=/opt/python3/bin:/opt/pi/bin:/nodejs/bin:/usr/local/bin:/usr/bin:/bin
+
+# ENTRYPOINT and USER are inherited on purpose: the base runs as uid 65532 and
+# entrypoints `pi`, which is what run_pi in shared/test/container/lib.sh invokes.
+# in_image overrides the entrypoint with --entrypoint /bin/bash itself.

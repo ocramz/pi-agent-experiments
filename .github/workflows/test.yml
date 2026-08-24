@@ -136,9 +136,16 @@ jobs:
       # digest and the model are written down.
     steps:
       - uses: actions/checkout@v4
-      - name: pull the pinned image
+      - name: pull the pinned images
         working-directory: .
-        run: SHARED_DIR=shared . shared/versions.sh && podman pull "$IMAGE"
+        # PY_TEST_IMAGE is pi-incremental-py's second image (the pinned userland
+        # plus a Python). It is empty until first published, and its run.sh
+        # builds locally in that case, so a missing pin must not fail the job
+        # for the package that does not use it either.
+        run: |
+          SHARED_DIR=shared . shared/versions.sh
+          podman pull "$IMAGE"
+          if [ -n "${PY_TEST_IMAGE:-}" ]; then podman pull "$PY_TEST_IMAGE"; fi
       # The runner's podman is not nested, so none of the Makefile's flags apply.
       # The git capability probe is not run here — the `image` job covers it once
       # for every package.
