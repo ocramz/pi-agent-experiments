@@ -65,6 +65,7 @@ import {
 	epicBranchName,
 	formatFindings,
 	isBranchEscapingCommand,
+	pruneStaleInjections,
 	reviewPlan,
 	reviewWork,
 	type ReviewFinding,
@@ -305,6 +306,12 @@ function isDbReady() {
 		return false;
 	}
 }
+
+/**
+ * The `customType` on every injected story context, shared by the producer in
+ * `before_agent_start` and the pruner in `context` so the two cannot drift.
+ */
+const STORY_CONTEXT_TYPE = "story-context";
 
 /**
  * The slice of an extension context that module-scope helpers need.
@@ -1047,11 +1054,26 @@ export default function (pi: ExtensionAPI) {
 
 		return {
 			message: {
-				customType: "story-context",
+				customType: STORY_CONTEXT_TYPE,
 				content: lines.join("\n"),
 				display: true,
 			},
 		};
+	});
+
+	// pi appends the message above and never replaces it: it lands in the
+	// transcript as a `custom` message and `convertToLlm` re-sends every one of
+	// them as a user message on every request. So the block naming #12 as "work
+	// on this now" is still being sent long after #12 closed, ahead of the block
+	// that supersedes it. Only the newest is current.
+	//
+	// `context` runs on a clone of the message array before each provider request,
+	// so pruning here leaves the session history, the TUI scrollback and the HTML
+	// export whole — it narrows only what the model is shown.
+	pi.on("context", async (event) => {
+		const messages = pruneStaleInjections(event.messages, STORY_CONTEXT_TYPE);
+		// Unchanged by identity: return bare, so the array reaches the next handler untouched.
+		return messages === event.messages ? undefined : { messages };
 	});
 
 	// ── Story Tool ──────────────────────────────────────────────────

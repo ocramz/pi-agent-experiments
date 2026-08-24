@@ -467,6 +467,42 @@ export function refsToPrune(refnames: string[], keep: number): string[] {
 	return [...refnames].sort((a, b) => stamp(b) - stamp(a)).slice(keep);
 }
 
+/**
+ * The two fields the pruner reads off a pi message.
+ *
+ * Structural rather than pi's own `AgentMessage`, for the reason at the top of
+ * this file: `src/` may not import from `@earendil-works/*`. The real union
+ * satisfies this shape, so the caller passes it straight through and gets its
+ * own element type back.
+ */
+export interface InjectedMessage {
+	role: string;
+	customType?: string;
+}
+
+/**
+ * Drop every injection of `customType` but the newest.
+ *
+ * pi appends what a `before_agent_start` handler returns and never replaces it,
+ * so a per-turn context block accumulates: after five turns the model is sent
+ * five of them, four naming work that is already closed, the stale ones first.
+ * Only the last is current.
+ *
+ * Returns the array unchanged — by identity, so the caller can tell — when there
+ * is nothing to prune. "Keep the newest" is an index predicate, not a fold:
+ * locate it once, then filter on position.
+ */
+export function pruneStaleInjections<T extends InjectedMessage>(messages: T[], customType: string): T[] {
+	const isInjection = (m: T): boolean => m.role === "custom" && m.customType === customType;
+	const oldest = messages.findIndex(isInjection);
+	const newest = messages.findLastIndex(isInjection);
+	// Coinciding ends mean none or one, and neither has anything stale behind it.
+	// The single-injection case is every early turn, so returning before the
+	// filter is what keeps the identity contract worth checking.
+	if (oldest === newest) return messages;
+	return messages.filter((m, i) => !isInjection(m) || i === newest);
+}
+
 /** Commands that would move the epic out from under the agent. Blocked while one is active. */
 export function isBranchEscapingCommand(command: string): boolean {
 	const normalized = command.trim().replace(/\s+/g, " ");

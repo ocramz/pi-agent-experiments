@@ -9,7 +9,7 @@ pi-issue-tracker/
   extensions/index.ts  → Extension factory (tool, commands, lifecycle, context injection, TUI)
   src/context.ts       → TrackerContext: paths, db, injected git/shell runners, clock
   src/config.ts        → Path resolution and the .pi/epic.json manifest
-  src/rules.ts         → Pure decisions: gates, naming, commit messages, undo strategy
+  src/rules.ts         → Pure decisions: gates, naming, commit messages, undo strategy, context pruning
   src/git.ts           → Git plumbing over an injected runner
   src/worktree.ts      → Worktree plumbing and database/git reconciliation
   src/epic.ts          → Epic lifecycle: start, commit, update, merge, cancel, undo
@@ -61,6 +61,7 @@ Two columns carry review and memory:
 - **`updateStory` builds its SET clause by interpolating object keys.** Safe today because every call site passes an object literal with `Story` keys, but it is a `${}` into SQL — do not spread untrusted tool params into it.
 - **`story_history` is write-only.** Every create/update/delete logs a row and `getHistory` can read them, but nothing surfaces it yet.
 - **Relevance is pluggable.** `RelatedStoriesStrategy` has three methods — `findRelated` (open stories), `findLearnings` (closed stories carrying a learning) and `findHandoffs` (any story carrying a handoff note). `keywordStrategy` scores word overlap plus structural boosts; swapping in embeddings means implementing the same interface. `findHandoffs` also scores against the *note's* text, not only the story's plan, because the note names exactly what the plan did not.
+- **pi appends injected context; it never replaces it.** What a `before_agent_start` handler returns lands in the transcript as a `custom` message, and `convertToLlm` re-sends every one of them as a user message on every subsequent request. Nothing dedupes by `customType`. So without intervention the block that named #12 as "work on this now" keeps being sent long after #12 closed, ahead of the block that supersedes it — five turns in, the model reads four stale orders before the current one, plus four more copies of the RELATED/LESSONS/HANDOFF sections that are capped per-turn precisely because they ride on every turn. The fix is the `context` hook, which runs on a *clone* of the message array before each provider request: `pruneStaleInjections` drops all but the newest there, so the session file, the TUI scrollback and the HTML export stay whole and only the model's view narrows. It returns its input by identity when there is nothing stale, and the handler passes that through as `undefined` so the array reaches the next extension untouched.
 - **A memory nothing reads is not a memory.** `story_history` is the cautionary tale directly above. Handoff notes have six read paths on purpose: the injected context, the story commit message, `storyToText` (so `list`/`search`/`get_next` show them), `/export-stories`, the board detail pane, and the epic roll-up in `closeCompletedParents`. The commit message matters most — there are no migrations, so `stories.db` is deleted whenever a column is added, and git history is the copy that survives.
 
 ## Git integration
