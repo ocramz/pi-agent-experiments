@@ -1,0 +1,52 @@
+{
+	"name": "pi-web-search",
+	"version": "0.1.0",
+	"description": "Web search for the pi agent: one agent tool per search backend. First backend: Tavily.",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"web-search",
+		"tavily"
+	],
+	"license": "MIT",
+	"type": "module",
+	"scripts": {
+		"test": "node --test 'test/*.test.ts'",
+		"typecheck": "npm --prefix ../shared/typecheck install --no-audit --no-fund --silent && npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && node ../shared/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+		"test:tui": "npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && ../shared/with-versions.sh node --test 'test/tui/*.test.ts'",
+		"test:container": "test/container/run.sh"
+	},
+	"author": "Marco Zocca",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ocramz/pi-agent-experiments.git",
+		"directory": "pi-web-search"
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"files": [
+		"extensions/",
+		"src/",
+		"LICENSE",
+		"README.md",
+		"package.json"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-ai": { "optional": true },
+		"@earendil-works/pi-coding-agent": { "optional": true },
+		"@earendil-works/pi-tui": { "optional": true },
+		"typebox": { "optional": true }
+	}
+}
