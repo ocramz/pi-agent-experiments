@@ -49,7 +49,7 @@ jobs:
       fail-fast: false
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
-        pkg: [pi-issue-tracker, pi-incremental-py]
+        pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [pi-issue-tracker, pi-incremental-py]
+        pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -93,6 +93,8 @@ jobs:
       # are the only coverage an extension's entry point has, and a run that
       # quietly left them out would be green over nothing.
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # pi-web-search's live tier refuses to start without this, same rule.
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -123,7 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [pi-issue-tracker, pi-incremental-py]
+        pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -131,6 +133,7 @@ jobs:
       # The live tier is the only coverage an extension's entry point has;
       # without a key run.sh refuses to start rather than quietly skipping it.
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       ENGINE: podman
       # IMAGE, PI_PROVIDER and PI_MODEL are deliberately absent: the shared
       # driver loads them from shared/versions.env, which is the only place the

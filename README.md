@@ -7,25 +7,35 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 |---|---|
 | [pi-issue-tracker/](pi-issue-tracker/) | Turns goals into linked, tracked user stories in a project-local SQLite database |
 | [pi-incremental-py/](pi-incremental-py/) | An incremental computing kernel for Python, plus the pi extension that drives it |
+| [pi-web-search/](pi-web-search/) | Web search as agent tools, one per backend, normalised into a shared result shape (first backend: Tavily) |
 | [shared/](shared/) | Version pins, the tsconfig base, and the shell + pty test harnesses |
 
-# Dev set up
+# Development
 
-For security, we run pi inside a container, and the test suite starts containers of
+## Secrets
+
+All secrets go in `.env` at the repo top level: `OPENROUTER_API_KEY` for every tier that drives a
+model, plus whatever an extension's own backend needs — `TAVILY_API_KEY` for
+[pi-web-search/](pi-web-search/).
+
+## Containers
+
+We run pi inside a container, and the test suite starts containers of
 its own, so the outer one needs a handful of flags to make nested podman work.
 The Makefile specifies all the flags.
 
 ```bash
-cp env.example .env       # then set OPENROUTER_API_KEY
-
 make dev                  # build + start the dev container, detached
 make shell                # a shell in it (or attach VS Code to "pi-dev")
 ```
 
-`make dev` mounts volumes :
-- this checkout at `/workspace`,
+### Dev container configuration and secrets
+NB: The dev container sources **all** secrets from `.env` and mounts the following volumes :
+- the current directory at `/workspace`,
 - a named volume for pi's credentials and sessions,
 - and a named volume for the inner podman's image store.
+
+
 
 ## Tests
 
@@ -63,7 +73,8 @@ model; the rest are local and free. See
 
 Without `.env`, `make` stops and says so; without `OPENROUTER_API_KEY` in it, the
 container and interactive suites exit rather than skipping their live cases
-quietly.
+quietly. `pi-web-search/test/tui/live.test.ts` does the same, and needs
+`TAVILY_API_KEY` as well as the model key.
 
 ## Adding an extension
 

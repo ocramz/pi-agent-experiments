@@ -51,7 +51,7 @@ fi
 # lib.sh splices USER_FLAGS into every `podman run` it issues, so this is the
 # whole of the hand-off inward. The distroless image points HOME and
 # PI_CODING_AGENT_DIR at read-only paths; /tmp is all uid 65532 can write.
-export USER_FLAGS="${USER_FLAGS:-} -e OPENROUTER_API_KEY -e PI_PROVIDER -e PI_MODEL -e HOME=/tmp -e PI_CODING_AGENT_DIR=/tmp/agent"
+export USER_FLAGS="${USER_FLAGS:-} -e OPENROUTER_API_KEY -e TAVILY_API_KEY -e PI_PROVIDER -e PI_MODEL -e HOME=/tmp -e PI_CODING_AGENT_DIR=/tmp/agent"
 
 if ! command -v "$ENGINE" >/dev/null 2>&1; then
 	echo "no container engine: '$ENGINE' is not on PATH" >&2
