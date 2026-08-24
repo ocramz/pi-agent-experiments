@@ -19,11 +19,20 @@ export interface PathOverrides {
 	manifestPath?: string;
 }
 
+/** Which model reviews stories. Both unset means self-review. */
+export interface ReviewerOverrides {
+	reviewProvider?: string;
+	reviewModel?: string;
+}
+
+/** Everything the `tracker` key in `.pi/settings.json` may carry. */
+export type TrackerSettings = PathOverrides & ReviewerOverrides;
+
 /** Project-local `.pi/settings.json`, under a `tracker` key. Absent or malformed is fine. */
-function readSettings(repoRoot: string): PathOverrides {
+function readSettings(repoRoot: string): TrackerSettings {
 	try {
 		const raw = readFileSync(join(repoRoot, ".pi", "settings.json"), "utf-8");
-		const parsed = JSON.parse(raw) as { tracker?: PathOverrides };
+		const parsed = JSON.parse(raw) as { tracker?: TrackerSettings };
 		return parsed.tracker ?? {};
 	} catch {
 		return {};
@@ -79,6 +88,62 @@ export async function resolvePaths(opts: {
 		join(repoRoot, ".pi", "epic.json");
 
 	return { repoRoot, dbPath, worktreeRoot, manifestPath };
+}
+
+/** Which model to review with. Null when none is configured — the self-review default. */
+export interface ReviewerChoice {
+	provider: string;
+	modelId: string;
+}
+
+/**
+ * Resolve the reviewer model, same precedence as `resolvePaths`:
+ *   1. explicit overrides   (tests)
+ *   2. environment          (containers, CI)
+ *   3. .pi/settings.json    (per project)
+ *
+ * Synchronous, unlike `resolvePaths`, because nothing here needs git.
+ *
+ * Both halves are required together. A provider with no model (or the reverse)
+ * is a half-finished configuration, and silently falling back to self-review
+ * would hide it — `describeReviewerConfig` reports that case so `session_start`
+ * can say so out loud.
+ */
+export function resolveReviewer(opts: {
+	repoRoot: string;
+	overrides?: ReviewerOverrides;
+	env?: NodeJS.ProcessEnv;
+}): ReviewerChoice | null {
+	const { provider, modelId } = readReviewerFields(opts);
+	if (!provider || !modelId) return null;
+	return { provider, modelId };
+}
+
+/** Why there is no reviewer, when the configuration looks like there should be one. */
+export function describeReviewerConfig(opts: {
+	repoRoot: string;
+	overrides?: ReviewerOverrides;
+	env?: NodeJS.ProcessEnv;
+}): { ok: true } | { ok: false; reason: string } {
+	const { provider, modelId } = readReviewerFields(opts);
+	if (provider && modelId) return { ok: true };
+	if (!provider && !modelId) return { ok: true };
+	const missing = provider ? "reviewModel / PI_TRACKER_REVIEW_MODEL" : "reviewProvider / PI_TRACKER_REVIEW_PROVIDER";
+	return { ok: false, reason: `${missing} is not set — a reviewer needs both a provider and a model` };
+}
+
+function readReviewerFields(opts: {
+	repoRoot: string;
+	overrides?: ReviewerOverrides;
+	env?: NodeJS.ProcessEnv;
+}): { provider: string | undefined; modelId: string | undefined } {
+	const { repoRoot, overrides = {}, env = process.env } = opts;
+	const settings = readSettings(repoRoot);
+	const blank = (value: string | undefined) => (value && value.trim() ? value.trim() : undefined);
+	return {
+		provider: blank(overrides.reviewProvider) ?? blank(env.PI_TRACKER_REVIEW_PROVIDER) ?? blank(settings.reviewProvider),
+		modelId: blank(overrides.reviewModel) ?? blank(env.PI_TRACKER_REVIEW_MODEL) ?? blank(settings.reviewModel),
+	};
 }
 
 /** The declared setup manifest. Every field is optional; a missing file is an empty manifest. */

@@ -75,4 +75,20 @@ describe("/export-stories", () => {
 
 		assert.equal(s.exists("stories.md"), false, "an empty database exports nothing");
 	});
+
+	/**
+	 * The export is one of the read paths that keeps handoff notes from becoming
+	 * another write-only table, and the only one a human reads outside the TUI.
+	 */
+	it("C6 carries review verdicts and handoff notes into the markdown", async (t) => {
+		const s = await session(t, "withHandoffs");
+		await s.command("/export-stories");
+		await s.expect("Exported 4 stories to");
+		await s.close();
+
+		const exported = s.read("stories.md");
+		assert.match(exported, /\*\*Handoff:\*\* the widget model lives in model\.ts/, "the handoff note is exported");
+		assert.match(exported, /\*\*Plan review:\*\* approved — by self/, "the plan verdict is exported");
+		assert.match(exported, /\*\*Work review:\*\* approved — by stub\/reviewer-1/, "and who reached it");
+	});
 });

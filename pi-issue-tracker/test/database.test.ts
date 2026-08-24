@@ -13,12 +13,16 @@ import {
 	getEpicBranchByPath,
 	getEpicBranchesByState,
 	getLastMergedEpicBranch,
+	getStoriesWithHandoffNotes,
+	getStoryById,
 	getStoryCommit,
 	getStoryCommitsForEpic,
+	missingStoryColumns,
 	openDb,
 	recordStoryCommit,
 	recordStoryStart,
 	updateEpicBranch,
+	updateStory,
 } from "../src/database.ts";
 
 const dirs: string[] = [];
@@ -225,5 +229,139 @@ describe("story_commits", () => {
 			getStoryCommitsForEpic(db, 12).map((r) => r.story_id),
 			[13, 14],
 		);
+	});
+});
+
+describe("stories: review and handoff columns", () => {
+	const make = (db: ReturnType<typeof tempDb>, overrides: Record<string, unknown> = {}) =>
+		createStory(db, {
+			title: "Add auth",
+			sub_goal: "sign in",
+			proposed_changes: "a login route",
+			status: "draft",
+			priority: 0,
+			parent_id: null,
+			next_id: null,
+			depends_on: [],
+			...overrides,
+		});
+
+	it("defaults review to an empty object and handoff_notes to null", () => {
+		const story = make(tempDb());
+		assert.deepEqual(story.review, {});
+		assert.equal(story.handoff_notes, null);
+	});
+
+	/**
+	 * updateStory builds its SET clause from object keys and JSON-encodes only
+	 * the columns it knows are JSON. A column missing from that set binds
+	 * "[object Object]" and the write is lost silently — which is exactly what
+	 * this asserts against.
+	 */
+	it("round-trips a review record through updateStory", () => {
+		const db = tempDb();
+		const story = make(db);
+		const record = { verdict: "approved" as const, findings: "scope is clear", by: "anthropic/x", at: 1700 };
+		const updated = updateStory(db, story.id, { review: { plan: record } });
+		assert.deepEqual(updated?.review.plan, record);
+		assert.deepEqual(getStoryById(db, story.id)?.review.plan, record, "and survives a re-read");
+	});
+
+	it("keeps both gates independently", () => {
+		const db = tempDb();
+		const story = make(db);
+		updateStory(db, story.id, { review: { plan: { verdict: "approved", findings: "a", by: "self", at: 1 } } });
+		const before = getStoryById(db, story.id)!;
+		updateStory(db, story.id, {
+			review: { ...before.review, work: { verdict: "changes_requested", findings: "b", by: "self", at: 2 } },
+		});
+		const after = getStoryById(db, story.id)!;
+		assert.equal(after.review.plan?.verdict, "approved");
+		assert.equal(after.review.work?.verdict, "changes_requested");
+	});
+
+	it("reads a malformed review blob as empty rather than making the story unreadable", () => {
+		const db = tempDb();
+		const story = make(db);
+		db.prepare("UPDATE stories SET review = ? WHERE id = ?").run("not json at all", story.id);
+		assert.deepEqual(getStoryById(db, story.id)?.review, {});
+	});
+
+	it("round-trips handoff_notes", () => {
+		const db = tempDb();
+		const story = make(db);
+		updateStory(db, story.id, { handoff_notes: "the limiter is keyed by IP" });
+		assert.equal(getStoryById(db, story.id)?.handoff_notes, "the limiter is keyed by IP");
+	});
+});
+
+describe("getStoriesWithHandoffNotes", () => {
+	const make = (db: ReturnType<typeof tempDb>, title: string) =>
+		createStory(db, {
+			title,
+			sub_goal: "",
+			proposed_changes: "",
+			status: "draft",
+			priority: 0,
+			parent_id: null,
+			next_id: null,
+			depends_on: [],
+		});
+
+	it("returns nothing when no story has a note", () => {
+		const db = tempDb();
+		make(db, "one");
+		assert.deepEqual(getStoriesWithHandoffNotes(db), []);
+	});
+
+	it("excludes null and whitespace-only notes", () => {
+		const db = tempDb();
+		const blank = make(db, "blank");
+		const real = make(db, "real");
+		updateStory(db, blank.id, { handoff_notes: "   " });
+		updateStory(db, real.id, { handoff_notes: "something worth knowing" });
+		const found = getStoriesWithHandoffNotes(db);
+		assert.equal(found.length, 1);
+		assert.equal(found[0].id, real.id);
+	});
+
+	it("orders by most recently updated first", () => {
+		const db = tempDb();
+		const first = make(db, "first");
+		const second = make(db, "second");
+		updateStory(db, first.id, { handoff_notes: "older" });
+		db.prepare("UPDATE stories SET updated_at = ? WHERE id = ?").run(1000, first.id);
+		updateStory(db, second.id, { handoff_notes: "newer" });
+		db.prepare("UPDATE stories SET updated_at = ? WHERE id = ?").run(2000, second.id);
+		assert.deepEqual(
+			getStoriesWithHandoffNotes(db).map((s) => s.id),
+			[second.id, first.id],
+		);
+	});
+});
+
+describe("missingStoryColumns", () => {
+	it("reports nothing against a database this version created", () => {
+		assert.deepEqual(missingStoryColumns(tempDb()), []);
+	});
+
+	/**
+	 * INIT_SQL is all CREATE TABLE IF NOT EXISTS and there are no migrations, so
+	 * a database written before these columns existed keeps its old shape. The
+	 * extension detects that and prints the documented fix instead of throwing
+	 * `no such column` on every turn.
+	 */
+	it("names the columns an older database is missing", () => {
+		const db = tempDb();
+		db.exec("DROP TABLE stories");
+		db.exec(`CREATE TABLE stories (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			title TEXT NOT NULL, sub_goal TEXT NOT NULL, proposed_changes TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'draft', priority INTEGER NOT NULL DEFAULT 0,
+			parent_id INTEGER, next_id INTEGER, depends_on TEXT NOT NULL DEFAULT '[]',
+			resolution TEXT, resolution_note TEXT, learnings TEXT,
+			created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0
+		)`);
+		assert.deepEqual(missingStoryColumns(db), ["review", "handoff_notes"]);
 	});
 });

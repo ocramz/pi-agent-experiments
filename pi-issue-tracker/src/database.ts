@@ -10,6 +10,7 @@ import {
 	type StoryCommit,
 	type StoryHistoryEntry,
 	type StoryResolution,
+	type StoryReview,
 } from "./types.ts";
 
 /** node:sqlite does not export SQLInputValue; this covers everything we bind. */
@@ -29,6 +30,10 @@ CREATE TABLE IF NOT EXISTS stories (
   resolution TEXT,
   resolution_note TEXT,
   learnings TEXT,
+  -- Plan and work review records. JSON for the same reason epic_branches.setup
+  -- is: new fields land here, not in a migration.
+  review TEXT NOT NULL DEFAULT '{}',
+  handoff_notes TEXT,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
   updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
 );
@@ -133,15 +138,48 @@ function rowToStory(row: Record<string, unknown>): Story {
 		resolution: (row.resolution as StoryResolution | null) ?? null,
 		resolution_note: (row.resolution_note as string | null) ?? null,
 		learnings: (row.learnings as string | null) ?? null,
+		review: parseReview(row.review),
+		handoff_notes: (row.handoff_notes as string | null) ?? null,
 		created_at: row.created_at as number,
 		updated_at: row.updated_at as number,
 	};
 }
 
-/** Outcome fields default to null, so most callers can omit them. */
+/**
+ * A malformed `review` blob must not make a story unreadable.
+ *
+ * The column is written by us and defaults to '{}', so this should never fire —
+ * but a story that cannot be read is a story that cannot be fixed, and the
+ * whole board renders through this function.
+ */
+function parseReview(raw: unknown): StoryReview {
+	if (typeof raw !== "string" || raw.trim() === "") return {};
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+		return parsed as StoryReview;
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Outcome fields default to null, so most callers can omit them.
+ *
+ * `review` and `handoff_notes` are not in the INSERT at all — the column
+ * defaults ('{}' and NULL) are right at creation, and `RETURNING *` feeds
+ * `rowToStory` either way. A caller wanting either sets it with `updateStory`.
+ */
 export type CreateStoryInput = Omit<
 	Story,
-	"id" | "created_at" | "updated_at" | "resolution" | "resolution_note" | "learnings"
+	| "id"
+	| "created_at"
+	| "updated_at"
+	| "resolution"
+	| "resolution_note"
+	| "learnings"
+	| "review"
+	| "handoff_notes"
 > &
 	Partial<Pick<Story, "resolution" | "resolution_note" | "learnings">>;
 
@@ -177,12 +215,17 @@ export function updateStory(db: DatabaseSync, id: number, updates: Partial<Omit<
 	const setClauses: string[] = [];
 	const values: SqlValue[] = [];
 
+	// Columns holding JSON rather than a scalar. Missing one here binds
+	// "[object Object]" into the column, which round-trips as an empty value and
+	// loses the write silently.
+	const JSON_COLUMNS = new Set(["depends_on", "review"]);
+
 	for (const [key, value] of Object.entries(updates)) {
 		// Skip absent keys before dispatching on name — `JSON.stringify(undefined)`
 		// is `undefined`, which cannot be bound as a SQLite parameter.
 		if (value === undefined) continue;
 		setClauses.push(`${key} = ?`);
-		values.push(key === "depends_on" ? JSON.stringify(value) : (value as SqlValue));
+		values.push(JSON_COLUMNS.has(key) ? JSON.stringify(value) : (value as SqlValue));
 	}
 	if (setClauses.length === 0) return existing;
 
@@ -252,6 +295,40 @@ export function getStoriesWithLearnings(db: DatabaseSync): Story[] {
 	);
 	const rows = stmt.all() as Record<string, unknown>[];
 	return rows.map(rowToStory);
+}
+
+/**
+ * Stories carrying a handoff note, most recently updated first.
+ *
+ * Deliberately not filtered to closed stories, unlike `getStoriesWithLearnings`:
+ * `closeCompletedParents` writes a rolled-up note onto an epic as it closes, and
+ * a note on an in-progress story is exactly what somebody picking it up needs.
+ */
+export function getStoriesWithHandoffNotes(db: DatabaseSync): Story[] {
+	const stmt = db.prepare(
+		"SELECT * FROM stories WHERE handoff_notes IS NOT NULL AND TRIM(handoff_notes) != '' ORDER BY updated_at DESC",
+	);
+	const rows = stmt.all() as Record<string, unknown>[];
+	return rows.map(rowToStory);
+}
+
+/**
+ * Whether this database predates a column the code now reads.
+ *
+ * `INIT_SQL` is all `CREATE TABLE IF NOT EXISTS`, so it is a no-op against an
+ * existing file and new columns never appear there — that is the documented
+ * no-migration invariant. This only *detects* the mismatch, so the extension can
+ * print the documented fix instead of throwing `no such column` on every turn.
+ */
+export function missingStoryColumns(db: DatabaseSync): string[] {
+	const expected = ["review", "handoff_notes"];
+	try {
+		const rows = db.prepare("PRAGMA table_info(stories)").all() as { name: string }[];
+		const present = new Set(rows.map((row) => row.name));
+		return expected.filter((column) => !present.has(column));
+	} catch {
+		return [];
+	}
 }
 
 /** Highest priority currently in use, or -1 when the table is empty. */

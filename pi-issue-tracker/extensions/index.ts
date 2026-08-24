@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -22,6 +22,7 @@ import {
 	getEpicBranch,
 	getLastMergedEpicBranch,
 	hasChildren,
+	missingStoryColumns,
 	openDb,
 	searchStories,
 	setAppState,
@@ -30,14 +31,17 @@ import {
 	updateStory,
 	wouldCreateCycle,
 } from "../src/database.ts";
-import type { Story } from "../src/types.ts";
-import { STORY_RESOLUTIONS } from "../src/types.ts";
+import type { ReviewVerdict, Story } from "../src/types.ts";
+import { REVIEW_VERDICTS, STORY_RESOLUTIONS } from "../src/types.ts";
 import { keywordStrategy } from "../src/related.ts";
-import { resolvePaths } from "../src/config.ts";
-import type { GitRunner, NotifyLevel, ShellRunner, TrackerContext } from "../src/context.ts";
+import { describeReviewerConfig, resolvePaths, resolveReviewer, type ReviewerChoice } from "../src/config.ts";
+import type { GitRunner, NotifyLevel, ReviewerRunner, ShellRunner, TrackerContext } from "../src/context.ts";
+import { decideReview, type ReviewGate } from "../src/review.ts";
+import { extractJsonArray } from "../src/json.ts";
 import { currentBranch, isDirty, probeRepo, revParse, withLockRetry, type RepoInfo } from "../src/git.ts";
 import {
 	cancelEpic,
+	collectWorkEvidence,
 	commitStory,
 	ensureDatabaseIgnored,
 	epicCwd,
@@ -59,7 +63,11 @@ import {
 	checkCanStartEpic,
 	checkpointRefPrefix,
 	epicBranchName,
+	formatFindings,
 	isBranchEscapingCommand,
+	reviewPlan,
+	reviewWork,
+	type ReviewFinding,
 } from "../src/rules.ts";
 import type { EpicBranch, EpicMode } from "../src/types.ts";
 import { branchCheckoutLocation, findMissingWorktrees, listWorktrees } from "../src/worktree.ts";
@@ -75,6 +83,21 @@ let tracker: TrackerContext | null = null;
 let repo: RepoInfo | null = null;
 /** Set once at registration, so module-scope helpers can talk back to the agent. */
 let host: ExtensionAPI | null = null;
+/**
+ * Which model reviews stories, or null for self-review.
+ *
+ * Only the *choice* is cached. The runner that uses it is built from whichever
+ * live context is calling, because `ctx.modelRegistry` belongs to one context
+ * and a tracker outlives several.
+ */
+let reviewerChoice: ReviewerChoice | null = null;
+/**
+ * Reviewer tokens, accumulated across the session.
+ *
+ * A tool's model calls have the same blind spot `/plan-stories` documents: they
+ * never become session entries, so pi's footer counter cannot see them.
+ */
+let reviewUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
 /**
  * The epic *this session* is working on, resolved from where the session stands.
@@ -259,6 +282,15 @@ function storyToText(story: Story, compact = true): string {
 		if (story.learnings) {
 			lines.push(`  Learned: ${story.learnings}`);
 		}
+		for (const gate of ["plan", "work"] as const) {
+			const record = story.review[gate];
+			if (record) {
+				lines.push(`  ${gate === "plan" ? "Plan" : "Work"} review: ${record.verdict} (by ${record.by})`);
+			}
+		}
+		if (story.handoff_notes) {
+			lines.push(`  Handoff: ${story.handoff_notes}`);
+		}
 	} else {
 		lines[0] += ` — ${truncate(story.sub_goal, 60)}`;
 	}
@@ -378,6 +410,116 @@ async function transitionStatus(
 	return after;
 }
 
+// ─── Review ─────────────────────────────────────────────────────────
+
+/**
+ * Build a reviewer from the context that is calling, or null for self-review.
+ *
+ * `ctx.modelRegistry` is reachable from a *tool*, not only a command — which is
+ * the whole reason an independent reviewer can run without breaking the agent's
+ * autonomy. `ToolDefinition.execute` receives an `ExtensionContext`, and that
+ * carries the registry.
+ *
+ * Built per call rather than cached on the tracker: the registry belongs to one
+ * live context, and the tracker outlives several.
+ */
+function buildReviewer(ctx: ExtensionContext): ReviewerRunner | null {
+	const choice = reviewerChoice;
+	if (!choice) return null;
+
+	const registry = ctx.modelRegistry;
+	const model = registry.find(choice.provider, choice.modelId);
+	if (!model) return null;
+
+	return async (req, signal) => {
+		try {
+			const response = await registry.complete(
+				model,
+				{
+					systemPrompt: req.systemPrompt,
+					messages: [
+						{ role: "user" as const, content: [{ type: "text" as const, text: req.prompt }], timestamp: Date.now() },
+					],
+				},
+				{ sessionId: reviewSessionId, signal },
+			);
+			// Aborted and truncated replies still burn tokens, so bank usage before
+			// deciding whether the text is usable.
+			addUsage(reviewUsage, response.usage);
+			if (response.stopReason === "aborted") return { ok: false, error: "the review was aborted" };
+			const text = response.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n")
+				.trim();
+			if (response.stopReason === "length") {
+				return { ok: false, error: "the reviewer hit its output limit before finishing" };
+			}
+			return { ok: true, text, model: `${choice.provider}/${choice.modelId}`, usage: response.usage };
+		} catch (err) {
+			// The runner contract is resolve-never-throw, matching GitRunner.
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	};
+}
+
+/** One id for every review call in this session, as `/plan-stories` does for planning. */
+const reviewSessionId = randomUUID();
+
+function reportReviewUsage(ctx: UiContext): void {
+	if (!hasUsage(reviewUsage)) return;
+	const label = reviewerChoice ? `review ${reviewerChoice.modelId}` : "review";
+	ctx.ui.setStatus("issue-tracker-review", `${label} ${formatUsage(reviewUsage)}`);
+}
+
+/** The mechanical findings for a gate, plus whatever evidence the reviewer should see. */
+async function gatherFindings(
+	db: DatabaseSync,
+	story: Story,
+	gate: ReviewGate,
+): Promise<{ findings: ReviewFinding[]; evidence?: string }> {
+	if (gate === "plan") {
+		return {
+			findings: reviewPlan({
+				story,
+				children: getChildren(db, story.id),
+				all: getAllStories(db),
+				similar: ensureTracker().related.findRelated(db, story, 3),
+			}),
+		};
+	}
+
+	const tracked = ensureTracker();
+	const epic = findEpicForStory(tracked, story.id);
+	if (!epic) {
+		// No epic means no working tree to inspect and no commit to make. The plan
+		// gate still applies; there is simply nothing mechanical to check here.
+		return {
+			findings: [
+				{
+					severity: "note",
+					message: "this story is not under a started epic, so there is no working tree to review. Ask the user to run /start-epic.",
+				},
+			],
+		};
+	}
+
+	const evidence = await serializeGit(() => collectWorkEvidence(tracked, epic));
+	const findings = reviewWork({
+		story,
+		changedFiles: evidence.changedFiles,
+		totalBytes: evidence.totalBytes,
+		verify: evidence.verify,
+	});
+
+	const lines = [`Files changed (${evidence.changedFiles.length}):`, ...evidence.changedFiles.slice(0, 50).map((f) => `  ${f}`)];
+	if (evidence.changedFiles.length > 50) lines.push(`  … ${evidence.changedFiles.length - 50} more`);
+	if (evidence.verify) {
+		lines.push(`\nverify (\`${evidence.verify.command}\`): ${evidence.verify.ok ? "passed" : "FAILED"}`);
+	}
+	return { findings, evidence: lines.join("\n") };
+}
+
 // ─── Usage accounting ───────────────────────────────────────────────
 // `/plan-stories` is a command, so its model calls never become session
 // entries and the built-in footer counter cannot see them. We total them
@@ -438,15 +580,6 @@ interface PlanItem {
 	parent_index?: number | null;
 }
 
-/** Tolerate code fences and prose around the array, despite the prompt asking for neither. */
-function extractJsonArray(text: string): string {
-	const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-	const body = (fenced ? fenced[1] : text).trim();
-	const start = body.indexOf("[");
-	const end = body.lastIndexOf("]");
-	return start !== -1 && end > start ? body.slice(start, end + 1) : body;
-}
-
 /**
  * JSON.parse guarantees nothing about shape. Without this, a well-formed but
  * wrong-shaped response reaches createStory and trips a NOT NULL constraint
@@ -498,6 +631,25 @@ function repairStoryGraph(items: PlanItem[]): { items: PlanItem[]; warnings: str
 }
 
 /**
+ * Gather an epic's handoff note from its children's.
+ *
+ * An epic is closed by `closeCompletedParents`, not by `mark_done`, so nobody is
+ * ever asked to write one for it — and an epic with no note would be a hole in
+ * the middle of the tree exactly where the summary belongs. Rolling the
+ * children's notes up means the memory accumulates upward instead of staying
+ * scattered across leaves.
+ */
+function rollUpHandoffNotes(epic: Story, children: Story[]): string {
+	const notes = children
+		.filter((child) => child.handoff_notes?.trim())
+		.map((child) => `#${child.id} ${child.title}: ${child.handoff_notes!.trim()}`);
+	if (notes.length === 0) {
+		return `Epic "${epic.title}" closed with ${children.length} child stories; none recorded a handoff note.`;
+	}
+	return [`Epic "${epic.title}" — handoff notes from its ${notes.length} closed ${notes.length === 1 ? "story" : "stories"}:`, ...notes].join("\n");
+}
+
+/**
  * Close any ancestor epic whose children have all closed, walking upwards.
  * Mirrors the existing next_id auto-promote: finishing work should move the
  * board without a second round-trip.
@@ -518,6 +670,7 @@ async function closeCompletedParents(db: DatabaseSync, fromStoryId: number): Pro
 			status: "done",
 			resolution: "completed",
 			resolution_note: `All ${children.length} child stories closed.`,
+			handoff_notes: rollUpHandoffNotes(epic, children),
 		});
 		if (!updated) break;
 		closed.push(updated);
@@ -562,7 +715,7 @@ function treeOrder(stories: Story[]): { story: Story; depth: number }[] {
 
 // ─── Schema ─────────────────────────────────────────────────────────
 const StoryParams = Type.Object({
-	action: StringEnum(["create", "update", "delete", "list", "mark_done", "mark_in_progress", "reorder", "simplify", "get_next", "search", "set_top_level"] as const),
+	action: StringEnum(["create", "update", "delete", "list", "mark_done", "mark_in_progress", "reorder", "simplify", "get_next", "search", "set_top_level", "review_plan", "review_work"] as const),
 
 	title: Type.Optional(Type.String({ description: "Title (for create / update / simplify)" })),
 	sub_goal: Type.Optional(Type.String({ description: "Sub-goal (for create / update)" })),
@@ -585,6 +738,22 @@ const StoryParams = Type.Object({
 			description:
 				"Only set this if something CONTRADICTED proposed_changes — an assumption that proved false, an API that behaved differently than expected, a hidden dependency. If the implementation matched the plan, omit this field. Most stories should have no learnings.",
 		}),
+	),
+
+	handoff_notes: Type.Optional(
+		Type.String({
+			description:
+				"REQUIRED for mark_done. What the next person needs to know to pick up from here: where the work lives, what was not obvious, what you deliberately left undone. Unlike learnings, every story should have one. Write it for someone who has not read this conversation.",
+		}),
+	),
+	verdict: Type.Optional(
+		StringEnum(REVIEW_VERDICTS, {
+			description:
+				"Your review verdict (review_plan / review_work). Omit on the first call to get the findings first. Refused outright when a reviewer model is configured — the verdict is then not yours to set.",
+		}),
+	),
+	findings: Type.Optional(
+		Type.String({ description: "What your review found (review_plan / review_work), alongside your verdict." }),
 	),
 
 	status_filter: Type.Optional(StringEnum(["draft", "ready", "in_progress", "done", "cancelled", "archived"] as const)),
@@ -625,6 +794,46 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.hasUI) ctx.ui.notify(message, level);
 			},
 		};
+
+		// There are no migrations: INIT_SQL is all CREATE TABLE IF NOT EXISTS, so a
+		// database written before the review columns existed keeps its old shape
+		// and every read of them throws. Say so once, with the fix, instead of
+		// failing cryptically on every turn.
+		const stale = missingStoryColumns(tracker.db);
+		if (stale.length > 0 && ctx.hasUI) {
+			ctx.ui.notify(
+				`${paths.dbPath} predates the ${stale.join(" and ")} column(s) and cannot be read. ` +
+					`This extension has no migrations — delete the file and re-plan.`,
+				"error",
+			);
+		}
+
+		reviewerChoice = resolveReviewer({ repoRoot: paths.repoRoot });
+		const reviewerConfig = describeReviewerConfig({ repoRoot: paths.repoRoot });
+		if (!reviewerConfig.ok && ctx.hasUI) {
+			// A half-configured reviewer must not quietly become self-review: the
+			// user asked for an independent one and would never find out.
+			ctx.ui.notify(`Reviewer not configured: ${reviewerConfig.reason}. Falling back to self-review.`, "warning");
+		} else if (reviewerChoice) {
+			const model = ctx.modelRegistry.find(reviewerChoice.provider, reviewerChoice.modelId);
+			if (!model) {
+				ctx.ui.notify(
+					`Reviewer ${reviewerChoice.provider}/${reviewerChoice.modelId} is not a known model — falling back to self-review.`,
+					"warning",
+				);
+				reviewerChoice = null;
+			} else if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+				// Caught here rather than mid-loop: the first story to be reviewed
+				// is a bad place to discover a missing API key.
+				ctx.ui.notify(
+					`Reviewer ${reviewerChoice.provider}/${reviewerChoice.modelId} has no configured credentials — falling back to self-review.`,
+					"warning",
+				);
+				reviewerChoice = null;
+			} else {
+				ctx.ui.setStatus("issue-tracker-review", `reviewer ${reviewerChoice.modelId}`);
+			}
+		}
 
 		// The extension creates stories.db, so it takes responsibility for keeping
 		// it out of the user's `git status` — whether or not an epic is ever
@@ -802,6 +1011,25 @@ export default function (pi: ExtensionAPI) {
 					lines.push(`  ⚠ #${s.id} ${s.title}: ${truncate(s.learnings ?? "", 200)}`);
 				}
 			}
+
+			// What earlier work handed on. Same cap and same relevance filter as
+			// lessons: this rides on every turn, so an unrelated note is pure noise.
+			const handoffs = ensureTracker().related.findHandoffs(db, primaryFocus, 3);
+			if (handoffs.length > 0) {
+				lines.push(`\n>>> HANDOFF NOTES FROM RELATED WORK — what the people who did this before left for you`);
+				for (const s of handoffs) {
+					lines.push(`  ↪ #${s.id} ${s.title}: ${truncate(s.handoff_notes ?? "", 300)}`);
+				}
+			}
+		}
+
+		// The review gates are enforced, so a story sitting unreviewed stalls
+		// silently unless the next step is stated where the agent will read it.
+		if (readyToWork && readyToWork.review.plan?.verdict !== "approved") {
+			lines.push(`\n>>> BEFORE STARTING — #${readyToWork.id} needs a plan review: story{action:"review_plan", story_id:${readyToWork.id}}`);
+		} else if (!readyToWork && inProgressStories[0] && inProgressStories[0].review.work?.verdict !== "approved") {
+			const p = inProgressStories[0];
+			lines.push(`\n>>> BEFORE CLOSING — #${p.id} needs a work review: story{action:"review_work", story_id:${p.id}}`);
 		}
 
 		const activeEpic = sessionEpic();
@@ -831,10 +1059,19 @@ export default function (pi: ExtensionAPI) {
 		name: "story",
 		label: "Story",
 		description:
-			"Issue tracker for self-contained work chunks (user stories). Actions: create (title, sub_goal, proposed_changes, status, next_story_id, depends_on, parent_story_id), update (story_id + fields), delete (story_id), list (status_filter), search (query), mark_in_progress (story_id), mark_done (story_id + REQUIRED resolution, optional resolution_note and learnings), get_next (fetch top ready), reorder (ordered_ids), simplify (source_ids + merged_title), set_top_level (story_id). Stories form a tree: a story with children is an epic and is never handed out as work.",
+			"Issue tracker for self-contained work chunks (user stories). Actions: create (title, sub_goal, proposed_changes, status, next_story_id, depends_on, parent_story_id), update (story_id + fields), delete (story_id), list (status_filter), search (query), review_plan (story_id — call with no verdict first to get findings), mark_in_progress (story_id — needs an approved plan review), review_work (story_id — call with no verdict first), mark_done (story_id + REQUIRED resolution and handoff_notes, optional resolution_note and learnings — needs an approved work review), get_next (fetch top ready), reorder (ordered_ids), simplify (source_ids + merged_title), set_top_level (story_id). Stories form a tree: a story with children is an epic and is never handed out as work.",
+		promptSnippet:
+			"story: plan, review, track and close units of work. Review gates guard starting and closing; every closed story records a handoff note.",
+		promptGuidelines: [
+			"Work stories through the full cycle: create → review_plan → mark_in_progress → do the work → review_work → mark_done. The two review gates are enforced, so skipping one just makes the next call fail.",
+			"Call review_plan and review_work with only story_id first. They run mechanical checks (dependency cycles, whether the story is an epic, whether `verify` passes) and hand the findings back. A finding marked BLOCKER cannot be approved past — fix it instead.",
+			"If a reviewer model is configured, it decides the verdict and yours is refused. That is deliberate: you do not grade your own work. If the reviewer cannot be reached, nothing is recorded and the gate stays shut.",
+			"mark_done requires handoff_notes: what the next person needs to know to pick up from here — entry points, what was not obvious, what you deliberately left undone. Unlike learnings, every story should have one. Handoff notes from related work are injected into later turns, so write for a reader who has not seen this conversation.",
+			"Starting, merging and cancelling an epic are the user's to run (/start-epic, /merge-epic, /cancel-epic). Ask rather than attempting them yourself.",
+		],
 		parameters: StoryParams,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const db = ensureDb();
 			const { action } = params;
 
@@ -884,6 +1121,30 @@ export default function (pi: ExtensionAPI) {
 						return { content: [{ type: "text", text: `Error: parenting #${params.story_id} to #${params.parent_story_id} would create a cycle` }], details: { action, error: "cycle" } };
 					}
 				}
+				/**
+				 * `update` writes any status with no gates, which is fine for
+				 * bookkeeping moves but would make the review gates decorative: an
+				 * agent refused by `mark_in_progress` could set the status here and
+				 * carry on. A live run did exactly that.
+				 *
+				 * Only the two gated transitions are redirected. `draft`, `ready`
+				 * and `archived` are bookkeeping, and `cancelled` is deliberately
+				 * still allowed — abandoning a story is not the same act as
+				 * declaring it finished, and it is the only way to cancel from the
+				 * tool.
+				 */
+				if (params.status === "in_progress" || params.status === "done") {
+					const target = params.status === "in_progress" ? "mark_in_progress" : "mark_done";
+					return {
+						content: [{
+							type: "text",
+							text:
+								`Cannot set status to ${params.status} with update — use ${target} instead.\n` +
+								`It runs the checks this action skips (dependencies, review gates${params.status === "done" ? ", resolution and handoff notes" : ""}).`,
+						}],
+						details: { action, error: `status ${params.status} requires ${target}` },
+					};
+				}
 				const story = await transitionStatus(params.story_id, {
 					title: params.title,
 					sub_goal: params.sub_goal,
@@ -931,6 +1192,58 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// ── review_plan / review_work ──────────────────────────
+			if (action === "review_plan" || action === "review_work") {
+				const gate: ReviewGate = action === "review_plan" ? "plan" : "work";
+				if (!params.story_id) {
+					return { content: [{ type: "text", text: `Error: story_id required for ${action}` }], details: { action, error: "missing story_id" } };
+				}
+				const story = getStoryById(db, params.story_id);
+				if (!story) {
+					return { content: [{ type: "text", text: `Story #${params.story_id} not found` }], details: { action, error: "not found" } };
+				}
+
+				const { findings, evidence } = await gatherFindings(db, story, gate);
+				const outcome = await decideReview({
+					gate,
+					story,
+					findings,
+					evidence,
+					reviewer: buildReviewer(ctx),
+					selfVerdict: params.verdict as ReviewVerdict | undefined,
+					selfFindings: params.findings,
+					now: () => Date.now(),
+					signal,
+				});
+				reportReviewUsage(ctx);
+
+				if (!outcome.ok) {
+					// Not an error: the no-verdict call reports findings this way too.
+					return { content: [{ type: "text", text: outcome.report }], details: { action, findings, recorded: false } };
+				}
+
+				// Written straight through updateStory, not transitionStatus — a
+				// review records a judgement and changes no status, so it has no
+				// git effect to hang off.
+				const updated = updateStory(db, story.id, { review: { ...story.review, [gate]: outcome.record } });
+				if (!updated) {
+					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
+				}
+				const next =
+					outcome.record.verdict === "approved"
+						? gate === "plan"
+							? `\n\nApproved — you may now mark_in_progress on #${story.id}.`
+							: `\n\nApproved — you may now mark_done on #${story.id} with a resolution and handoff_notes.`
+						: `\n\nChanges requested — address them and review again.`;
+				return {
+					content: [{
+						type: "text",
+						text: `${gate === "plan" ? "Plan" : "Work"} review of #${story.id}: ${outcome.record.verdict.toUpperCase()} (by ${outcome.record.by})\n\n${outcome.record.findings}${next}`,
+					}],
+					details: { action, story: updated, review: outcome.record, recorded: true },
+				};
+			}
+
 			// ── mark_in_progress ───────────────────────────────────
 			if (action === "mark_in_progress") {
 				if (!params.story_id) {
@@ -953,6 +1266,21 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text: `Cannot start: dependencies not done — ${unmet.map((id) => `#${id}`).join(", ")}` }],
 						details: { action, error: "unmet dependencies", unmet },
+					};
+				}
+				// Plan review gate. Same shape as the resolution gate on mark_done:
+				// an optional step is a skipped step, so it is required explicitly.
+				const planReview = story.review.plan;
+				if (planReview?.verdict !== "approved") {
+					return {
+						content: [{
+							type: "text",
+							text:
+								planReview
+									? `Cannot start #${story.id}: its plan review requested changes (by ${planReview.by}).\n${planReview.findings}\n\nAddress them, then run review_plan again.`
+									: `Cannot start #${story.id}: its plan has not been reviewed.\nRun story{action:"review_plan", story_id:${story.id}} first — call it with no verdict to see the findings.`,
+						}],
+						details: { action, error: "plan not approved", review: planReview ?? null },
 					};
 				}
 				const updated = await transitionStatus(params.story_id, { status: "in_progress" });
@@ -1024,6 +1352,37 @@ export default function (pi: ExtensionAPI) {
 						details: { action, error: "resolution required" },
 					};
 				}
+				// Handoff gate, deliberately the same shape as the resolution gate
+				// above. Optional fields get skipped by models, and a closed story
+				// whose context died with the conversation is the gap this closes.
+				if (!params.handoff_notes?.trim()) {
+					return {
+						content: [{
+							type: "text",
+							text:
+								`Cannot mark done: handoff_notes required.\n` +
+								`Write what the next person needs to pick up from here — where the work lives, what was not ` +
+								`obvious, what you deliberately left undone. Unlike learnings, every story should have one, and ` +
+								`it is written for a reader who has not seen this conversation.`,
+						}],
+						details: { action, error: "handoff_notes required" },
+					};
+				}
+				// Work review gate. Epics are exempt: they carry no commit of their
+				// own and close automatically, so there is no diff to review.
+				const workReview = story.review.work;
+				if (!hasChildren(db, story.id) && workReview?.verdict !== "approved") {
+					return {
+						content: [{
+							type: "text",
+							text:
+								workReview
+									? `Cannot close #${story.id}: its work review requested changes (by ${workReview.by}).\n${workReview.findings}\n\nAddress them, then run review_work again.`
+									: `Cannot close #${story.id}: its work has not been reviewed.\nRun story{action:"review_work", story_id:${story.id}} first — call it with no verdict to see the findings.`,
+						}],
+						details: { action, error: "work not approved", review: workReview ?? null },
+					};
+				}
 				// dependency check
 				const unmet = story.depends_on.filter((id) => getStoryById(db, id)?.status !== "done");
 				if (unmet.length > 0) {
@@ -1044,6 +1403,7 @@ export default function (pi: ExtensionAPI) {
 					resolution: params.resolution,
 					resolution_note: params.resolution_note,
 					learnings: params.learnings,
+					handoff_notes: params.handoff_notes.trim(),
 				});
 				if (!updated) {
 					return { content: [{ type: "text", text: "Update failed unexpectedly" }], details: { action, error: "update failed" } };
@@ -1379,6 +1739,22 @@ export default function (pi: ExtensionAPI) {
 							if (s.learnings) {
 								lines.push(`${pad}${theme.fg("warning", `⚠ ${truncate(s.learnings, Math.max(10, width - pad.length - 3))}`)}`);
 							}
+							// Shown because the board's keys bypass the review gates on
+							// purpose — a human overriding one should see what they are
+							// overriding, and who (or whether anyone) reviewed it.
+							const reviewMarks = (["plan", "work"] as const)
+								.map((gate) => ({ gate, record: s.review[gate] }))
+								.filter((entry) => entry.record)
+								.map((entry) => `${entry.gate}: ${entry.record!.verdict} (${entry.record!.by})`);
+							if (reviewMarks.length > 0) {
+								const approved = (["plan", "work"] as const).every(
+									(gate) => !s.review[gate] || s.review[gate]!.verdict === "approved",
+								);
+								lines.push(`${pad}${theme.fg(approved ? "success" : "warning", `⌾ ${reviewMarks.join(" · ")}`)}`);
+							}
+							if (s.handoff_notes) {
+								lines.push(`${pad}${theme.fg("muted", `↪ ${truncate(s.handoff_notes, Math.max(10, width - pad.length - 3))}`)}`);
+							}
 						}
 					}
 
@@ -1702,6 +2078,15 @@ export default function (pi: ExtensionAPI) {
 				if (s.learnings) {
 					lines.push(`**Learned:** ${s.learnings}`);
 				}
+				for (const gate of ["plan", "work"] as const) {
+					const record = s.review[gate];
+					if (record) {
+						lines.push(`**${gate === "plan" ? "Plan" : "Work"} review:** ${record.verdict} — by ${record.by}`);
+					}
+				}
+				if (s.handoff_notes) {
+					lines.push(`**Handoff:** ${s.handoff_notes}`);
+				}
 				lines.push("");
 			}
 
@@ -1710,6 +2095,40 @@ export default function (pi: ExtensionAPI) {
 			const outPath = isAbsolute(targetPath) ? targetPath : join(process.cwd(), targetPath);
 			writeFileSync(outPath, lines.join("\n"), "utf-8");
 			ctx.ui.notify(`Exported ${all.length} stories to ${outPath}`, "info");
+		},
+	});
+
+	pi.registerCommand("review-story", {
+		description: "Show the mechanical review findings for a story (usage: /review-story <story_id> [work])",
+		handler: async (args, ctx) => {
+			if (!isDbReady()) return void ctx.ui.notify("Story DB not ready", "error");
+			const db = ensureDb();
+
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const id = Number(tokens[0]);
+			if (!Number.isInteger(id)) {
+				return void ctx.ui.notify("Usage: /review-story <story_id> [work]", "error");
+			}
+			const story = getStoryById(db, id);
+			if (!story) return void ctx.ui.notify(`Story #${id} not found`, "error");
+
+			// Read-only on purpose: this is the human's window onto the same checks
+			// the tool runs, not a way to record a verdict on the agent's behalf.
+			const gate: ReviewGate = tokens[1] === "work" ? "work" : "plan";
+			const { findings } = await gatherFindings(db, story, gate);
+
+			const recorded = story.review[gate];
+			const lines = [
+				`${gate === "plan" ? "Plan" : "Work"} review — #${story.id} ${story.title}`,
+				"",
+				formatFindings(findings),
+			];
+			if (recorded) {
+				lines.push("", `Recorded: ${recorded.verdict} by ${recorded.by} at ${new Date(recorded.at).toISOString()}`);
+			} else {
+				lines.push("", "No verdict recorded yet.");
+			}
+			ctx.ui.notify(lines.join("\n"), findings.some((f) => f.severity === "blocker") ? "warning" : "info");
 		},
 	});
 
@@ -2152,9 +2571,12 @@ export default function (pi: ExtensionAPI) {
 		return {
 			block: true,
 			reason:
+				// Addressed to the agent, which cannot run a slash command: this used
+				// to tell it to use /merge-epic, which it has no channel to invoke.
 				`Epic #${epic.epic_id} is active on ${epic.branch}. Switching branches, hard-resetting or ` +
-				`deleting branches would strand its work. Use /merge-epic, /cancel-epic, /undo-story or ` +
-				`/undo-turn instead.`,
+				`deleting branches would strand its work. Leave the branch alone and keep working; if the epic ` +
+				`needs to be merged, cancelled or undone, ask the user to run /merge-epic, /cancel-epic, ` +
+				`/undo-story or /undo-turn.`,
 		};
 	});
 }

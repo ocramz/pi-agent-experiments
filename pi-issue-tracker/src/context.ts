@@ -44,6 +44,43 @@ export interface ShellRunner {
 	(command: string, opts?: GitOptions & { env?: Record<string, string> }): Promise<GitResult>;
 }
 
+/** What a reviewer model was asked, and what it cost. */
+export interface ReviewRequest {
+	systemPrompt: string;
+	prompt: string;
+}
+
+export interface ReviewUsage {
+	input?: number;
+	output?: number;
+}
+
+export type ReviewReply =
+	| { ok: true; text: string; model: string; usage?: ReviewUsage }
+	| { ok: false; error: string };
+
+/**
+ * Calls a second model to review a story.
+ *
+ * Same contract as `GitRunner` and `ShellRunner`: resolves with `ok: false`
+ * rather than throwing, so a flaky reviewer is an outcome the caller handles
+ * rather than an exception that unwinds a tool call.
+ *
+ * Injected because `src/` may not import from `@earendil-works/*` — the real
+ * implementation is built in `extensions/index.ts` from `ctx.modelRegistry`,
+ * and tests pass a stub. Null means no independent reviewer is configured, in
+ * which case the working agent supplies its own verdict.
+ *
+ * Deliberately *not* a field on `TrackerContext`. `ctx.modelRegistry` belongs to
+ * one live pi context, and a tracker built at `session_start` outlives several;
+ * both callers build a runner from the context they were handed, so there is
+ * nothing stale to capture. See src/README.md on `withSession` closures for the
+ * bug class this avoids.
+ */
+export interface ReviewerRunner {
+	(req: ReviewRequest, signal?: AbortSignal): Promise<ReviewReply>;
+}
+
 export interface TrackerPaths {
 	/** Main repository working tree — git operations default here. */
 	repoRoot: string;

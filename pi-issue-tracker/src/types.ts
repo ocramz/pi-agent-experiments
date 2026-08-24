@@ -14,6 +14,40 @@ export const STORY_RESOLUTIONS = [
 	"duplicate",
 ] as const;
 
+/** A review's outcome. `changes_requested` keeps the gate it guards shut. */
+export type ReviewVerdict = "approved" | "changes_requested";
+
+export const REVIEW_VERDICTS = ["approved", "changes_requested"] as const;
+
+/**
+ * One recorded review.
+ *
+ * `by` is what makes the record auditable: `"self"` means the working agent
+ * graded its own homework, anything else is the reviewer model's id. A human
+ * reading the board can tell a rubber stamp from an independent judgement.
+ */
+export interface ReviewRecord {
+	verdict: ReviewVerdict;
+	/** What the reviewer found — mechanical findings plus its own reasoning. */
+	findings: string;
+	/** Reviewer model id, or "self" when no independent reviewer is configured. */
+	by: string;
+	at: number;
+}
+
+/**
+ * Both review gates for a story, stored as JSON in one column.
+ *
+ * JSON for the same reason `epic_branches.setup` is — new fields land here, not
+ * in a migration. See src/README.md.
+ */
+export interface StoryReview {
+	/** Gates `mark_in_progress`: is this story worth starting as written? */
+	plan?: ReviewRecord;
+	/** Gates `mark_done`: does the work in the tree satisfy the story? */
+	work?: ReviewRecord;
+}
+
 export interface Story {
 	id: number;
 	title: string;
@@ -33,6 +67,14 @@ export interface Story {
 	 * Null is the common case — see the `story` tool description.
 	 */
 	learnings: string | null;
+	/** Plan and work review records. `{}` until either gate is reviewed. */
+	review: StoryReview;
+	/**
+	 * What the next person needs to know to pick up from here. Required by
+	 * `mark_done`, unlike `learnings` — this is the institutional memory that
+	 * gets fed back into later turns and written into the story's commit.
+	 */
+	handoff_notes: string | null;
 	created_at: number;
 	updated_at: number;
 }

@@ -14,7 +14,9 @@ pi-issue-tracker/
   src/worktree.ts      → Worktree plumbing and database/git reconciliation
   src/epic.ts          → Epic lifecycle: start, commit, update, merge, cancel, undo
   src/database.ts      → SQLite schema and CRUD helpers
-  src/related.ts       → Pluggable relevance strategy (related stories, learnings)
+  src/related.ts       → Pluggable relevance strategy (related stories, learnings, handoffs)
+  src/review.ts        → Review decisions: self-review vs an independent reviewer model
+  src/json.ts          → Getting JSON back out of model prose
   src/types.ts         → Shared TypeScript interfaces
   src/README.md        → This file
   test/                → node --test suites; test/container/ runs them in the image
@@ -42,7 +44,14 @@ Structure is carried by three independent fields:
 - `depends_on` — a DAG, stored as a JSON array (so it is not queryable in SQL). Gates `mark_in_progress` and `mark_done`.
 - `next_id` — a linear suggestion chain. Closing a story promotes its `next_id` to `ready`.
 
-Outcome fields are set when a story closes: `resolution` (enum, validated in TypeBox rather than by a SQL `CHECK` so the vocabulary can still change), `resolution_note`, and `learnings`.
+Outcome fields are set when a story closes: `resolution` (enum, validated in TypeBox rather than by a SQL `CHECK` so the vocabulary can still change), `resolution_note`, `learnings`, and `handoff_notes`.
+
+Two columns carry review and memory:
+
+- `review` — JSON, `{ plan?: ReviewRecord, work?: ReviewRecord }`. JSON for the same reason `epic_branches.setup` is: new fields land there, not in a migration. Notably this avoids a new `status` value — `status` carries a SQL `CHECK`, which is the one constraint SQLite cannot alter in place, so `ready` keeps meaning "queued" and the plan verdict gates `mark_in_progress` instead.
+- `handoff_notes` — plain TEXT, because it is narrative that has to reach the commit message, the export, the board and the injected context. `learnings` is its shape-mate, but the two are deliberately different: a learning is something that *contradicted* the plan and most stories have none, while a handoff note is what the next person needs and every closed story has one.
+
+`ReviewRecord.by` is the audit trail: `"self"` when the working agent judged, otherwise the reviewer model's id.
 
 ## Things worth knowing
 
@@ -51,7 +60,8 @@ Outcome fields are set when a story closes: `resolution` (enum, validated in Typ
 - **`openDb` returns a fresh handle per call.** It replaced a module-level singleton that ignored its argument after the first call, so one process could never hold two databases. Caching now lives in `extensions/index.ts`, keyed by path. The database runs in WAL mode with a 5 s busy timeout, because several worktrees or sessions can write one file.
 - **`updateStory` builds its SET clause by interpolating object keys.** Safe today because every call site passes an object literal with `Story` keys, but it is a `${}` into SQL — do not spread untrusted tool params into it.
 - **`story_history` is write-only.** Every create/update/delete logs a row and `getHistory` can read them, but nothing surfaces it yet.
-- **Relevance is pluggable.** `RelatedStoriesStrategy` has two methods — `findRelated` (open stories) and `findLearnings` (closed stories carrying a learning). `keywordStrategy` scores word overlap plus structural boosts; swapping in embeddings means implementing the same interface.
+- **Relevance is pluggable.** `RelatedStoriesStrategy` has three methods — `findRelated` (open stories), `findLearnings` (closed stories carrying a learning) and `findHandoffs` (any story carrying a handoff note). `keywordStrategy` scores word overlap plus structural boosts; swapping in embeddings means implementing the same interface. `findHandoffs` also scores against the *note's* text, not only the story's plan, because the note names exactly what the plan did not.
+- **A memory nothing reads is not a memory.** `story_history` is the cautionary tale directly above. Handoff notes have six read paths on purpose: the injected context, the story commit message, `storyToText` (so `list`/`search`/`get_next` show them), `/export-stories`, the board detail pane, and the epic roll-up in `closeCompletedParents`. The commit message matters most — there are no migrations, so `stories.db` is deleted whenever a column is added, and git history is the copy that survives.
 
 ## Git integration
 
@@ -137,7 +147,27 @@ depends on — `pre-merge` and `pre-cancel` respectively.
 - `ctx.cwd` is a read-only getter, the built-in tools capture their directory at
   construction, and `process.chdir()` is inert. The only true relocation is
   `SessionManager.forkFrom(sessionFile, targetCwd)` + `ctx.switchSession`, and those work
-  only from a *command* handler. So the agent can never start an epic — the user must.
+  only from a *command* handler.
+
+  **Two claims live here and only one is a technical constraint.** Session
+  relocation genuinely requires a command handler, which rules out `--worktree`
+  mode and `/merge-epic` (which moves the session back). Branch mode needs no
+  relocation at all — `startEpic` is plain git, and the handler returns before
+  the relocation block — so *that* is a policy choice: merging rewrites the
+  branch the user is standing on, and starting an epic commits them to one. Keep
+  the two apart; a future reader deciding what an agent may do should not be told
+  a preference is a wall.
+- **`ctx.modelRegistry` is reachable from a tool, not only from a command.**
+  `ToolDefinition.execute` receives an `ExtensionContext`, and that carries the
+  registry — `find(provider, modelId)`, `hasConfiguredAuth(model)`,
+  `complete(model, context, { signal })`. This is what lets an independent
+  reviewer model run inside the `story` tool without a human in the loop, and it
+  is worth knowing before assuming a second model call needs a slash command.
+  Build the runner from the calling context, never from one cached at
+  `session_start`: the registry belongs to a live context and the tracker
+  outlives several. Thread `execute`'s `signal` into `complete` so a user abort
+  kills the review, and report progress via `onUpdate` — a tool must not seize
+  the TUI with `ctx.ui.custom`.
 - **A `withSession` callback runs in the old closure.** By then the old session has
   emitted `session_shutdown`, the runtime has been torn down and rebound, and the new
   extension instance has already had its `session_start`. Anything session-bound captured

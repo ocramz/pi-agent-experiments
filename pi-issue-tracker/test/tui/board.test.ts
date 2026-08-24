@@ -103,3 +103,58 @@ describe("/stories board", () => {
 		assert.ok(s.db((db) => getStoryCommit(db, first)?.commit_sha), "the story commit is recorded for undo");
 	});
 });
+
+describe("/stories board — review and handoff", () => {
+	/**
+	 * The board's keys deliberately bypass the review gates: they are a human
+	 * action, and a human overriding a gate should see what they are overriding.
+	 * That is the only reason the detail pane carries this.
+	 */
+	it("A6 shows the recorded verdict and who reached it", async (t) => {
+		const s = await session(t, "reviewed");
+		await s.command("/stories");
+		await s.expect("Story Board");
+		await s.press("[ArrowDown]");
+		await s.expect(`#${s.facts.firstId} Add the widget model`);
+		await s.expect("plan: approved (stub/reviewer-1)");
+
+		await s.press("[ArrowDown]");
+		await s.expect(`#${s.facts.secondId} Render the widget`);
+		await s.expect("plan: changes_requested (self)");
+		await s.press("[Escape]");
+		await s.close();
+	});
+
+	it("A7 shows a closed story's handoff note in the detail pane", async (t) => {
+		const s = await session(t, "withHandoffs");
+		await s.command("/stories");
+		await s.expect("Story Board");
+		await s.press("[ArrowDown]");
+		await s.expect("keyed by slug, not by id");
+		await s.expect("work: approved (stub/reviewer-1)");
+		await s.press("[Escape]");
+		await s.close();
+	});
+
+	/**
+	 * Pinned deliberately. The board is a human override, so a story with no work
+	 * review still closes from a keystroke — if a future change routes these keys
+	 * through the tool's gates, this fails and the decision gets made on purpose
+	 * rather than by accident.
+	 */
+	it("A8 key d still closes an unreviewed story — the board is a human override", async (t) => {
+		const s = await session(t, "stories");
+		const first = s.facts.firstId!;
+		await s.command("/stories");
+		await s.expect("Story Board");
+		await s.press("[ArrowDown]");
+		await s.press("d", { settle: 2000 });
+		await s.expect(`[done] #${first}`);
+		await s.press("[Escape]");
+		await s.close();
+
+		const story = s.db((db) => getStoryById(db, first));
+		assert.equal(story?.status, "done", "the board closed it without a work review");
+		assert.deepEqual(story?.review, {}, "and recorded no review");
+	});
+});

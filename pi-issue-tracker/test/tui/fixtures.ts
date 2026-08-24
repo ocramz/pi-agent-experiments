@@ -19,7 +19,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { resolvePaths } from "../../src/config.ts";
 import type { GitResult, TrackerContext } from "../../src/context.ts";
-import { createStory, getEpicBranch, getStoryById, openDb, setAppState } from "../../src/database.ts";
+import { createStory, getEpicBranch, getStoryById, openDb, setAppState, updateStory } from "../../src/database.ts";
 import {
 	commitStory,
 	mergeIntoBase,
@@ -28,6 +28,7 @@ import {
 } from "../../src/epic.ts";
 import { createLocalGitRunner, createLocalShellRunner } from "../../src/git.ts";
 import { keywordStrategy } from "../../src/related.ts";
+import { SELF_REVIEW } from "../../src/review.ts";
 import type { Story } from "../../src/types.ts";
 
 export interface Facts {
@@ -67,7 +68,10 @@ export type Shape =
 	| "epicTwoCommits"
 	| "epicBaseMoved"
 	| "epicConflict"
-	| "epicMerged";
+	| "epicMerged"
+	| "reviewed"
+	| "cyclicDeps"
+	| "withHandoffs";
 
 /** The environment a fixture's git commands run under. Also what pi inherits. */
 export function fixtureEnv(dir: string): NodeJS.ProcessEnv {
@@ -402,5 +406,80 @@ const shapes: Record<Shape, ShapeBuilder> = {
 		db.close();
 		const baseTip = (await tools.must(["rev-parse", facts.baseBranch!])).stdout.trim();
 		return { ...facts, backupRef: merged.backupRef, baseTip };
+	},
+
+	/**
+	 * Stories carrying recorded review verdicts — one approved by an independent
+	 * reviewer, one where changes were requested. Written through `updateStory`
+	 * rather than by hand-editing the column, so the fixture cannot drift from
+	 * what the tool actually persists.
+	 */
+	async reviewed({ initRepo, tracker, seedStories }) {
+		await initRepo();
+		const { db } = await tracker();
+		const seeded = seedStories(db);
+		updateStory(db, seeded.first.id, {
+			review: {
+				plan: { verdict: "approved", findings: "scope is one commit's worth", by: "stub/reviewer-1", at: 1_700_000_000_000 },
+			},
+		});
+		updateStory(db, seeded.second.id, {
+			review: {
+				plan: { verdict: "changes_requested", findings: "the sub-goal covers two features", by: SELF_REVIEW, at: 1_700_000_000_000 },
+			},
+		});
+		db.close();
+		return {
+			branch: "feat/work",
+			epicId: seeded.epic.id,
+			firstId: seeded.first.id,
+			secondId: seeded.second.id,
+			looseId: seeded.loose.id,
+		};
+	},
+
+	/**
+	 * Two stories that depend on each other. Nothing in the tool path prevents
+	 * this and no gate can ever pass while it stands, which is exactly what the
+	 * plan review exists to catch.
+	 */
+	async cyclicDeps({ initRepo, tracker, seedStories }) {
+		await initRepo();
+		const { db } = await tracker();
+		const seeded = seedStories(db);
+		updateStory(db, seeded.first.id, { depends_on: [seeded.second.id] });
+		updateStory(db, seeded.second.id, { depends_on: [seeded.first.id] });
+		db.close();
+		return {
+			branch: "feat/work",
+			epicId: seeded.epic.id,
+			firstId: seeded.first.id,
+			secondId: seeded.second.id,
+			looseId: seeded.loose.id,
+		};
+	},
+
+	/** A closed story carrying a handoff note, for the export and the board. */
+	async withHandoffs({ initRepo, tracker, seedStories }) {
+		await initRepo();
+		const { db } = await tracker();
+		const seeded = seedStories(db);
+		updateStory(db, seeded.first.id, {
+			status: "done",
+			resolution: "completed",
+			handoff_notes: "the widget model lives in model.ts and is keyed by slug, not by id",
+			review: {
+				plan: { verdict: "approved", findings: "fine", by: SELF_REVIEW, at: 1_700_000_000_000 },
+				work: { verdict: "approved", findings: "matches the sub-goal", by: "stub/reviewer-1", at: 1_700_000_000_000 },
+			},
+		});
+		db.close();
+		return {
+			branch: "feat/work",
+			epicId: seeded.epic.id,
+			firstId: seeded.first.id,
+			secondId: seeded.second.id,
+			looseId: seeded.loose.id,
+		};
 	},
 };

@@ -5,6 +5,7 @@ import { after, describe, it } from "node:test";
 import { createStory, getEpicBranch, getStoryCommit } from "../src/database.ts";
 import {
 	cancelEpic,
+	collectWorkEvidence,
 	commitStory,
 	ensureDatabaseIgnored,
 	findEpicForStory,
@@ -481,5 +482,47 @@ describe("cancelEpic", () => {
 		await cancelEpic(r.ctx, epic, { deleteBranch: true });
 		assert.equal(await revParse(r.git, epic.branch, r.dir), null);
 		assert.equal(await revParse(r.git, `refs/pi/backup/${epic.epic_id}/pre-cancel`, r.dir), epicTip);
+	});
+});
+
+describe("collectWorkEvidence", () => {
+	it("reports an empty tree as no changed files", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		const evidence = await collectWorkEvidence(r.ctx, epic, {});
+		assert.deepEqual(evidence.changedFiles, []);
+		assert.equal(evidence.totalBytes, 0);
+		assert.equal(evidence.verify, null, "no verify declared means nothing was run");
+	});
+
+	it("reports what a commit would sweep up", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		r.write("limiter.ts", "export const limit = 10;\n");
+		const evidence = await collectWorkEvidence(r.ctx, epic, {});
+		assert.deepEqual(evidence.changedFiles, ["limiter.ts"]);
+		assert.ok(evidence.totalBytes > 0);
+	});
+
+	/**
+	 * verify runs at review time as well as at commit time. Duplicated work, but
+	 * a failure found here becomes a finding the agent can act on, where the same
+	 * failure inside commitStory only aborts a close it had already decided on.
+	 */
+	it("runs the manifest's verify and reports that it passed", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		r.write("limiter.ts", "export const limit = 10;\n");
+		const evidence = await collectWorkEvidence(r.ctx, epic, { verify: "true" });
+		assert.deepEqual(evidence.verify, { command: "true", ok: true, output: "" });
+	});
+
+	it("reports a failing verify without throwing", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		r.write("limiter.ts", "export const limit = 10;\n");
+		const evidence = await collectWorkEvidence(r.ctx, epic, { verify: "echo boom && false" });
+		assert.equal(evidence.verify?.ok, false);
+		assert.match(evidence.verify?.output ?? "", /boom/);
 	});
 });
