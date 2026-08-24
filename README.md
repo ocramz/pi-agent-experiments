@@ -13,15 +13,11 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 
 ## Secrets
 
-These extensions assume their secrets are in the environment. If they are not, start pi with the `.env` file sourced:
-      
- ```bash
-   set -a && . ./.env && set +a && pi                                        
- ```          
+All secrets go in `.env` at the repo top level.
 
-## Container tests
+## Containers
 
-For security, we run pi inside a container, and the test suite starts containers of
+We run pi inside a container, and the test suite starts containers of
 its own, so the outer one needs a handful of flags to make nested podman work.
 The Makefile specifies all the flags.
 
@@ -30,10 +26,13 @@ make dev                  # build + start the dev container, detached
 make shell                # a shell in it (or attach VS Code to "pi-dev")
 ```
 
-`make dev` mounts volumes :
-- this checkout at `/workspace`,
+### Dev container configuration and secrets
+NB: The dev container sources **all** secrets from `.env` and mounts the following volumes :
+- the current directory at `/workspace`,
 - a named volume for pi's credentials and sessions,
 - and a named volume for the inner podman's image store.
+
+
 
 ## Tests
 
