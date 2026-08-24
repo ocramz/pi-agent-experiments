@@ -10,9 +10,8 @@
 // That makes these slow, non-deterministic and not free, so they are the one
 // file that needs a key.
 //
-// Refusing loudly beats skipping quietly, so an absent key fails the run rather
-// than silently reducing it. PI_TUI_SKIP_LIVE=1 is the explicit opt-out, for the
-// fork CI job that gets no secrets.
+// They always run — there is no opt-out. Refusing loudly beats skipping quietly,
+// so an absent key fails the run rather than silently reducing it.
 
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync } from "node:fs";
@@ -22,11 +21,10 @@ import { getAllStories, getEpicBranch } from "../../src/database.ts";
 import { rowCount } from "./inspect.ts";
 import { session, sessionFileExists, sessionFilesFor, type Session } from "./session.ts";
 
-const SKIP = process.env.PI_TUI_SKIP_LIVE === "1";
-if (!SKIP && !process.env.OPENROUTER_API_KEY) {
+if (!process.env.OPENROUTER_API_KEY) {
 	throw new Error(
 		"OPENROUTER_API_KEY is not set — the live interactive cases cannot run.\n" +
-			"Set it in .env at the repo root (see env.example), or pass PI_TUI_SKIP_LIVE=1 to leave them out.",
+			"Set it in .env at the repo root (see env.example).",
 	);
 }
 
@@ -43,7 +41,7 @@ async function until(s: Session, what: string, check: () => Promise<boolean>, ti
 	assert.fail(`timed out waiting for ${what}\n\nlast output:\n${s.screen().slice(-2000)}`);
 }
 
-describe("/plan-stories", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
+describe("/plan-stories", () => {
 	it("B1 builds a story tree from a goal", async (t) => {
 		const s = await session(t, "empty", { live: true });
 		await s.command("/plan-stories add rate limiting to the public API");
@@ -70,7 +68,7 @@ describe("/plan-stories", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
 	});
 });
 
-describe("/undo-turn", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
+describe("/undo-turn", () => {
 	it("I1 restores the working tree from the newest checkpoint", async (t) => {
 		// turn_end checkpoints with `git stash create`, which only records tracked
 		// modifications and reports nothing at all on a clean tree. So the tree has
@@ -96,7 +94,7 @@ describe("/undo-turn", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
 	});
 });
 
-describe("/start-epic --worktree", { skip: SKIP ? "PI_TUI_SKIP_LIVE=1" : false }, () => {
+describe("/start-epic --worktree", () => {
 	/**
 	 * The one case that reaches pi's session relocation.
 	 *

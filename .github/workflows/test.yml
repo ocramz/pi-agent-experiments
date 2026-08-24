@@ -7,8 +7,10 @@ on:
 
 jobs:
   # Whether this run can see the repository's secrets. A pull request from a fork
-  # cannot, and two jobs need to know: the interactive tier opts out of its live
-  # cases, and the container tier does not run at all.
+  # cannot, and the container tier needs to know: without a key it does not run
+  # at all. The interactive tier deliberately does not consult this — its live
+  # cases have no opt-out, so a fork pull request fails there rather than
+  # reporting green over coverage it never had.
   #
   # It is a job rather than a top-level `env:` because a job-level `if:` cannot
   # read the `env` context — only `needs`, which is what this exists to provide.
@@ -77,7 +79,6 @@ jobs:
   tui:
     name: interactive (pty)
     runs-on: ubuntu-24.04
-    needs: gate
     strategy:
       fail-fast: false
       matrix:
@@ -86,12 +87,12 @@ jobs:
       run:
         working-directory: ${{ matrix.pkg }}
     env:
+      # A few cases drive a real model, and test/tui/live.test.ts refuses to
+      # start without this — there is no opt-out. A pull request from a fork
+      # gets no secrets and so fails here, which is the intent: the live cases
+      # are the only coverage an extension's entry point has, and a run that
+      # quietly left them out would be green over nothing.
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      # A few cases drive a real model, and a pull request from a fork gets no
-      # secrets. Opting out explicitly beats letting the suite fail on a missing
-      # key — and beats a silent skip, which is why test/tui/live.test.ts refuses
-      # to run without either the key or this flag.
-      PI_TUI_SKIP_LIVE: ${{ needs.gate.outputs.has_secrets == '1' && '0' || '1' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

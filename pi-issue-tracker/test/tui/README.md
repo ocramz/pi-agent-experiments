@@ -64,7 +64,7 @@ same scope node does.
 
 Four cases — B1, B3, I1 and W10 — drive a real model and need `OPENROUTER_API_KEY`, which
 `make test-tui` passes from `.env`. Without it [live.test.ts](live.test.ts) fails the run rather
-than skipping quietly; `PI_TUI_SKIP_LIVE=1` is the explicit opt-out, used by the fork CI job.
+than skipping quietly, and there is no opt-out.
 
 ## The groups
 

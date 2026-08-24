@@ -63,13 +63,7 @@ MOUNTS = \
 # command line is confusing to read even though podman takes the last.
 RUN_FLAGS = $(NEST_FLAGS) $(MOUNTS) --env-file $(ENV_FILE) \
             -e PI_PROVIDER=$(PI_PROVIDER) -e PI_MODEL=$(PI_MODEL) \
-            -e PI_REVIEW_PROVIDER=$(PI_REVIEW_PROVIDER) -e PI_REVIEW_MODEL=$(PI_REVIEW_MODEL) \
-            -e PI_TUI_SKIP_LIVE=$(PI_TUI_SKIP_LIVE)
-
-# The documented opt-out from the money-spending interactive cases. It is read
-# inside the container by test/tui/live.test.ts, so it has to be forwarded —
-# `make test-tui PI_TUI_SKIP_LIVE=1` silently ran them before this existed.
-PI_TUI_SKIP_LIVE ?=
+            -e PI_REVIEW_PROVIDER=$(PI_REVIEW_PROVIDER) -e PI_REVIEW_MODEL=$(PI_REVIEW_MODEL)
 
 $(ENV_FILE):
 	@echo "$(ENV_FILE) is missing. cp env.example $(ENV_FILE) and set OPENROUTER_API_KEY." >&2

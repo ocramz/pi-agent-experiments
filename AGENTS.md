@@ -40,7 +40,9 @@ PI_TUI_KEEP=1 node --test test/tui/merge-epic.test.ts   # keep the fixture and p
 session, so the only coverage `extensions/index.ts` has is a real model driving it. Three tiers
 spend money — `test/container/test_extension_live.sh` (four blocks: the story tool, the two hooks,
 the autonomous review cycle, and the independent reviewer), and cases B1/B3/I1/W10 in `test/tui/`.
-`PI_TUI_SKIP_LIVE=1` opts the interactive tier out (used by the fork CI job).
+The interactive live cases have no opt-out: `test/tui/live.test.ts` refuses to start without
+`OPENROUTER_API_KEY` rather than skipping quietly, so a run without a key fails instead of
+reporting green over the only coverage `extensions/index.ts` has.
 
 The reviewer block calls a *second* model per review. `PI_REVIEW_PROVIDER`/`PI_REVIEW_MODEL` default
 to the working model (see [shared/versions.env](shared/versions.env)), so it costs one extra call and
