@@ -33,6 +33,9 @@ const DENY = [
 	{ re: /(^|\/)\.venv\//, why: "virtualenv" },
 	{ re: /(^|\/)\.ruff_cache\//, why: "ruff cache" },
 	{ re: /(^|\/)\.hypothesis\//, why: "hypothesis database" },
+	// `uv sync` writes one next to the sources it builds from, so the very
+	// command the README tells a contributor to run leaves it in the tree.
+	{ re: /(^|\/)[^/]*\.egg-info\//, why: "Python build metadata" },
 	{ re: /(^|\/)node_modules\//, why: "dependency tree" },
 	{ re: /^tsconfig\.json$/, why: "build config, not needed at runtime" },
 	{ re: /^tests?\//, why: "test tier" },

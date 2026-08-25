@@ -132,11 +132,21 @@ def handle(nb: Notebook, req: dict) -> dict:
         match req.get("tool"):
             case "add_cell":
                 cid, results = nb.add(
-                    req["src"], name=req.get("name"), run=req.get("run", True)
+                    req["src"],
+                    name=req.get("name"),
+                    run=req.get("run", True),
+                    impure=bool(req.get("impure", False)),
                 )
                 return _response(nb, results, id=cid)
             case "set_cell":
-                results = nb.set(req["id"], req["src"], run=req.get("run", True))
+                # Absent rather than false when unsent: a `set_cell` that
+                # says nothing about the flag must not clear it.
+                results = nb.set(
+                    req["id"],
+                    req["src"],
+                    run=req.get("run", True),
+                    impure=req.get("impure"),
+                )
                 return _response(nb, results)
             case "delete_cell":
                 results = nb.delete(req["id"], run=req.get("run", True))

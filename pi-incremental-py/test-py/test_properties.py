@@ -450,6 +450,74 @@ class TestDescriptions(unittest.TestCase):
                 self.assertIn(cid, nb.pending)
 
 
+class TestImpurity(unittest.TestCase):
+    """A declared effect changes how much work happens, never the answer.
+
+    `dags()` builds pure arithmetic, so no law here — or anywhere else in
+    this file — could otherwise reach a program where "same source, same
+    inputs, same result" is false. Marking a generated cell impure is the
+    cheapest way to put one in front of them: the *values* stay
+    deterministic, so a law can still say what the answer must be, while
+    the kernel is obliged to treat the cell as though they were not.
+    """
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_marking_a_cell_impure_never_changes_the_result(self, cells, data):
+        nb, ids = build(cells, memo_min_seconds=0)
+        expected = ns_digests(nb)
+        cid = ids[data.draw(st.sampled_from(sorted(ids)))]
+
+        nb.set(cid, nb.cells[cid].src, impure=True)
+        self.assertEqual(ns_digests(nb), expected)
+
+        # ...and from here it is genuinely re-executed on every pass.
+        for _ in range(2):
+            nb.pending = {cid}
+            self.assertEqual([r.status for r in nb.run() if r.cell == cid], ["ran"])
+        self.assertEqual(ns_digests(nb), expected)
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_an_impure_cone_is_never_answered_from_a_description(self, cells, data):
+        """What `test_a_shallow_restore_never_disagrees_with_a_full_run`
+        rests on, in the case its own DAGs cannot construct: a cell whose
+        source does not say what it will answer. The taint has to reach
+        every descendant, since each was computed out of that answer."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        cid = ids[data.draw(st.sampled_from(sorted(ids)))]
+        nb.set(cid, nb.cells[cid].src, impure=True)
+
+        tainted = {cid} | nb.descendants(cid)
+        for other in nb.cells:
+            self.assertEqual(nb._deterministic(other), other not in tainted)
+
+        nb.fork("scratch")
+        nb.delete(cid, run=False)
+        restored = {r.cell for r in nb.switch(DEFAULT, shallow=True)}
+        self.assertEqual(restored & tainted, set())
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_a_cell_binding_a_module_round_trips_a_variant_switch(self, cells, data):
+        """Module defs are recorded by name and imported back rather than
+        pickled, so a cell that imports is restorable like any other — and
+        a variant round trip over one costs no execution."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        var = data.draw(st.sampled_from(sorted(ids)))
+        cid = ids[var]
+        # One cell only: two would both provide `math` and be refused.
+        nb.set(cid, f"import math\n{nb.cells[cid].src}")
+        before = ns_digests(nb)
+
+        nb.fork("alt")
+        nb.set(cid, f"import math\n{var} = 987654")
+        statuses = {r.status for r in nb.switch(DEFAULT)}
+
+        self.assertEqual(ns_digests(nb), before)
+        self.assertNotIn("ran", statuses)
+
+
 class TestFailureIsolation(unittest.TestCase):
     @SLOW
     @given(dags(), st.data())

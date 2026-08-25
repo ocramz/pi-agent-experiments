@@ -94,6 +94,29 @@ deliberately not shipped.
 
   Everything the analysis is unsure about keeps the reference, so it can
   only ever drop a dependency it has proved spurious.
+- **Purity, and opting out of it.** A cell is assumed to be a pure
+  function of its source, its inputs' content addresses and the
+  environment digest — that assumption is what a cache key *is*. A cell
+  that reads a clock, an RNG, the network or the filesystem breaks it, and
+  the kernel cannot see that it does: a timestamp pickles as well as any
+  other value, and such a cell has neither a self-edge (`stateful`) nor an
+  unidentifiable global (`opaque`). Left unmarked it runs once and reports
+  `cached` from then on, and a variant switch puts the old value back
+  rather than fetching again. So it is declared, not detected — `impure`
+  on `py_cell` or on the `add_cell`/`set_cell`/`apply_edits` verbs:
+
+  ```json
+  {"tool": "add_cell", "src": "page = get(url)", "impure": true}
+  ```
+
+  An impure cell is re-run on every pass, never memoized, and never
+  answered from the description index (`inspect` flags it). It is not
+  refused across a variant switch the way an accumulator is — re-fetching
+  restores, where re-running an accumulator advances it. The cost stops
+  there: dependents key off the *address* of what it produced, so a fetch
+  returning the same bytes still leaves its readers `cached`. Without the
+  flag, `rerun_cell` and `run_all` with `restart` are the manual ways to
+  re-perform an effect.
 - **Builtin shadowing.** If a cell defines `len`, dependents of `len` get
   a real DAG edge and re-run when it changes.
 - **Failure isolation.** A cell that raises leaves its dependents
@@ -142,6 +165,7 @@ mid-line).
 
 ```json
 {"tool": "add_cell", "src": "rows = [1, 2, 3]", "name": "load", "run": true}
+{"tool": "add_cell", "src": "page = get(url)", "impure": true}   # never cached
 {"tool": "set_cell", "id": "k7x2qm", "src": "rows = [4, 5, 6]", "run": false}
 {"tool": "delete_cell", "id": "k7x2qm"}
 {"tool": "rerun_cell", "id": "k7x2qm"}
@@ -160,7 +184,9 @@ mid-line).
 **Agent tools**
 
 - **`py_cell`** — create (omit `id`) or modify (`id` given) a cell;
-  `run: false` stages without executing.
+  `run: false` stages without executing, `impure: true` marks a cell whose
+  effect must be re-performed rather than cached (omit it on a modify to
+  leave the cell's current setting alone).
 - **`py_kernel`** — `inspect` / `rerun` / `run_all` / `delete` /
   `plan` / `apply` (atomic batches).
 - **`py_install`** — pip-install into the kernel's environment; importing
@@ -219,7 +245,7 @@ it.
 
 ```bash
 uv sync --group dev                        # ruff + hypothesis
-uv run python -m unittest discover -s test-py   # kernel tests (86)
+uv run python -m unittest discover -s test-py   # kernel tests (177)
 uvx ruff check py test-py                  # also a CI job; pinned in shared/versions.env
 python3 py/protocol.py                     # speak the protocol on stdin/stdout
 ```
@@ -228,9 +254,12 @@ python3 py/protocol.py                     # speak the protocol on stdin/stdout
 unit suite only spot-checks: incremental edits reach the same namespace as
 a from-scratch replay, early cutoff is invisible, a rejected batch changes
 nothing, `plan` bounds `apply`, failures isolate, and keys are content
-addresses. It imports hypothesis unconditionally — these are the cases
-that check the laws, so a missing dependency fails the run instead of
-silently removing 21 tests from it.
+addresses. Its DAGs are pure arithmetic, so the one program shape those
+laws cannot otherwise reach — a cell whose source does not say what it
+will answer — is built by marking a generated cell `impure`. It imports
+hypothesis unconditionally: these are the cases that check the laws, so a
+missing dependency fails the run instead of silently removing 43 tests
+from it.
 
 Extension side (this repo's standard tiers):
 

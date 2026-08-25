@@ -19,14 +19,21 @@ class Edit:
     id: str | None = None
     src: str | None = None
     name: str | None = None
+    # Declared rather than recovered: nothing in a cell's source says
+    # whether calling it twice can answer differently. Tri-state, because
+    # an edit that does not mention the flag is not a request to clear it
+    # — the same way `set` leaves a cell's `name` alone.
+    impure: bool | None = None
 
     @classmethod
     def from_json(cls, raw: object) -> Edit:
         match raw:
             case {"op": "add", "src": str(src), **rest}:
-                return cls("add", src=src, name=rest.get("name"))
-            case {"op": "set", "id": str(cid), "src": str(src)}:
-                return cls("set", id=cid, src=src)
+                return cls(
+                    "add", src=src, name=rest.get("name"), impure=rest.get("impure")
+                )
+            case {"op": "set", "id": str(cid), "src": str(src), **rest}:
+                return cls("set", id=cid, src=src, impure=rest.get("impure"))
             case {"op": "delete", "id": str(cid)}:
                 return cls("delete", id=cid)
             case _:

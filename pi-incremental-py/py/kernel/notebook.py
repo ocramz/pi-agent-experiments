@@ -17,8 +17,11 @@ views onto it.
 from __future__ import annotations
 
 import copy
+import importlib
+import itertools
 import random
 import time
+import types
 
 import collections
 import dataclasses
@@ -100,6 +103,10 @@ class Notebook:
             DEFAULT: Variant(DEFAULT, None, {}, ())
         }
         self._rng = random.Random(seed)
+        # Distinguishes two "never cache" keys minted in the same clock
+        # tick. Deliberately outside `_STATE`: rolling a batch back must
+        # not rewind it, or the rollback could hand out a key twice.
+        self._nonce = itertools.count()
 
     # ---- identity
 
@@ -175,13 +182,19 @@ class Notebook:
                         if cid in self.cells:
                             raise KeyError(f"cell {cid!r} already exists")
                         self._check_name(edit.name)
-                        self.cells[cid] = Cell.of(edit.src or "", edit.name)
+                        self.cells[cid] = Cell.of(
+                            edit.src or "", edit.name, bool(edit.impure)
+                        )
                         created.append(cid)
                     case "set":
                         if edit.id not in self.cells:
                             raise KeyError(f"no cell {edit.id!r}")
-                        name = self.cells[edit.id].name
-                        self.cells[edit.id] = Cell.of(edit.src or "", name)
+                        # Metadata survives a `set`: the edit carries
+                        # source, and a flag it does not mention is not a
+                        # request to clear one.
+                        was = self.cells[edit.id]
+                        kept = was.impure if edit.impure is None else bool(edit.impure)
+                        self.cells[edit.id] = Cell.of(edit.src or "", was.name, kept)
                     case "delete":
                         if edit.id not in self.cells:
                             raise KeyError(f"no cell {edit.id!r}")
@@ -226,15 +239,24 @@ class Notebook:
     # ---- public editing API
 
     def add(
-        self, src: str, name: str | None = None, run: bool = True
+        self,
+        src: str,
+        name: str | None = None,
+        run: bool = True,
+        impure: bool = False,
     ) -> tuple[str, list[Result]]:
         """Create a new cell; returns (generated_id, results)."""
-        results, created = self.apply([Edit("add", src=src, name=name)], run=run)
+        results, created = self.apply(
+            [Edit("add", src=src, name=name, impure=impure)], run=run
+        )
         return created[0], results
 
-    def set(self, cid: str, src: str, run: bool = True) -> list[Result]:
-        """Modify an existing cell."""
-        return self.apply([Edit("set", id=cid, src=src)], run=run)[0]
+    def set(
+        self, cid: str, src: str, run: bool = True, impure: bool | None = None
+    ) -> list[Result]:
+        """Modify an existing cell. `impure` left None keeps the flag the
+        cell already carries."""
+        return self.apply([Edit("set", id=cid, src=src, impure=impure)], run=run)[0]
 
     def delete(self, cid: str, run: bool = True) -> list[Result]:
         """Deleting a cell retracts its globals. This is the behaviour
@@ -425,6 +447,20 @@ class Notebook:
         for name in names:
             self.addr.pop(name, None)
 
+    def _never_cache(self) -> str:
+        """A key guaranteed not to match anything, this run or the last.
+
+        "Assume always changed", spelled as an address. It has to be
+        *unique*, not merely unlikely: `_fresh` asks whether this key
+        equals the one the cell last ran under, so a poison that repeats is
+        a cell reported `cached` over work that was never redone.
+        `time_ns` alone does not promise that — two calls inside one tick
+        can return the same number — so the counter is what carries the
+        guarantee and the clock only keeps keys from colliding across
+        processes.
+        """
+        return _hash(f"{time.time_ns()}:{next(self._nonce)}")
+
     def _key(self, cid: str) -> str:
         """Content address of a cell's next run.
 
@@ -437,6 +473,14 @@ class Notebook:
         answer is recomputed rather than reused.
         """
         cell = self.cells[cid]
+        if cell.impure:
+            # Declared to read something the kernel cannot address — a
+            # clock, an RNG, a URL. No content names its *next* run, so it
+            # gets the same poison a missing input gets, for the same
+            # reason: an address that would be wrong is worse than none.
+            # Cheap, because dependents key off the address of what this
+            # produced, so an unchanged answer still cuts off below.
+            return self._never_cache()
         inputs = []
         for name in sorted(cell.refs):
             if name not in self.provider:
@@ -449,10 +493,10 @@ class Notebook:
             # computation whose inputs were never established. The self-edge
             # is exempt: an accumulator's first run reads nothing on purpose.
             if name not in self.ns and self.provider[name] != cid:
-                return _hash(f"{time.time_ns()}")  # missing input: never cache
+                return self._never_cache()  # missing input: never cache
             inputs.append((name, self._address_of(name)))
         if any(d is None for _, d in inputs):
-            return _hash(f"{time.time_ns()}")  # unhashable input: never cache
+            return self._never_cache()  # unhashable input: never cache
         key = _hash(cell.src + repr(inputs))
         return _hash(key + self.env) if cell.imports else key
 
@@ -474,7 +518,12 @@ class Notebook:
         out: dict[str, str] = {}
         for cid in self.topo():
             cell = self.cells[cid]
-            base = _hash(cell.src + repr(sorted(out[p] for p in self.parents_of[cid])))
+            # `impure` is part of what the program says, and — unlike every
+            # other such fact — it is not inside `src`, so it has to be
+            # mixed in by hand or two different programs would describe
+            # identically.
+            said = cell.src + ("\x00impure" if cell.impure else "")
+            base = _hash(said + repr(sorted(out[p] for p in self.parents_of[cid])))
             out[cid] = _hash(base + self.env) if cell.imports else base
         return out
 
@@ -516,17 +565,28 @@ class Notebook:
         All or nothing: a cell whose defs cannot all be written back is
         not restorable, and half its namespace is worse than none of it.
         """
+        if self.cells[cid].impure:
+            # Its key is a fresh nonce, so an entry stored under one could
+            # never be found again — only accumulate.
+            return
         if result.seconds < self.memo_min_seconds:
             return
         blobs: dict[str, bytes] = {}
+        modules: dict[str, str] = {}
         for name in self.cells[cid].defs:
             if name not in self.ns:
                 return  # a def the cell left unbound; `_fresh` refuses these too
-            frozen = freeze(self.ns[name])
+            value = self.ns[name]
+            if isinstance(value, types.ModuleType):
+                modules[name] = value.__name__  # re-imported, not unpickled
+                continue
+            frozen = freeze(value)
             if frozen is None:
-                return  # a module, a function, or something unpicklable
+                return  # a function, or something unpicklable
             blobs[name] = frozen
-        self.memo[key] = Memo(blobs, sum(map(len, blobs.values())), result.seconds, result)
+        self.memo[key] = Memo(
+            blobs, sum(map(len, blobs.values())), result.seconds, result, modules
+        )
         self.memo.move_to_end(key)
         self._index(cid, key)
         self._evict()
@@ -540,15 +600,21 @@ class Notebook:
     def _deterministic(self, cid: str) -> bool:
         """Whether a description can be trusted to name one value.
 
-        Two things break the equation "same program, same result", and the
-        kernel can see both. A stateful cell's value is a function of how
-        many times it has run, not of what it says. An opaque global is one
-        `digest` cannot identify, so nothing downstream of it was ever
-        established to be a function of anything. Either in the cone and
-        the description is a name for more than one value.
+        Three things break the equation "same program, same result". A
+        stateful cell's value is a function of how many times it has run,
+        not of what it says. An impure cell's is a function of when it ran
+        and of what answered — a clock, a URL — which its source likewise
+        does not record. An opaque global is one `digest` cannot identify,
+        so nothing downstream of it was ever established to be a function
+        of anything. Any of the three in the cone and the description is a
+        name for more than one value.
+
+        The first two are declared or structural and the third is
+        discovered, but they fail the same way, so they are refused in the
+        same place.
         """
         cone = self.graph.ancestors(cid) | {cid}
-        if any(self.cells[c].stateful for c in cone):
+        if any(self.cells[c].stateful or self.cells[c].impure for c in cone):
             return False
         return not ({n for c in cone for n in self.cells[c].refs} & self.opaque)
 
@@ -561,6 +627,8 @@ class Notebook:
             return None
         try:
             values = {name: thaw(blob) for name, blob in memo.blobs.items()}
+            for name, module in memo.modules.items():
+                values[name] = importlib.import_module(module)
         except Exception:
             del self.memo[key]  # an entry that will not load is not an answer
             return None
@@ -735,6 +803,7 @@ class Notebook:
                     "defines": sorted(self.cells[cid].defs),
                     "depends_on": sorted(self.parents_of[cid]),
                     "stateful": self.cells[cid].stateful,
+                    "impure": self.cells[cid].impure,
                     "failing": cid in failing,
                 }
                 for cid in self.topo()

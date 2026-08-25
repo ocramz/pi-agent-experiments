@@ -37,7 +37,7 @@
 	},
 	"files": [
 		"extensions/",
-		"src/",
+		"src/*.ts",
 		"py/*.py",
 		"py/kernel/*.py",
 		"LICENSE",

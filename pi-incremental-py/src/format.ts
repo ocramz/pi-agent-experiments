@@ -144,6 +144,8 @@ export interface InspectResponse {
 		defines: string[];
 		depends_on: string[];
 		stateful: boolean;
+		/** Declared to perform an effect, so it is re-run rather than cached. */
+		impure?: boolean;
 		failing: boolean;
 	}[];
 	globals?: Record<string, string>;
@@ -159,7 +161,11 @@ export function formatInspect(resp: InspectResponse): string {
 	const lines: string[] = [];
 	for (const c of resp.cells ?? []) {
 		const label = c.name ? `${c.id} (${c.name})` : c.id;
-		const flags = [c.stateful ? "stateful" : "", c.failing ? "FAILING" : ""]
+		const flags = [
+			c.stateful ? "stateful" : "",
+			c.impure ? "impure" : "",
+			c.failing ? "FAILING" : "",
+		]
 			.filter(Boolean)
 			.join(" ");
 		const deps = c.depends_on.length ? ` <- ${c.depends_on.join(", ")}` : "";

@@ -59,6 +59,19 @@ def check_name(name: str) -> None:
         )
 
 
+def _program(cell: Cell) -> tuple[str, bool]:
+    """What makes two cells the same computation.
+
+    `name` stays out — it is display metadata, and two variants disagreeing
+    about what to call a cell are not two programs. `impure` is in: it
+    decides whether the cell is ever answered from the cache, so a variant
+    that only sets it really is a different program and has to produce an
+    edit. Compared here rather than in `Notebook`, so `describe_variants`
+    reports the same difference `switch` would act on.
+    """
+    return cell.src, cell.impure
+
+
 def diff(src: dict[str, Cell], dst: dict[str, Cell]) -> list[Edit]:
     """The batch that turns one program into another.
 
@@ -75,12 +88,18 @@ def diff(src: dict[str, Cell], dst: dict[str, Cell]) -> list[Edit]:
     return [
         *(Edit("delete", id=cid) for cid in src.keys() - dst.keys()),
         *(
-            Edit("set", id=cid, src=dst[cid].src)
+            Edit("set", id=cid, src=dst[cid].src, impure=dst[cid].impure)
             for cid in src.keys() & dst.keys()
-            if src[cid].src != dst[cid].src
+            if _program(src[cid]) != _program(dst[cid])
         ),
         *(
-            Edit("add", id=cid, src=dst[cid].src, name=dst[cid].name)
+            Edit(
+                "add",
+                id=cid,
+                src=dst[cid].src,
+                name=dst[cid].name,
+                impure=dst[cid].impure,
+            )
             for cid in dst.keys() - src.keys()
         ),
     ]

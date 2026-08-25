@@ -98,6 +98,7 @@ export default function (pi: ExtensionAPI) {
 			"Prefer many small cells with one definition each over few big ones: smaller cells mean finer invalidation and less recompute.",
 			"A cell whose last line is an expression displays that value. Never print() for the user's benefit — stdout is captured in `output`, but the display value is the trailing expression.",
 			"Self-reference is temporal: `x = x + 1` reads the previous committed value. Write accumulators as `try: x = x + 1 / except NameError: x = None` so run_all replays converge (pick the initial value that fits; None means \"nothing yet\"). Rerunning such a stateful cell ADVANCES it — it is not a refresh.",
+			"Set `impure: true` on a cell that reads a clock, an RNG, the network or the filesystem. The kernel assumes a cell is a pure function of its source and its inputs, so without this it runs the effect ONCE and reports `cached` forever after — and a variant switch puts the old value back instead of fetching again. Marking it costs only that cell: dependents still skip when the value comes back unchanged.",
 			"If a cell fails, its dependents stay pending (not poisoned). Fix the cell and they re-run. Check `failing`/`pending` in the response.",
 			"On ImportError, use py_install — never pip/uv from bash, which bypasses the kernel's environment tracking and leaves cached cells stale.",
 		],
@@ -112,15 +113,32 @@ export default function (pi: ExtensionAPI) {
 			run: Type.Optional(
 				Type.Boolean({ description: "Execute immediately (default true). False stages the edit." }),
 			),
+			impure: Type.Optional(
+				Type.Boolean({
+					description:
+						"This cell reads a clock, an RNG, the network or the filesystem, so the same source " +
+						"can answer differently. It is then re-run every time instead of cached or restored. " +
+						"On modify, omit to leave the cell's current setting alone.",
+				}),
+			),
 		}),
 		async execute(_id, params) {
 			const resp = params.id
-				? await call({ tool: "set_cell", id: params.id, src: params.src, run: params.run ?? true })
+				? await call({
+						tool: "set_cell",
+						id: params.id,
+						src: params.src,
+						run: params.run ?? true,
+						// Omitted rather than defaulted: the kernel keeps the flag
+						// a cell already carries when an edit says nothing about it.
+						...(params.impure === undefined ? {} : { impure: params.impure }),
+					})
 				: await call({
 						tool: "add_cell",
 						src: params.src,
 						name: params.name,
 						run: params.run ?? true,
+						impure: params.impure ?? false,
 					});
 			const note = (resp as Record<string, unknown>)._lostState ? LOST_STATE_NOTE : undefined;
 			const response = resp as MutatingResponse;
@@ -229,6 +247,7 @@ export default function (pi: ExtensionAPI) {
 			"Fork before trying an alternative, not after: forking is free, and it is what lets you get the current results back without recomputing them.",
 			"Comparing alternatives is switch plus reading the globals — the values of the version you left are kept, so switching back is cheap however long its cells took.",
 			"A switch that would re-run a stateful cell is refused by name, because re-running an accumulator advances it instead of restoring it. Use force only if that cell's value is not what you are comparing.",
+			"An `impure` cell is not refused: switching re-performs its effect rather than putting the old value back, which is what marking it asked for. Its dependents still come out of the cache when the new value matches the old.",
 			"shallow gives you a variant's results without rebuilding what produced them — use it to compare outcomes across many variants. The cells behind those results stay pending and their globals absent, so run_all or any ordinary edit fills them back in.",
 		],
 		parameters: Type.Object({

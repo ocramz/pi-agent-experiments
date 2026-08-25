@@ -44,6 +44,24 @@ test("kernel round trip: add, inspect, modify by id", async (t) => {
 	}
 });
 
+test("impure reaches the kernel and comes back on inspect", async (t) => {
+	const { k } = kernelIn(t);
+	try {
+		const add = await k.call({ tool: "add_cell", src: "x = 1", name: "eff", impure: true });
+		const id = add.id as string;
+
+		const cells = (await k.call({ tool: "inspect" })).cells as { id: string; impure?: boolean }[];
+		assert.equal(cells.find((c) => c.id === id)?.impure, true);
+
+		// A set_cell that says nothing about the flag must not clear it.
+		await k.call({ tool: "set_cell", id, src: "x = 2" });
+		const after = (await k.call({ tool: "inspect" })).cells as { id: string; impure?: boolean }[];
+		assert.equal(after.find((c) => c.id === id)?.impure, true);
+	} finally {
+		k.kill();
+	}
+});
+
 test("calls are serialised even when issued concurrently", async (t) => {
 	const { k } = kernelIn(t);
 	try {
@@ -275,6 +293,20 @@ test("formatInspect renders the graph with labels and flags", () => {
 	assert.match(text, /abc123 \(load\): defines \[rows\]/);
 	assert.match(text, /def456: defines \[n\] <- abc123 {2}stateful FAILING/);
 	assert.match(text, /globals: rows=list\(3\)/);
+});
+
+test("formatInspect flags an impure cell separately from a stateful one", () => {
+	// Two different reasons a cell is not a pure function of its inputs, and
+	// a cell can carry either without the other.
+	const text = formatInspect({
+		ok: true,
+		cells: [
+			{ id: "abc123", name: "fetch", defines: ["page"], depends_on: [], stateful: false, impure: true, failing: false },
+			{ id: "def456", name: null, defines: ["n"], depends_on: [], stateful: true, impure: false, failing: false },
+		],
+	});
+	assert.match(text, /abc123 \(fetch\): defines \[page\] {2}impure$/m);
+	assert.match(text, /def456: defines \[n\] {2}stateful$/m);
 });
 
 test("formatVariants marks the current one and says what differs from it", () => {

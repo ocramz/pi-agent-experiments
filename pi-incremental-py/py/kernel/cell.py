@@ -13,7 +13,7 @@ import builtins
 import io
 import types
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 
 from .analysis import analyze_source, tail_expression
@@ -32,6 +32,12 @@ class Cell:
     body: types.CodeType
     tail: types.CodeType | None
     imports: bool  # edge from the synthetic environment root
+    # Declared by whoever wrote the cell: it reads a clock, an RNG, a URL
+    # or a file, so the same source over the same inputs may still answer
+    # differently. The one fact about a cell that cannot be recovered from
+    # its source, which is why it arrives on the `Edit` beside `name`
+    # rather than out of `analysis`.
+    impure: bool = False
 
     @property
     def stateful(self) -> bool:
@@ -44,7 +50,7 @@ class Cell:
         return bool(self.refs & self.defs)
 
     @classmethod
-    def of(cls, src: str, name: str | None) -> Cell:
+    def of(cls, src: str, name: str | None, impure: bool = False) -> Cell:
         """Analyse and compile in one parse.
 
         Compiling splits off a trailing expression — the one piece of
@@ -63,7 +69,14 @@ class Cell:
         body = compile(tree, "<cell>", "exec")
         tail = compile(tail_expr, "<cell>", "eval") if tail_expr is not None else None
         return cls(
-            src, name, analysis.defs, analysis.refs, body, tail, analysis.imports
+            src,
+            name,
+            analysis.defs,
+            analysis.refs,
+            body,
+            tail,
+            analysis.imports,
+            impure,
         )
 
 
@@ -105,12 +118,20 @@ class Memo:
 
     `nbytes` and `seconds` are the two numbers eviction needs: what an
     entry costs to keep, and what it would cost to recompute.
+
+    Two slots rather than one, because a module is not bytes. Pickling one
+    stores a pointer into `sys.modules`, so `freeze` refuses it — and a
+    cell that binds a module (`import time`) would otherwise be
+    unrestorable in its entirety. Recording the name and importing it back
+    keeps the entry whole; the environment is already in such a cell's key,
+    so an upgrade moves the key rather than reusing this.
     """
 
     blobs: dict[str, bytes]  # def name -> the bytes it round-trips through
     nbytes: int
     seconds: float
     result: Result
+    modules: dict[str, str] = field(default_factory=dict)  # def name -> module name
 
 
 def fresh_namespace() -> dict[str, object]:

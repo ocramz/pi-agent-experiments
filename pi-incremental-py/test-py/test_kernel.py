@@ -5,9 +5,12 @@
 No third-party packages required.
 """
 
+import dataclasses
 import os
 import sys
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
@@ -542,6 +545,60 @@ class TestMemo(unittest.TestCase):
         nb.add("boom = 1 / 0", name="boom")
         self.assertEqual(nb.memo, {})
 
+    # ---- module-valued defs
+
+    # Binds `math` as well as `unit`, and reads `scale`, so it is
+    # displaceable. `math` is a def and never a ref, so this is an
+    # ordinary cell and not an accumulator.
+    IMPORTING = "import math\nunit = math.floor(scale)"
+
+    def test_a_cell_binding_a_module_is_memoized(self):
+        """`freeze` refuses a module — pickling one stores a pointer into
+        `sys.modules` — which used to cost the cell its whole entry.
+        Recorded by name and imported back instead."""
+        import math
+
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        knob, _ = nb.add("scale = 1", name="knob")
+        cell, _ = nb.add(self.IMPORTING, name="importer")
+
+        self.assertEqual(self.statuses(nb.set(knob, "scale = 2"))[cell], "ran")
+        self.assertEqual(self.statuses(nb.set(knob, "scale = 1"))[cell], "restored")
+        self.assertIs(nb.ns["math"], math)
+        self.assertEqual(nb.ns["unit"], 1)
+
+    def test_hoisting_the_import_no_longer_changes_the_answer(self):
+        """The asymmetry this closes. The same computation with its import
+        lifted into a cell of its own was restorable; with the import left
+        in place it was not, and re-ran on every round trip."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        knob, _ = nb.add("scale = 1", name="knob")
+        inline, _ = nb.add(self.IMPORTING, name="inline")
+        nb.add("import statistics", name="hoisted")
+        lifted, _ = nb.add("other = statistics.mean([scale, scale])", name="lifted")
+
+        nb.set(knob, "scale = 2")
+        results = self.statuses(nb.set(knob, "scale = 1"))
+        self.assertEqual(results[lifted], "restored")  # always worked
+        self.assertEqual(results[inline], "restored")  # now agrees
+
+    def test_an_entry_whose_module_will_not_import_is_a_miss(self):
+        """The same rule a blob that will not load gets: an entry that
+        cannot be rebuilt is not an answer, and must not be a crash."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        knob, _ = nb.add("scale = 1", name="knob")
+        cell, _ = nb.add(self.IMPORTING, name="importer")
+        key = nb.done[cell].key
+        nb.set(knob, "scale = 2")
+
+        nb.memo[key] = dataclasses.replace(
+            nb.memo[key], modules={"math": "no_such_module_xyz"}
+        )
+        self.assertEqual(self.statuses(nb.set(knob, "scale = 1"))[cell], "ran")
+        # Dropped on the way past, and the re-run wrote an honest one back
+        # under the same key — the miss costs one execution, not the entry.
+        self.assertEqual(nb.memo[key].modules, {"math": "math"})
+
     def test_a_cheap_cell_is_not_worth_saving(self):
         """The default threshold: pickling a value costs real work, and
         below it the cell was cheaper to run than to store."""
@@ -951,6 +1008,238 @@ class TestOpaqueGlobals(unittest.TestCase):
         self.assertEqual(self.opaque(nb), [])
 
 
+class Fetches:
+    """A counted stand-in for the effect all of this is about.
+
+    Every call answers differently, exactly as a clock or a URL does, and
+    the count is the only honest witness to whether the effect was really
+    performed — a status of `cached` says the kernel *thinks* it skipped
+    work, not that it did.
+    """
+
+    def __init__(self):
+        self.n = 0
+
+    def __call__(self, url):
+        self.n += 1
+        return f"{url}-{self.n}"
+
+
+class TestEffectfulCells(unittest.TestCase):
+    """Cells that read a clock, an RNG or a URL.
+
+    The kernel assumes a cell is a pure function of its source and its
+    inputs, and can *see* only two ways for that to fail: a self-edge
+    (`stateful`), and a global `digest` cannot identify (`opaque`). An
+    effectful cell is neither — a timestamp pickles perfectly well — so it
+    has to say so. These cases pin both sides: what an unmarked one does,
+    which is the behaviour the whole design implies, and what marking one
+    buys.
+    """
+
+    def build(self, impure=False):
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        fetches = Fetches()
+        nb.ns["_fetch"] = fetches  # no cell provides it, so it keys nothing
+        knob, _ = nb.add("url = 'a'", name="knob")
+        page, _ = nb.add("page = _fetch(url)", name="fetch", impure=impure)
+        report, _ = nb.add("report = page.upper()", name="report")
+        return nb, fetches, knob, page, report
+
+    def statuses(self, results):
+        return {r.cell: r.status for r in results}
+
+    # ---- unmarked: the contract as it stands
+
+    def test_unmarked_it_caches_and_the_effect_is_paid_once(self):
+        nb, fetches, _, page, _ = self.build()
+        self.assertEqual(fetches.n, 1)
+
+        nb.pending = {page}
+        self.assertEqual(self.statuses(nb.run())[page], "cached")
+        self.assertEqual(fetches.n, 1)  # source and inputs still, so no fetch
+
+    def test_unmarked_a_variant_round_trip_puts_the_old_answer_back(self):
+        """The one the version trees make reachable: the fetch is displaced
+        by the fork's edit and comes out of the memo on the way home."""
+        nb, fetches, knob, page, _ = self.build()
+        nb.fork("alt")
+        nb.set(knob, "url = 'b'")
+        self.assertEqual(fetches.n, 2)  # diverging really did fetch
+
+        results = self.statuses(nb.switch("main"))
+        self.assertEqual(results[page], "restored")
+        self.assertEqual(fetches.n, 2)  # ...and coming back did not
+        self.assertEqual(nb.ns["page"], "a-1")  # the first fetch, not a fresh one
+
+    def test_unmarked_the_description_index_will_answer_for_it(self):
+        """The sharpest edge. `run_shallow` hands back a result whose inputs
+        were never rebuilt, and an unmarked effectful cone carries nothing
+        that tells it not to."""
+        nb, fetches, _, page, report = self.build()
+        self.assertTrue(nb._deterministic(page))
+        self.assertTrue(nb._deterministic(report))
+
+        nb.fork("scratch")
+        nb.delete(report)
+        nb.delete(page)
+        results = self.statuses(nb.switch("main", shallow=True))
+        self.assertEqual(results[report], "restored")
+        self.assertNotIn(page, results)  # answered without re-fetching
+        self.assertEqual(fetches.n, 1)
+
+    def test_unmarked_rerun_re_performs_the_effect(self):
+        """One of the two manual escape hatches. Both already worked;
+        nothing had ever checked that they do."""
+        nb, fetches, _, page, _ = self.build()
+        nb.rerun(page)
+        self.assertEqual(fetches.n, 2)
+        self.assertEqual(nb.ns["page"], "a-2")
+
+    def test_unmarked_a_restart_re_performs_the_effect(self):
+        """The other one, on a real clock — a restart drops the namespace
+        and the memo together, which is why it is the recovery move."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        cid, _ = nb.add("import time\nstamp = time.time_ns()", name="clock")
+        first = nb.ns["stamp"]
+
+        nb.pending = {cid}
+        self.assertEqual(self.statuses(nb.run())[cid], "cached")
+        self.assertEqual(nb.ns["stamp"], first)  # the clock was not consulted
+
+        nb.run_all(restart=True)
+        self.assertNotEqual(nb.ns["stamp"], first)
+
+    # ---- marked: what declaring it buys
+
+    def test_marked_it_never_caches(self):
+        nb, fetches, _, page, _ = self.build(impure=True)
+        # No content names its next run, so it cannot be handed an address.
+        self.assertNotEqual(nb._key(page), nb._key(page))
+
+        nb.pending = {page}
+        self.assertEqual(self.statuses(nb.run())[page], "ran")
+        self.assertEqual(fetches.n, 2)
+
+    def test_a_poisoned_key_is_unique_inside_one_clock_tick(self):
+        """`time_ns` does not promise to advance between two calls, and a
+        poison that repeats is a key that *matches* — a cell reported
+        `cached` over an effect that was never re-performed. The counter is
+        what makes it unique; the clock only separates processes."""
+        nb, _, _, page, _ = self.build(impure=True)
+        with mock.patch.object(time, "time_ns", return_value=1):
+            minted = {nb._key(page) for _ in range(100)}
+        self.assertEqual(len(minted), 100)
+
+    def test_marked_it_re_runs_even_when_the_clock_stands_still(self):
+        """The same guarantee, through the front door."""
+        nb, fetches, _, page, _ = self.build(impure=True)
+        with mock.patch.object(time, "time_ns", return_value=1):
+            for _ in range(3):
+                nb.pending = {page}
+                self.assertEqual(self.statuses(nb.run())[page], "ran")
+        self.assertEqual(fetches.n, 4)
+
+    def test_marked_it_is_re_run_on_an_ordinary_pass(self):
+        nb, fetches, _, page, _ = self.build(impure=True)
+        nb.pending = {page}
+        self.assertEqual(self.statuses(nb.run())[page], "ran")
+        self.assertEqual(fetches.n, 2)
+
+    def test_marked_a_variant_round_trip_re_performs_the_effect(self):
+        nb, fetches, knob, page, _ = self.build(impure=True)
+        nb.fork("alt")
+        nb.set(knob, "url = 'b'")
+        self.assertEqual(fetches.n, 2)
+
+        results = self.statuses(nb.switch("main"))
+        self.assertEqual(results[page], "ran")  # not `restored`
+        self.assertEqual(fetches.n, 3)
+        self.assertEqual(nb.ns["page"], "a-3")  # fetched again, not put back
+
+    def test_marked_a_dependent_still_cuts_off_when_the_value_repeats(self):
+        """What makes the poison cheap: it moves the impure cell's own key,
+        never its dependents'. Those key off the address of what it
+        produced, so an unchanged answer still stops there."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        calls = {"n": 0}
+        nb.ns["_clock"] = lambda: calls.__setitem__("n", calls["n"] + 1) or 7
+        stamp, _ = nb.add("stamp = _clock()", name="stamp", impure=True)
+        reader, _ = nb.add("doubled = stamp * 2", name="reader")
+
+        nb.pending = {stamp}
+        results = self.statuses(nb.run())
+        self.assertEqual(results[stamp], "ran")  # the effect was re-performed
+        self.assertEqual(results[reader], "cached")  # its answer did not move
+        self.assertEqual(calls["n"], 2)
+
+    def test_marked_nothing_is_memoized_for_it(self):
+        """An entry under a nonce could never be found again, only
+        accumulate."""
+        nb, _, _, _, _ = self.build(impure=True)
+        stored = {name for m in nb.memo.values() for name in m.blobs}
+        self.assertNotIn("page", stored)
+        self.assertIn("report", stored)  # its dependents are cached as usual
+
+    def test_marked_the_description_index_declines_it(self):
+        nb, _, _, page, report = self.build(impure=True)
+        self.assertFalse(nb._deterministic(page))
+        self.assertFalse(nb._deterministic(report))  # inherited down the cone
+
+        nb.fork("scratch")
+        nb.delete(report)
+        nb.delete(page)
+        self.assertEqual(self.statuses(nb.switch("main", shallow=True)), {})
+        self.assertIn(report, nb.pending)
+
+    def test_a_switch_across_an_impure_cell_is_not_refused(self):
+        """The contrast with an accumulator, and the reason there is no
+        guard here. Re-performing a fetch restores it; advancing a counter
+        does not, and the value it left is unrecoverable."""
+        nb, _, knob, page, _ = self.build(impure=True)
+        nb.fork("alt")
+        nb.set(knob, "url = 'b'")
+
+        nb.switch("main")  # no StatefulVariantError
+        self.assertEqual(nb.current, "main")
+        self.assertFalse(nb.stateful(page))
+
+    def test_inspect_reports_the_flag(self):
+        nb, _, _, page, _ = self.build(impure=True)
+        described = {c["id"]: c for c in nb.describe()["cells"]}
+        self.assertTrue(described[page]["impure"])
+        self.assertFalse(described[page]["stateful"])  # a different thing
+
+    # ---- the metadata channel itself
+
+    def test_a_set_that_says_nothing_keeps_the_flag(self):
+        """As `name` survives a `set`: an edit carrying source is not a
+        request to clear the cell's metadata."""
+        nb, _, _, page, _ = self.build(impure=True)
+        nb.set(page, "page = _fetch(url) + '!'")
+        self.assertTrue(nb.cells[page].impure)
+
+        nb.set(page, "page = _fetch(url)", impure=False)
+        self.assertFalse(nb.cells[page].impure)
+
+    def test_two_variants_differing_only_in_the_flag_are_two_programs(self):
+        """`diff` compares what the cells compute, and the flag decides
+        whether a cell is ever answered from the cache — so a variant that
+        only sets it has to produce an edit, or switching would be a no-op
+        that silently left the wrong program running."""
+        nb, _, _, page, _ = self.build()
+        nb.fork("live")
+        nb.set(page, "page = _fetch(url)", impure=True)
+
+        described = {v["name"]: v for v in nb.describe_variants()["variants"]}
+        self.assertEqual(described["main"]["differs"], [page])
+
+        nb.switch("main")
+        self.assertFalse(nb.cells[page].impure)  # the flag travelled back
+        nb.switch("live")
+        self.assertTrue(nb.cells[page].impure)  # ...and forward again
+
+
 class Counted:
     """Counts how many times it is pickled — i.e. how often the kernel
     computes its content address."""
@@ -1170,6 +1459,26 @@ class TestProtocol(unittest.TestCase):
         src = "c = c + 1 if 'c' in dir() else 0"
         acc = handle(nb, {"tool": "add_cell", "src": src})
         self.assertTrue(acc["results"][0]["stateful"])
+
+    def test_impure_travels_the_protocol_on_every_verb(self):
+        """It is declared, so the wire is the only way it can arrive."""
+        nb = Notebook(seed=1)
+        cid = handle(nb, {"tool": "add_cell", "src": "x = 1", "impure": True})["id"]
+        described = {c["id"]: c for c in handle(nb, {"tool": "inspect"})["cells"]}
+        self.assertTrue(described[cid]["impure"])
+
+        # A `set_cell` that says nothing about the flag leaves it alone.
+        handle(nb, {"tool": "set_cell", "id": cid, "src": "x = 2"})
+        self.assertTrue(nb.cells[cid].impure)
+
+        # ...and `apply_edits` carries it on both arms.
+        edits = [{"op": "set", "id": cid, "src": "x = 3", "impure": False}]
+        handle(nb, {"tool": "apply_edits", "edits": edits})
+        self.assertFalse(nb.cells[cid].impure)
+
+        made = [{"op": "add", "src": "y = 1", "impure": True}]
+        added = handle(nb, {"tool": "apply_edits", "edits": made})
+        self.assertTrue(nb.cells[added["created"][0]].impure)
 
     def test_deleting_a_cell_still_serialises_its_dependents(self):
         # `stateful` is asked of the notebook, which no longer holds the cell.
