@@ -15,10 +15,15 @@ from kernel import (  # noqa: E402
     CycleError,
     DuplicateNameError,
     Edit,
+    Memo,
     MultipleDefinitionError,
     Notebook,
+    Result,
+    StatefulVariantError,
     analyze,
+    digest,
 )
+from kernel.values import _hash  # noqa: E402
 from protocol import handle  # noqa: E402
 
 
@@ -303,6 +308,658 @@ class TestVersionedNamespaces(unittest.TestCase):
         nb.add(self.IDIOM, name="counter")
         desc = nb.describe()
         self.assertTrue(desc["cells"][0]["stateful"])
+
+
+class TestAddressing(unittest.TestCase):
+    """A value's content address is computed once and reused as key
+    material, instead of being re-derived per reader per run.
+
+    The point of the change is cost, so the tests are about *how often*
+    hashing happens and about the invalidation that caching it makes
+    necessary. That it does not change the keys themselves is asserted
+    first, because everything else assumes it."""
+
+    def test_a_key_still_hashes_the_digests_of_its_inputs(self):
+        """The address is the digest. Same rules, same bytes, same key —
+        so every caching property proved against the old formula still
+        describes this one."""
+        nb = Notebook(seed=1)
+        nb.add("source = 10", name="config")
+        load, _ = nb.add("rows = [source, 2, 3]", name="load")
+
+        expected = _hash("rows = [source, 2, 3]" + repr([("source", digest(10))]))
+        self.assertEqual(nb._key(load), expected)
+
+    def test_a_value_is_hashed_once_however_many_cells_read_it(self):
+        """The cost this change exists to remove: three readers used to
+        mean three picklings of the same object on every run.
+
+        Forced with `rerun`, because a producer that is merely pending is
+        found fresh and never re-executes — in which case its address is
+        not retracted at all and the count is zero, which would pass for
+        the wrong reason."""
+        nb = Notebook(seed=1)
+        nb.ns["_counter"] = Counted()
+        produce, _ = nb.add("shared = _counter", name="produce")
+        nb.add("a = shared", name="a")
+        nb.add("b = shared", name="b")
+        nb.add("c = shared", name="c")
+
+        Counted.pickled = 0
+        nb.rerun(produce)  # re-executes, retracting `shared`'s address
+        self.assertEqual(Counted.pickled, 1)
+
+    def test_an_address_survives_a_run_that_executes_nothing(self):
+        """The other half, and where the saving actually lives: readers
+        that turn out to be cached never execute, so nothing retracts the
+        address and the next run re-hashes nothing at all."""
+        nb = Notebook(seed=1)
+        nb.ns["_counter"] = Counted()
+        produce, _ = nb.add("shared = _counter", name="produce")
+        nb.add("a = shared", name="a")
+        nb.add("b = shared", name="b")
+
+        nb.pending = {produce}
+        nb.run()  # warms the address; every cell comes out cached
+
+        Counted.pickled = 0
+        nb.pending = {produce}
+        nb.run()
+        self.assertEqual(Counted.pickled, 0)
+
+    def test_a_cell_mutating_what_it_reads_retracts_the_address(self):
+        """`data.append(4)` binds nothing, so retracting on rebind alone
+        would leave a reader keyed on the value the list used to hold.
+        Hashing per read caught this for free; retracting refs is what
+        buys it back."""
+        nb = Notebook(seed=1)
+        nb.add("data = [1, 2, 3]", name="source")
+        reader, _ = nb.add("total = sum(data)", name="reader")
+        mutate, _ = nb.add("data.append(4)", name="mutate")
+        before = nb._key(reader)
+
+        nb.set(mutate, "data.append(99)")  # re-executes, mutating in place
+        self.assertNotEqual(nb._key(reader), before)
+
+    def test_a_snippet_mutating_a_global_retracts_the_address(self):
+        """The same hole through the human's escape hatch."""
+        nb = Notebook(seed=1)
+        nb.add("data = [1, 2, 3]", name="source")
+        reader, _ = nb.add("total = sum(data)", name="reader")
+        before = nb._key(reader)
+
+        nb.eval_src("data.append(99)")
+        self.assertNotEqual(nb._key(reader), before)
+
+    def test_rebinding_a_global_retracts_its_address(self):
+        nb = Notebook(seed=1)
+        source, _ = nb.add("source = 10", name="config")
+        load, _ = nb.add("rows = [source, 2, 3]", name="load")
+        before = nb._key(load)
+
+        nb.set(source, "source = 99")
+        self.assertNotEqual(nb._key(load), before)
+
+    def test_eval_clobbering_a_global_retracts_its_address(self):
+        """`/py` execs in the live namespace, so a snippet can rebind a
+        global some cell provides. The old key re-hashed on every read and
+        noticed; a recorded address has to be retracted by hand."""
+        nb = Notebook(seed=1)
+        nb.add("source = 10", name="config")
+        load, _ = nb.add("rows = [source, 2, 3]", name="load")
+        before = nb._key(load)
+
+        nb.eval_src("source = 99")
+        self.assertNotEqual(nb._key(load), before)
+
+    def test_a_snippet_binding_an_unowned_name_leaves_addresses_alone(self):
+        nb = Notebook(seed=1)
+        nb.add("source = 10", name="config")
+        load, _ = nb.add("rows = [source, 2, 3]", name="load")
+        before = nb._key(load)
+
+        nb.eval_src("scratch = 99")  # no cell provides `scratch`
+        self.assertEqual(nb._key(load), before)
+
+    def test_run_all_drops_every_address(self):
+        """`run_all` is the recovery move: it drops the namespace, so the
+        addresses describing it cannot be allowed to outlive it."""
+        nb = Notebook(seed=1)
+        nb.add("source = 10", name="config")
+        nb.add("rows = [source, 2, 3]", name="load")
+        nb.addr["ghost"] = ("stale", 0)
+
+        nb.run_all()
+        self.assertNotIn("ghost", nb.addr)
+
+    def test_deleting_a_cell_retracts_its_address_with_its_global(self):
+        nb = Notebook(seed=1)
+        source, _ = nb.add("source = 10", name="config")
+        load, _ = nb.add("rows = [source, 2, 3]", name="load")
+        nb._key(load)  # records an address for `source`
+
+        nb.delete(load)
+        nb.delete(source)
+        self.assertNotIn("source", nb.addr)
+
+
+class TestMemo(unittest.TestCase):
+    """A value displaced by an edit is not lost: the key that produced it
+    still names it, so undoing the edit puts it back without re-running.
+
+    `memo_min_seconds=0` throughout — these cells run in microseconds, and
+    the default threshold exists to stop the kernel pickling values that
+    were cheaper to compute than to save."""
+
+    def build(self, **kw):
+        nb = Notebook(seed=1, memo_min_seconds=0, **kw)
+        config, _ = nb.add("source = 10", name="config")
+        load, _ = nb.add("rows = [source, 2, 3]", name="load")
+        return nb, config, load
+
+    def statuses(self, results):
+        return {r.cell: r.status for r in results}
+
+    def test_undoing_an_edit_restores_instead_of_rerunning(self):
+        """The round trip. `load` re-runs on the way out and comes back
+        without executing, because its key is the one it had before."""
+        nb, config, load = self.build()
+        self.assertEqual(self.statuses(nb.set(config, "source = 99"))[load], "ran")
+        self.assertEqual(self.statuses(nb.set(config, "source = 10"))[load], "restored")
+        self.assertEqual(nb.ns["rows"], [10, 2, 3])
+
+    def test_a_restored_cell_carries_its_value(self):
+        nb, config, load = self.build()
+        nb.set(config, "source = 99")
+        results = {r.cell: r for r in nb.set(config, "source = 10")}
+        self.assertIsNotNone(results[load].value)
+
+    def test_two_programs_reaching_the_same_value_share_one_entry(self):
+        """Convergence: the entry belongs to the computation, not to the
+        cell that got there first. A different upstream *source* that
+        yields the same upstream *value* is the same key downstream."""
+        nb, config, load = self.build()
+        nb.set(config, "source = 99")
+        # Same value as the original, reached by different source.
+        results = self.statuses(nb.set(config, "source = 5 * 2"))
+        self.assertEqual(results[config], "ran")
+        self.assertEqual(results[load], "restored")
+
+    def test_a_restored_cell_is_fresh_next_time(self):
+        """Restoring commits a run, so the cell is live in the namespace
+        again and the next pass finds it cached rather than restoring it
+        a second time."""
+        nb, config, load = self.build()
+        nb.set(config, "source = 99")
+        self.assertEqual(self.statuses(nb.set(config, "source = 10"))[load], "restored")
+
+        nb.pending = {load}
+        self.assertEqual(self.statuses(nb.run())[load], "cached")
+
+    def test_a_convergent_restore_is_attributed_to_the_cell_that_asked(self):
+        """Entries belong to computations, so the cell that stored one and
+        the cell that gets it back need not be the same cell."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        first, _ = nb.add("shared = sum([1, 2, 3])", name="first")
+        nb.delete(first)
+        second, results = nb.add("shared = sum([1, 2, 3])", name="second")
+
+        self.assertEqual(self.statuses(results)[second], "restored")
+        self.assertEqual(nb.done[second].result.cell, second)
+
+    def test_rerun_forces_past_the_memo(self):
+        """`rerun` pops `done` so freshness cannot short-circuit it; the
+        memo is a second place the same short-circuit could happen."""
+        nb, config, load = self.build()
+        nb.set(config, "source = 99")
+        nb.set(config, "source = 10")  # `load` is now restored, not run
+        self.assertEqual(self.statuses(nb.rerun(load))[load], "ran")
+
+    def test_run_all_replays_rather_than_answering_from_the_memo(self):
+        """The recovery move has to actually execute. It refills the memo
+        as it goes, so what proves the wipe is that nothing survived it."""
+        nb, _, load = self.build()
+        nb.memo["ghost"] = Memo({"a": b"x"}, 1, 1.0, Result("a", "ran", 1.0))
+
+        self.assertEqual(self.statuses(nb.run_all())[load], "ran")
+        self.assertNotIn("ghost", nb.memo)
+
+    def test_a_cell_defining_a_function_is_not_memoized(self):
+        """Pickle stores a function by name, so it would come back as
+        whatever answers to that name later — not as what was saved."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        nb.add("def scale(x):\n    return x * 2\n", name="fn")
+        self.assertEqual(nb.memo, {})
+
+    def test_an_unpicklable_value_is_not_memoized(self):
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        nb.add("import socket\nsock = socket.socket()", name="net")
+        self.addCleanup(nb.ns["sock"].close)
+        self.assertEqual(nb.memo, {})
+
+    def test_a_failed_run_is_not_memoized(self):
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        nb.add("boom = 1 / 0", name="boom")
+        self.assertEqual(nb.memo, {})
+
+    def test_a_cheap_cell_is_not_worth_saving(self):
+        """The default threshold: pickling a value costs real work, and
+        below it the cell was cheaper to run than to store."""
+        nb = Notebook(seed=1)  # default memo_min_seconds
+        nb.add("source = 10", name="config")
+        self.assertEqual(nb.memo, {})
+
+    def test_eviction_keeps_what_is_expensive_per_byte(self):
+        """An LRU would drop the slow entry to keep the big one. Cost per
+        byte is the question a cache of computed values is answering."""
+        nb = Notebook(seed=1, memo_min_seconds=0, memo_budget=50)
+        # `bulky` is the more recently used, and by far the larger.
+        nb.memo["slow"] = Memo({"a": b"xx"}, 2, 10.0, Result("a", "ran", 10.0))
+        nb.memo["bulky"] = Memo({"b": b"x" * 100}, 100, 0.1, Result("b", "ran", 0.1))
+        nb._evict()
+        self.assertEqual(list(nb.memo), ["slow"])
+
+
+class TestVariants(unittest.TestCase):
+    """Alternative programs over one namespace, and the reuse that makes
+    moving between them worth doing."""
+
+    def build(self, **kw):
+        """The shape the design is for: a shared prefix, then a cell whose
+        alternatives are what the researcher is actually comparing."""
+        nb = Notebook(seed=1, memo_min_seconds=0, **kw)
+        load, _ = nb.add("raw = [1, 2, 3, 4]", name="load")
+        feats, _ = nb.add("feats = [x * 10 for x in raw]", name="feats")
+        model, _ = nb.add("model = ('mean', sum(feats) / len(feats))", name="model")
+        score, _ = nb.add("score = model[1] * 2", name="score")
+        return nb, load, feats, model, score
+
+    def statuses(self, results):
+        return {r.cell: r.status for r in results}
+
+    def test_forking_leaves_the_program_alone(self):
+        nb, *_ = self.build()
+        before = dict(nb.cells)
+        nb.fork("alt")
+        self.assertEqual(nb.current, "alt")
+        self.assertEqual(nb.cells, before)
+
+    def test_a_variant_edit_reruns_only_below_the_divergence(self):
+        """Level one: upstream of the fork point is never recomputed."""
+        nb, load, feats, model, score = self.build()
+        nb.fork("median")
+        results = self.statuses(nb.set(model, "model = ('median', 25.0)"))
+
+        self.assertEqual(results[model], "ran")
+        self.assertEqual(results[score], "ran")
+        self.assertNotIn(load, results)  # not even considered
+        self.assertNotIn(feats, results)
+
+    def test_switching_back_restores_rather_than_recomputes(self):
+        """Level two, and the whole point: the displaced computation comes
+        back out of the memo instead of being redone."""
+        nb, _, _, model, score = self.build()
+        nb.fork("median")
+        nb.set(model, "model = ('median', 25.0)")
+
+        results = self.statuses(nb.switch("main"))
+        self.assertEqual(results[model], "restored")
+        self.assertEqual(results[score], "restored")
+        self.assertEqual(nb.ns["model"], ("mean", 25.0))
+
+    def test_a_round_trip_leaves_the_program_identical(self):
+        nb, *_ = self.build()
+        before = list(nb.cells.items())
+        nb.fork("alt")
+        nb.add("extra = 1", name="extra")
+        nb.switch("main")
+        self.assertEqual(list(nb.cells.items()), before)
+
+    def test_variants_may_bind_the_same_name_differently(self):
+        """The reason variants exist: two cells cannot both provide
+        `model`, so the alternatives cannot be siblings in one graph."""
+        nb, _, _, model, _ = self.build()
+        nb.fork("median")
+        nb.set(model, "model = ('median', 25.0)")
+        self.assertEqual(nb.ns["model"][0], "median")
+
+        nb.switch("main")
+        self.assertEqual(nb.ns["model"][0], "mean")
+
+    def test_a_variant_that_adds_a_cell_retracts_it_on_the_way_out(self):
+        nb, *_ = self.build()
+        nb.fork("extra")
+        nb.add("bonus = 99", name="bonus")
+        self.assertIn("bonus", nb.ns)
+
+        nb.switch("main")
+        self.assertNotIn("bonus", nb.ns)  # its provider is gone
+
+    def test_switching_preserves_cell_ids(self):
+        """Ids are what let the agent talk about `model` across variants,
+        and what makes the two variants' keys line up."""
+        nb, *_ = self.build()
+        ids = set(nb.cells)
+        nb.fork("alt")
+        nb.add("extra = 1")
+        nb.switch("main")
+        self.assertEqual(set(nb.cells), ids)
+
+    def test_dropping_a_variant_invalidates_nothing(self):
+        """Entries are addressed by what they computed, so a name going
+        away cannot take a value with it."""
+        nb, _, _, model, score = self.build()
+        nb.fork("median")
+        nb.set(model, "model = ('median', 25.0)")
+        nb.switch("main")
+        nb.drop("median")
+
+        nb.set(model, "model = ('median', 25.0)")
+        self.assertEqual(self.statuses(nb.rerun(score))[score], "ran")
+        self.assertEqual(nb.ns["model"][0], "median")
+
+    def test_the_current_variant_cannot_be_dropped(self):
+        nb, *_ = self.build()
+        nb.fork("alt")
+        with self.assertRaises(ValueError):
+            nb.drop("alt")
+
+    def test_forking_a_name_twice_is_refused(self):
+        nb, *_ = self.build()
+        nb.fork("alt")
+        nb.switch("main")
+        with self.assertRaises(DuplicateNameError):
+            nb.fork("alt")
+
+    def test_a_bad_variant_name_is_refused(self):
+        nb, *_ = self.build()
+        with self.assertRaises(ValueError):
+            nb.fork("Not A Name")
+
+    def test_switching_to_an_unknown_variant_is_refused(self):
+        nb, *_ = self.build()
+        with self.assertRaises(KeyError):
+            nb.switch("nope")
+
+    def test_variants_reports_what_differs_from_the_current_one(self):
+        nb, _, _, model, _ = self.build()
+        nb.fork("median")
+        nb.set(model, "model = ('median', 25.0)")
+
+        described = nb.describe_variants()
+        by_name = {v["name"]: v for v in described["variants"]}
+        self.assertEqual(described["current"], "median")
+        self.assertEqual(by_name["median"]["differs"], [])
+        self.assertEqual(by_name["main"]["differs"], [model])
+        self.assertEqual(by_name["median"]["parent"], "main")
+
+    def test_inspect_names_the_variant(self):
+        nb, *_ = self.build()
+        self.assertEqual(nb.describe()["variant"], "main")
+        nb.fork("alt")
+        self.assertEqual(nb.describe()["variant"], "alt")
+
+    # ---- the guard
+
+    # Reads what it writes, and sits downstream of `knob` — so an edit to
+    # `knob` puts it in the blast radius.
+    ACCUMULATOR = "try:\n    seen = seen + knob\nexcept NameError:\n    seen = knob"
+
+    def accumulating(self):
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        knob, _ = nb.add("knob = 1", name="knob")
+        counter, _ = nb.add(self.ACCUMULATOR, name="counter")
+        other, _ = nb.add("other = 1", name="other")
+        return nb, knob, counter, other
+
+    def test_a_switch_across_an_accumulator_is_refused(self):
+        """Such a cell keys on its own last value, so a switch advances it
+        rather than restoring it — and the value it left is unrecoverable."""
+        nb, knob, counter, _ = self.accumulating()
+        nb.fork("alt")
+        nb.set(knob, "knob = 2")
+
+        with self.assertRaises(StatefulVariantError) as caught:
+            nb.switch("main")
+        self.assertIn(counter, str(caught.exception))
+        self.assertEqual(nb.current, "alt")  # refused, and went nowhere
+
+    def test_a_refused_switch_leaves_the_program_untouched(self):
+        nb, knob, _, _ = self.accumulating()
+        nb.fork("alt")
+        nb.set(knob, "knob = 2")
+        before = dict(nb.cells)
+
+        with self.assertRaises(StatefulVariantError):
+            nb.switch("main")
+        self.assertEqual(nb.cells, before)
+
+    def test_force_proceeds_across_an_accumulator(self):
+        nb, knob, _, _ = self.accumulating()
+        nb.fork("alt")
+        nb.set(knob, "knob = 2")
+
+        nb.switch("main", force=True)
+        self.assertEqual(nb.current, "main")
+
+    def test_an_accumulator_outside_the_cone_does_not_block(self):
+        """The guard is about the blast radius, not about the notebook
+        containing an accumulator anywhere."""
+        nb, _, _, other = self.accumulating()
+        nb.fork("alt")
+        nb.set(other, "other = 2")  # cone is {other}; the counter is elsewhere
+
+        nb.switch("main")
+        self.assertEqual(nb.current, "main")
+
+
+class TestDescriptions(unittest.TestCase):
+    """The second identity: what a program *says*, not what it produced.
+
+    A key cannot be known before its inputs exist; a description can. That
+    is what lets a result be found without building what is behind it —
+    and the reason it needs a determinism gate that a key does not."""
+
+    def build(self, seed=1, **kw):
+        nb = Notebook(seed=seed, memo_min_seconds=0, **kw)
+        raw, _ = nb.add("raw = [1, 2, 3, 4]", name="raw")
+        feats, _ = nb.add("feats = [x * 10 for x in raw]", name="feats")
+        score, _ = nb.add("score = sum(feats)", name="score")
+        return nb, raw, feats, score
+
+    def test_a_description_covers_the_whole_upstream_subtree(self):
+        nb, raw, feats, score = self.build()
+        before = nb.descriptions()
+
+        nb.set(raw, "raw = [9, 9]")
+        after = nb.descriptions()
+        self.assertNotEqual(after[score], before[score])  # an ancestor moved
+        self.assertNotEqual(after[raw], before[raw])
+
+    def test_a_description_ignores_what_the_values_turn_out_to_be(self):
+        """The complement of a key, which is built from values alone: two
+        sources computing the same thing describe differently."""
+        nb, raw, _, score = self.build()
+        before = nb.descriptions()[score]
+        nb.set(raw, "raw = [1, 2, 3] + [4]")  # same value, different words
+        self.assertNotEqual(nb.descriptions()[score], before)
+
+    def test_a_description_is_independent_of_cell_ids(self):
+        """Ids are minted at random. Two notebooks holding the same program
+        have to describe it the same way, or nothing could be shared."""
+        one, *_ = self.build()
+        other, *_ = self.build(seed=7)
+        self.assertNotEqual(set(one.cells), set(other.cells))
+        self.assertEqual(
+            sorted(one.descriptions().values()), sorted(other.descriptions().values())
+        )
+
+    def test_the_environment_reaches_the_descriptions_of_importers(self):
+        nb = Notebook(seed=1)
+        probe, _ = nb.add("import json\nlib = json", name="probe")
+        plain, _ = nb.add("plain = 1", name="plain")
+        before = nb.descriptions()
+
+        nb.env = "pretend something was installed"
+        after = nb.descriptions()
+        self.assertNotEqual(after[probe], before[probe])
+        self.assertEqual(after[plain], before[plain])
+
+    # ---- the gate
+
+    def test_an_accumulator_makes_a_description_untrustworthy(self):
+        """Its value is a function of how many times it ran, which is not
+        something its source records."""
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        counter, _ = nb.add(
+            "try:\n    seen = seen + 1\nexcept NameError:\n    seen = 0", name="counter"
+        )
+        downstream, _ = nb.add("doubled = seen * 2", name="downstream")
+
+        self.assertFalse(nb._deterministic(counter))
+        self.assertFalse(nb._deterministic(downstream))  # inherited
+
+    def test_an_opaque_global_makes_a_description_untrustworthy(self):
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        nb.add("import socket\nsock = socket.socket()", name="net")
+        reader, _ = nb.add("port = sock.fileno()", name="reader")
+        self.addCleanup(nb.ns["sock"].close)
+
+        self.assertFalse(nb._deterministic(reader))
+
+    def test_an_ordinary_cone_is_trusted(self):
+        nb, _, _, score = self.build()
+        self.assertTrue(nb._deterministic(score))
+
+    # ---- shallow restore
+
+    def test_a_shallow_switch_answers_without_building_the_interior(self):
+        """`score` comes back although `feats`, the thing it was computed
+        from, is never rebuilt — which the ordinary path cannot do, because
+        it needs the input's address before it can name the result."""
+        nb, _, feats, score = self.build()
+        nb.fork("scratch")
+        nb.delete(score)
+        nb.delete(feats)
+
+        results = nb.switch("main", shallow=True)
+        statuses = {r.cell: r.status for r in results}
+        self.assertEqual(statuses.get(score), "restored")
+        self.assertNotIn(feats, statuses)
+        self.assertEqual(nb.ns["score"], 100)
+
+    def test_what_a_shallow_switch_skips_stays_pending(self):
+        """The namespace is deliberately partial, and says so."""
+        nb, raw, feats, score = self.build()
+        nb.fork("scratch")
+        nb.delete(score)
+        nb.delete(feats)
+        nb.switch("main", shallow=True)
+
+        self.assertIn(feats, nb.pending)
+        self.assertNotIn("feats", nb.ns)
+        self.assertEqual(nb.ns["score"], 100)
+
+    def test_an_ordinary_run_fills_in_what_shallow_left_out(self):
+        nb, _, feats, score = self.build()
+        nb.fork("scratch")
+        nb.delete(score)
+        nb.delete(feats)
+        nb.switch("main", shallow=True)
+
+        nb.run()
+        self.assertEqual(nb.ns["feats"], [10, 20, 30, 40])
+        self.assertEqual(nb.ns["score"], 100)
+
+    def test_a_partial_namespace_never_mints_a_key(self):
+        """The soundness the shallow path depends on: with an upstream
+        value absent, a cell has no address to be keyed from, so it must
+        not be handed one built out of the hole."""
+        nb, _, feats, score = self.build()
+        nb.ns.pop("feats")  # as a shallow restore leaves it
+
+        self.assertNotEqual(nb._key(score), nb._key(score))  # poisoned, not stable
+
+    def test_a_shallow_switch_declines_where_it_cannot_be_trusted(self):
+        nb = Notebook(seed=1, memo_min_seconds=0)
+        nb.add("knob = 1", name="knob")
+        nb.add(
+            "try:\n    seen = seen + knob\nexcept NameError:\n    seen = knob",
+            name="counter",
+        )
+        knob = next(c for c, cell in nb.cells.items() if "knob = 1" in cell.src)
+        counter = next(c for c in nb.cells if c != knob)
+        nb.fork("scratch")
+        nb.set(knob, "knob = 2")
+
+        results = nb.switch("main", shallow=True, force=True)
+        restored = {r.cell for r in results}
+        self.assertNotIn(counter, restored)  # its description names no one value
+        self.assertIn(counter, nb.pending)
+
+
+class TestOpaqueGlobals(unittest.TestCase):
+    """The kernel already knows which values it cannot identify — they
+    poison a cell's key so it never caches — and never used to say so."""
+
+    def opaque(self, nb):
+        return nb.describe()["opaque"]
+
+    def test_a_value_that_cannot_be_identified_is_reported(self):
+        nb = Notebook(seed=1)
+        nb.add("import socket\nsock = socket.socket()", name="net")
+        self.addCleanup(nb.ns["sock"].close)
+        nb.add("port = sock.fileno()", name="reader")  # reads it, so it is keyed
+
+        self.assertEqual(self.opaque(nb), ["sock"])
+
+    def test_an_unread_value_is_not_reported(self):
+        """Opacity only has a consequence where something reads it, and
+        checking a value costs the same as hashing it — so the report
+        covers what was actually asked about, not the whole namespace."""
+        nb = Notebook(seed=1)
+        nb.add("import socket\nsock = socket.socket()", name="net")
+        self.addCleanup(nb.ns["sock"].close)
+
+        self.assertEqual(self.opaque(nb), [])
+
+    def test_an_ordinary_value_is_not_reported(self):
+        nb = Notebook(seed=1)
+        nb.add("source = 10", name="config")
+        nb.add("rows = [source]", name="load")
+        self.assertEqual(self.opaque(nb), [])
+
+    def test_a_reader_of_an_opaque_value_never_caches(self):
+        """The consequence the report is warning about."""
+        nb = Notebook(seed=1)
+        nb.add("import socket\nsock = socket.socket()", name="net")
+        reader, _ = nb.add("port = sock.fileno()", name="reader")
+        self.addCleanup(nb.ns["sock"].close)
+
+        nb.pending = {reader}
+        self.assertEqual({r.cell: r.status for r in nb.run()}[reader], "ran")
+
+    def test_a_dropped_global_stops_being_reported(self):
+        nb = Notebook(seed=1)
+        net, _ = nb.add("import socket\nsock = socket.socket()", name="net")
+        reader, _ = nb.add("port = sock.fileno()", name="reader")
+        self.addCleanup(nb.ns["sock"].close)
+        self.assertEqual(self.opaque(nb), ["sock"])
+
+        nb.delete(reader)
+        nb.delete(net)
+        self.assertEqual(self.opaque(nb), [])
+
+
+class Counted:
+    """Counts how many times it is pickled — i.e. how often the kernel
+    computes its content address."""
+
+    pickled = 0
+
+    def __reduce__(self):
+        type(self).pickled += 1
+        return (Counted, ())
 
 
 class TestCaching(unittest.TestCase):

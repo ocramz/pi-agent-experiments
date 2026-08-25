@@ -72,6 +72,21 @@ class Graph:
         """Providing cells this cell reads."""
         return set(self.parents_of[cid])
 
+    def ancestors(self, cid: str) -> set[str]:
+        """Providing cells this one depends on, transitively.
+
+        The mirror of `descendants`: that one is the blast radius of a
+        change, this one is everything a value was built out of.
+        """
+        seen: set[str] = set()
+        stack = [cid]
+        while stack:
+            for parent in self.parents_of.get(stack.pop(), ()):
+                if parent not in seen:
+                    seen.add(parent)
+                    stack.append(parent)
+        return seen
+
     def descendants(self, cid: str) -> set[str]:
         seen: set[str] = set()
         stack = [cid]

@@ -259,6 +259,65 @@ def _digest_mapping(value: dict, seen: frozenset[int]) -> str | None:
     return _hash("dict:" + "\x00".join(digested))
 
 
+def address(obj: object) -> tuple[str, int] | None:
+    """A value's content address and its serialised size, in one pass.
+
+    The address *is* `digest(obj)` — same rules, same answers — so keys
+    built from addresses are the keys that were built from digests. What
+    changes is when it runs: an address is computed once, when the value
+    is produced, and is then key material for every dependent. Hashing at
+    the point of use instead meant re-pickling a large value once per
+    reader per run.
+
+    The size is a byproduct rather than a second pass: the general path
+    already holds the pickled bytes, and a cache that retains values needs
+    bytes to evict by cost-per-byte rather than by count. The structural
+    paths never pickle, so they report 0 — a module is a pointer, and a
+    function is small enough that evicting one buys nothing.
+    """
+    if isinstance(obj, (types.ModuleType, types.FunctionType, types.LambdaType)):
+        digested = digest(obj)
+        return None if digested is None else (digested, 0)
+    if type(obj) in (set, frozenset):  # exact types only, as in `_digest`
+        digested = digest(obj)
+        return None if digested is None else (digested, 0)
+    try:
+        blob = pickle.dumps(obj, protocol=4)
+    except Exception:
+        return None  # sockets, file handles, live models, ...
+    return _hash(blob), len(blob)
+
+
+def freeze(obj: object) -> bytes | None:
+    """The bytes a value round-trips through, or None if it does not.
+
+    What a cache has to store, as opposed to what `address` has to hash.
+    The two differ in one direction only: a module is a pointer into
+    `sys.modules` and a function pickles *by name*, so both would come
+    back as whatever currently answers to that name rather than as the
+    value that was saved. Their addresses are honest; their bytes are not,
+    so they are refused here and their cells re-run instead.
+
+    Bytes rather than the live object, because a cached object stays
+    reachable through the namespace and can be mutated in place by any
+    cell that reads it — and an entry describing a value that has since
+    moved is precisely the false hit `digest` exists to prevent. Bytes
+    cannot change behind the cache's back, so a hit needs no second look.
+    """
+    if isinstance(obj, (types.ModuleType, types.FunctionType, types.LambdaType)):
+        return None
+    try:
+        return pickle.dumps(obj, protocol=4)
+    except Exception:
+        return None  # sockets, file handles, live models, ...
+
+
+def thaw(blob: bytes) -> object:
+    """Read back what `freeze` wrote. Raises: callers treat a failure as
+    a miss, because an entry that will not load is not an answer."""
+    return pickle.loads(blob)
+
+
 _env_digest: str | None = None
 
 

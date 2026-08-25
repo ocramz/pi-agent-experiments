@@ -25,6 +25,7 @@ import {
 	SUPERSEDED_INSPECT,
 	formatInspect,
 	formatResults,
+	scoped,
 	type InspectResponse,
 	type MutatingResponse,
 } from "./format.ts";
@@ -148,7 +149,16 @@ function body(
  */
 function claim(resp: MutatingResponse, into: Set<string>): void {
 	for (const r of resp.results ?? []) {
-		if (r.status === "ran") into.add(r.cell);
+		// `restored` counts with `ran`: the cell's value was displaced and
+		// has come back, so an older message holding it is describing a
+		// namespace that has since been rebuilt, not one still standing.
+		//
+		// Scoped by variant, because a claim is only good within the program
+		// that made it: `model` re-run on one variant leaves `model` on
+		// another exactly where it was.
+		if (r.status === "ran" || r.status === "restored") {
+			into.add(scoped(resp.variant, r.cell));
+		}
 	}
 }
 

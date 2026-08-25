@@ -28,6 +28,7 @@ from kernel import (  # noqa: E402
     analyze,
     digest,
 )
+from kernel.variants import DEFAULT  # noqa: E402
 
 # ----------------------------------------------------------- strategies
 
@@ -57,9 +58,9 @@ def dags(draw, size=MAX_VARS):
     return draw(st.permutations(cells))
 
 
-def build(cells, seed=0):
+def build(cells, seed=0, **kw):
     """A notebook holding `cells`, run. Returns (nb, {var: cid})."""
-    nb = Notebook(seed=seed)
+    nb = Notebook(seed=seed, **kw)
     ids = {}
     for var, src in cells:
         ids[var], _ = nb.add(src, run=False)
@@ -205,9 +206,46 @@ class TestIncrementalEqualsFromScratch(unittest.TestCase):
         cached, _ = build(cells)
         uncached, _ = build(cells)
         uncached.done.clear()
+        uncached.memo.clear()  # freshness and the memo are both the cache
         uncached.pending = set(uncached.cells)
         uncached.run()
         self.assertEqual(ns_digests(cached), ns_digests(uncached))
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_the_memo_never_changes_the_result(self, cells, data):
+        """A restored value must be the value that would have been
+        computed. Driven by an edit and its undo, because nothing is ever
+        restored in a notebook that has not had a value displaced."""
+        remembering, ids = build(cells, memo_min_seconds=0)
+        forgetting, _ = build(cells, memo_budget=0)
+        var = data.draw(st.sampled_from(sorted(ids)))
+
+        for nb, cid in ((remembering, ids[var]), (forgetting, ids[var])):
+            original = nb.cells[cid].src
+            nb.set(cid, f"{var} = 987654")
+            nb.set(cid, original)
+
+        self.assertEqual(ns_digests(remembering), ns_digests(forgetting))
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_undoing_an_edit_costs_no_execution(self, cells, data):
+        """The point of the memo, stated as a bound rather than a value:
+        a displaced computation comes back without being redone. Checking
+        only the namespace would pass on a full replay, which is the thing
+        this is supposed to avoid."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        var = data.draw(st.sampled_from(sorted(ids)))
+        cid = ids[var]
+        original = nb.cells[cid].src
+        before = ns_digests(nb)
+
+        nb.set(cid, f"{var} = 987654")
+        statuses = {r.status for r in nb.set(cid, original)}
+
+        self.assertEqual(ns_digests(nb), before)
+        self.assertNotIn("ran", statuses)
 
     @SLOW
     @given(dags())
@@ -304,6 +342,112 @@ class TestStaging(unittest.TestCase):
         nb.delete(cid)
         again, results = nb.add(f"{var} = 4242")
         self.assertEqual({r.cell: r.status for r in results}[again], "ran")
+
+
+class TestVariants(unittest.TestCase):
+    """Moving between alternative programs, over any generated DAG.
+
+    `dags()` builds stateless cells only, so the accumulator guard never
+    fires here — which is what makes "no cell re-ran" a fair thing to
+    demand."""
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_a_round_trip_restores_the_program_and_costs_no_execution(
+        self, cells, data
+    ):
+        """Both halves matter. The namespace alone would be satisfied by a
+        full replay, which is exactly what the memo is here to avoid; the
+        statuses alone would be satisfied by doing nothing at all."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        var = data.draw(st.sampled_from(sorted(ids)))
+        program = list(nb.cells.items())
+        before = ns_digests(nb)
+
+        nb.fork("alt")
+        nb.set(ids[var], f"{var} = 987654")
+        statuses = {r.status for r in nb.switch(DEFAULT)}
+
+        self.assertEqual(list(nb.cells.items()), program)
+        self.assertEqual(ns_digests(nb), before)
+        self.assertNotIn("ran", statuses)
+
+    @SLOW
+    @given(dags())
+    def test_a_variant_that_adds_a_cell_retracts_it_on_the_way_out(self, cells):
+        nb, _ = build(cells, memo_min_seconds=0)
+        owned = set(nb.provider)
+
+        nb.fork("alt")
+        nb.add("bonus_global = 1")
+        nb.switch(DEFAULT)
+
+        self.assertNotIn("bonus_global", nb.ns)
+        self.assertEqual(set(nb.provider), owned)
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_a_variant_is_reachable_from_either_side(self, cells, data):
+        """Switching is symmetric: the diff is computed at the time of the
+        move, so neither direction is the privileged one."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        var = data.draw(st.sampled_from(sorted(ids)))
+
+        nb.fork("alt")
+        nb.set(ids[var], f"{var} = 987654")
+        altered = ns_digests(nb)
+
+        nb.switch(DEFAULT)
+        nb.switch("alt")
+        self.assertEqual(ns_digests(nb), altered)
+
+
+class TestDescriptions(unittest.TestCase):
+    @SLOW
+    @given(dags())
+    def test_a_description_names_the_program_and_not_the_notebook(self, cells):
+        """Ids are random and insertion order is a tie-break, so neither may
+        reach a description — otherwise two notebooks holding one program
+        would describe it differently and share nothing."""
+        one, _ = build(cells, seed=0)
+        other, _ = build(list(reversed(cells)), seed=7)
+        self.assertEqual(
+            sorted(one.descriptions().values()), sorted(other.descriptions().values())
+        )
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_a_shallow_restore_never_disagrees_with_a_full_run(self, cells, data):
+        """The soundness the whole index rests on. Answering from a
+        description skips the cells that would have established the answer,
+        so what it puts back has to be what building it would have got."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        full = ns_digests(nb)
+        var = data.draw(st.sampled_from(sorted(ids)))
+
+        nb.fork("scratch")
+        nb.delete(ids[var])
+        nb.switch(DEFAULT, shallow=True)
+        nb.run()  # fill in whatever the shallow pass skipped
+
+        self.assertEqual(ns_digests(nb), full)
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_a_shallow_restore_leaves_what_it_skipped_pending(self, cells, data):
+        """A partial namespace has to admit it is partial, or the next edit
+        keys off a hole."""
+        nb, ids = build(cells, memo_min_seconds=0)
+        var = data.draw(st.sampled_from(sorted(ids)))
+
+        nb.fork("scratch")
+        nb.delete(ids[var])
+        nb.switch(DEFAULT, shallow=True)
+
+        for cid in nb.cells:
+            missing = [n for n in nb.cells[cid].defs if n not in nb.ns]
+            if missing:
+                self.assertIn(cid, nb.pending)
 
 
 class TestFailureIsolation(unittest.TestCase):

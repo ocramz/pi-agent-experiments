@@ -130,6 +130,64 @@ test("a cached mention claims nothing — it asserts the older value still holds
 	assert.match(shown(out[0]), /\* c1 ran .* 1$/m);
 });
 
+test("a restored mention claims the cell — the value was displaced and came back", () => {
+	const first = py({ kind: "py.cells", response: cellsResponse([ran("c1", "1")]) });
+	const second = py({
+		kind: "py.cells",
+		response: cellsResponse([{ cell: "c1", status: "restored", seconds: 0, value: "7" }]),
+	});
+
+	const out = filterPyContext([first, second], LIVE);
+	// Unlike `cached`, this does not assert the older line still holds: the
+	// namespace was rebuilt from a different computation in between, so the
+	// older value is stale and the newer message is the one carrying c1.
+	assert.equal(shown(out[0]), "- superseded: c1");
+	assert.match(shown(out[1]), /\+ c1 restored .* 7$/m);
+});
+
+test("a cell re-run on another variant does not supersede it on this one", () => {
+	const onMain = py({
+		kind: "py.cells",
+		response: { ...cellsResponse([ran("c1", "mean")]), variant: "main" },
+	});
+	const onAlt = py({
+		kind: "py.cells",
+		response: { ...cellsResponse([ran("c1", "median")]), variant: "median" },
+	});
+
+	const out = filterPyContext([onMain, onAlt], LIVE);
+	// Both are current, each for its own program. Collapsing across them
+	// would delete the value the user forked in order to compare against.
+	assert.match(shown(out[0]), /\* c1 ran .* mean$/m);
+	assert.match(shown(out[1]), /\* c1 ran .* median$/m);
+	assert.match(shown(out[1]), /^variant: median$/m);
+});
+
+test("a cell re-run on the same variant still supersedes", () => {
+	const first = py({
+		kind: "py.cells",
+		response: { ...cellsResponse([ran("c1", "1")]), variant: "median" },
+	});
+	const second = py({
+		kind: "py.cells",
+		response: { ...cellsResponse([ran("c1", "2")]), variant: "median" },
+	});
+
+	const out = filterPyContext([first, second], LIVE);
+	assert.match(shown(out[0]), /- superseded: c1/);
+});
+
+test("a transcript with no variant on it behaves as it always did", () => {
+	// Sessions recorded before variants existed carry no `variant`, so they
+	// all scope alike and supersede each other exactly as before.
+	const first = py({ kind: "py.cells", response: cellsResponse([ran("c1", "1")]) });
+	const second = py({ kind: "py.cells", response: cellsResponse([ran("c1", "2")]) });
+
+	const out = filterPyContext([first, second], LIVE);
+	assert.match(shown(out[0]), /- superseded: c1/);
+	assert.ok(!shown(out[1]).includes("variant:"), shown(out[1]));
+});
+
 test("only the newest message keeps the globals tail", () => {
 	const first = py({
 		kind: "py.cells",

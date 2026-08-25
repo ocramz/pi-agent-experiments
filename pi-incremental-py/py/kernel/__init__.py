@@ -71,12 +71,18 @@ than part of one.
 from __future__ import annotations
 
 from .analysis import Analysis, Survey, analyze
-from .cell import Cell, Outcome, Result, run_cell
+from .cell import Cell, Memo, Outcome, Result, run_cell
 from .edits import Edit
-from .errors import CycleError, DuplicateNameError, MultipleDefinitionError
+from .errors import (
+    CycleError,
+    DuplicateNameError,
+    MultipleDefinitionError,
+    StatefulVariantError,
+)
 from .graph import Graph
 from .notebook import Notebook
-from .values import brief, digest, env_digest
+from .variants import Variant
+from .values import address, brief, digest, env_digest
 
 __all__ = [
     "Analysis",
@@ -85,11 +91,15 @@ __all__ = [
     "DuplicateNameError",
     "Edit",
     "Graph",
+    "Memo",
     "MultipleDefinitionError",
     "Notebook",
     "Outcome",
     "Result",
+    "StatefulVariantError",
     "Survey",
+    "Variant",
+    "address",
     "analyze",
     "brief",
     "digest",

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { Kernel, MIN_PYTHON, interpreterVersion, resolvePython, type KernelResponse } from "../src/kernel.ts";
-import { formatEval, formatInspect, formatResults } from "../src/format.ts";
+import { formatEval, formatInspect, formatResults, formatVariants } from "../src/format.ts";
 import { filterPyContext, type ContextMessage } from "../src/context-filter.ts";
 
 // These tests drive the real Python kernel (stdlib-only python3, venv module).
@@ -275,6 +275,20 @@ test("formatInspect renders the graph with labels and flags", () => {
 	assert.match(text, /abc123 \(load\): defines \[rows\]/);
 	assert.match(text, /def456: defines \[n\] <- abc123 {2}stateful FAILING/);
 	assert.match(text, /globals: rows=list\(3\)/);
+});
+
+test("formatVariants marks the current one and says what differs from it", () => {
+	const text = formatVariants({
+		ok: true,
+		current: "median",
+		variants: [
+			{ name: "main", parent: null, cells: 4, differs: ["me3pex"] },
+			{ name: "median", parent: "main", cells: 4, differs: [] },
+		],
+	});
+	assert.match(text, /^ {2}main {2}4 cells {2}differs: me3pex$/m);
+	// The current variant differs from itself in nothing, so it says nothing.
+	assert.match(text, /^\* median <- main {2}4 cells$/m);
 });
 
 test("formatEval", () => {

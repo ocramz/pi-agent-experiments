@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict
@@ -27,6 +28,7 @@ from kernel import (
     MultipleDefinitionError,
     Notebook,
     Result,
+    StatefulVariantError,
     env_digest,
 )
 
@@ -89,6 +91,7 @@ EXPECTED_ERRORS = (
     MultipleDefinitionError,
     DuplicateNameError,
     CycleError,
+    StatefulVariantError,
     SyntaxError,
     KeyError,
     ValueError,
@@ -115,6 +118,10 @@ def _response(nb: Notebook, results: list[Result], **extra) -> dict:
         "pending": sorted(nb.pending),
         "failing": nb.failing(),
         "globals": nb.globals_brief(),
+        # Which program these results belong to. A cell id means one thing
+        # per variant, so a consumer deciding whether an older result has
+        # been superseded has to compare within a variant, not across.
+        "variant": nb.current,
         **extra,
     }
 
@@ -145,6 +152,24 @@ def handle(nb: Notebook, req: dict) -> dict:
             case "plan_edits":
                 edits = [Edit.from_json(e) for e in req["edits"]]
                 return {"ok": True, "would_invalidate": sorted(nb.plan(edits))}
+            case "fork_variant":
+                nb.fork(req["name"])
+                return _response(nb, [])
+            case "switch_variant":
+                return _response(
+                    nb,
+                    nb.switch(
+                        req["name"],
+                        run=req.get("run", True),
+                        force=req.get("force", False),
+                        shallow=req.get("shallow", False),
+                    ),
+                )
+            case "drop_variant":
+                nb.drop(req["name"])
+                return {"ok": True, **nb.describe_variants()}
+            case "variants":
+                return {"ok": True, **nb.describe_variants()}
             case "inspect":
                 return {"ok": True, **nb.describe()}
             case "eval":
@@ -160,9 +185,20 @@ def handle(nb: Notebook, req: dict) -> dict:
         return {"ok": False, "internal": True, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _configured() -> Notebook:
+    """A notebook set up from the environment.
+
+    The extension spawns this process, so the environment is the channel it
+    has. An unset or unparseable budget leaves the kernel's own default in
+    place rather than guessing at one.
+    """
+    budget = os.environ.get("PI_PY_MEMO_BUDGET", "").strip()
+    return Notebook(memo_budget=int(budget)) if budget.isdigit() else Notebook()
+
+
 def serve(stdin=sys.stdin, stdout=sys.stdout, nb: Notebook | None = None) -> None:
     if nb is None:
-        nb = Notebook()
+        nb = _configured()
     for line in stdin:
         if not line.strip():
             continue

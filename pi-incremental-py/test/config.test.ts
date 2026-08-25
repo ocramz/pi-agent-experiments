@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { resolveContextFilter } from "../src/config.ts";
+import { resolveContextFilter, resolveMemoBudget } from "../src/config.ts";
 
 /** A project dir, optionally carrying a `.pi/settings.json`. */
 function projectIn(t: TestContext, settings?: unknown): string {
@@ -18,6 +18,28 @@ function projectIn(t: TestContext, settings?: unknown): string {
 	}
 	return dir;
 }
+
+test("no memo budget anywhere leaves the kernel's own default alone", (t) => {
+	const dir = projectIn(t);
+	assert.equal(resolveMemoBudget({ cwd: dir, env: {} }), undefined);
+});
+
+test("settings.json sets the memo budget, and the environment outranks it", (t) => {
+	const dir = projectIn(t, { incrementalPy: { memoBudgetBytes: 1024 } });
+	assert.equal(resolveMemoBudget({ cwd: dir, env: {} }), 1024);
+	assert.equal(resolveMemoBudget({ cwd: dir, env: { PI_PY_MEMO_BUDGET: "64" } }), 64);
+});
+
+test("zero is a budget, not an absence — it switches the memo off", (t) => {
+	const dir = projectIn(t, { incrementalPy: { memoBudgetBytes: 0 } });
+	assert.equal(resolveMemoBudget({ cwd: dir, env: {} }), 0);
+});
+
+test("nonsense in the environment falls through rather than winning", (t) => {
+	const dir = projectIn(t, { incrementalPy: { memoBudgetBytes: 1024 } });
+	assert.equal(resolveMemoBudget({ cwd: dir, env: { PI_PY_MEMO_BUDGET: "lots" } }), 1024);
+	assert.equal(resolveMemoBudget({ cwd: dir, env: { PI_PY_MEMO_BUDGET: "-1" } }), 1024);
+});
 
 test("the filter is on when nothing says otherwise", (t) => {
 	const dir = projectIn(t);

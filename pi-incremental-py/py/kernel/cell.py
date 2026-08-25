@@ -92,6 +92,27 @@ class Outcome:
     result: Result
 
 
+@dataclass(frozen=True)
+class Memo:
+    """One successful run's committed defs, kept under its content key.
+
+    `Outcome` records what a *cell* last did, one slot per cell, which is
+    what freshness needs. This records what a *computation* produced, one
+    slot per key — so a value displaced by an edit is not lost, and comes
+    back if the edit is undone. Keys are content addresses, so entries are
+    shared by every program that computes the same thing rather than
+    belonging to the cell that happened to ask first.
+
+    `nbytes` and `seconds` are the two numbers eviction needs: what an
+    entry costs to keep, and what it would cost to recompute.
+    """
+
+    blobs: dict[str, bytes]  # def name -> the bytes it round-trips through
+    nbytes: int
+    seconds: float
+    result: Result
+
+
 def fresh_namespace() -> dict[str, object]:
     return {"__builtins__": builtins}
 

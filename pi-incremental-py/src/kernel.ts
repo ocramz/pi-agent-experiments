@@ -131,6 +131,12 @@ export class Kernel {
 	private readonly cwd: string;
 	private python: string | null = null;
 
+	/**
+	 * Settings the kernel reads at startup, applied at every spawn so a
+	 * respawn comes back configured the way the first one was.
+	 */
+	env: Record<string, string> = {};
+
 	constructor(script = join(PY_DIR, "protocol.py"), cwd = process.cwd()) {
 		this.script = script;
 		this.cwd = cwd;
@@ -167,7 +173,7 @@ export class Kernel {
 			// which follows the hash seed for str and bytes members. Fixing the
 			// seed costs nothing and closes that at every depth. A remote kernel
 			// must do the same — see docs/remote.md.
-			env: { ...process.env, PYTHONHASHSEED: "0" },
+			env: { ...process.env, ...this.env, PYTHONHASHSEED: "0" },
 		});
 		this.proc = proc;
 		this.buffer = "";

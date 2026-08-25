@@ -20,30 +20,85 @@ import copy
 import random
 import time
 
-from .cell import Cell, Outcome, Result, fresh_namespace, run_cell
+import collections
+import dataclasses
+
+from .cell import Cell, Memo, Outcome, Result, fresh_namespace, run_cell
 from .edits import Edit
-from .errors import DuplicateNameError
+from .errors import DuplicateNameError, StatefulVariantError
 from .graph import Graph
-from .values import _hash, brief, digest, env_digest
+from .values import _hash, address, brief, env_digest, freeze, thaw
+from .variants import DEFAULT, Variant, check_name, diff
 
 _MISSING = object()
 
 _ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # RFC 4648 base32, lowercase
 _ID_LENGTH = 6
 
+# How much of the memo to keep, in bytes of pickled value.
+_MEMO_BUDGET = 256 * 1024 * 1024
+
+# Below this, saving a value costs more than recomputing it would. Storing
+# an entry means pickling every def the cell bound, which is real work for
+# a cell that was cheap to run in the first place.
+_MEMO_MIN_SECONDS = 0.05
+
 
 class Notebook:
     # Everything staging has to roll back. `ns` is deliberately absent:
-    # staging never executes, so it cannot dirty the namespace.
+    # staging never executes, so it cannot dirty the namespace. `addr` is
+    # absent for the same reason — it describes values, and staging moves
+    # no values. (The one place staging touches `ns` is retracting dropped
+    # globals, which happens only after the commit point.)
     _STATE = ("cells", "graph", "pending", "done", "env")
 
-    def __init__(self, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        seed: int | None = None,
+        memo_budget: int = _MEMO_BUDGET,
+        memo_min_seconds: float = _MEMO_MIN_SECONDS,
+    ) -> None:
         self.cells: dict[str, Cell] = {}  # insertion order = execution tie-break
         self.ns: dict[str, object] = fresh_namespace()
         self.graph: Graph = Graph.of(self.cells)
         self.pending: set[str] = set()
         self.done: dict[str, Outcome] = {}
         self.env: str = env_digest()
+        # Global name -> (content address, serialised size) of its current
+        # value. One table rather than two, because an address and its size
+        # are invalidated by the same event and must never disagree.
+        self.addr: dict[str, tuple[str, int]] = {}
+        # Globals the last addressing attempt could not identify. The
+        # kernel already knows which values it cannot reason about — they
+        # poison a key so the cell never caches — and has never said so.
+        # Only names something actually read get in here, which is exactly
+        # when opacity has a consequence.
+        self.opaque: set[str] = set()
+        # Content key -> the values that key produced. Not in `_STATE`:
+        # staging moves no values, and an entry is addressed by what it
+        # computed rather than by which cell currently computes it, so
+        # rolling an edit back cannot orphan one.
+        self.memo: collections.OrderedDict[str, Memo] = collections.OrderedDict()
+        # Description -> the key that description produced. The index that
+        # makes a value findable without first building its inputs. It is
+        # only sound where the program is deterministic, which is a
+        # stronger assumption than the memo needs, so it is consulted only
+        # on request and only past `_deterministic`.
+        self.by_desc: dict[str, str] = {}
+        self.desc: dict[str, str] = {}
+        self.memo_budget = memo_budget
+        self.memo_min_seconds = memo_min_seconds
+        # Cells `rerun` has been asked to force. A matching key would
+        # otherwise be answered from the memo, which is exactly the
+        # short-circuit the force exists to defeat.
+        self._force: set[str] = set()
+        # Named alternative programs. The live `cells` is the truth for
+        # whichever one is current; its snapshot here is refreshed by
+        # `_checkpoint` before anything reads or leaves it.
+        self.current: str = DEFAULT
+        self.variants: dict[str, Variant] = {
+            DEFAULT: Variant(DEFAULT, None, {}, ())
+        }
         self._rng = random.Random(seed)
 
     # ---- identity
@@ -151,6 +206,8 @@ class Notebook:
 
         for name in set(saved["graph"].provider) - set(self.provider):
             self.ns.pop(name, None)  # retract dropped globals
+            self._retract([name])
+            self.opaque.discard(name)  # no value left to have an opinion about
         for cid in set(saved["cells"]) - set(self.cells):
             self.done.pop(cid, None)  # a recycled id must not inherit a cache hit
         self.pending |= affected
@@ -184,6 +241,129 @@ class Notebook:
         Jupyter cannot offer: there, a deleted cell's variables linger."""
         return self.apply([Edit("delete", id=cid)], run=run)[0]
 
+    # ---- variants
+
+    def _checkpoint(self) -> None:
+        """Record the live cells as the current variant's state."""
+        was = self.variants[self.current]
+        self.variants[self.current] = Variant(
+            was.name, was.parent, dict(self.cells), tuple(self.cells)
+        )
+
+    def _reorder(self, order: tuple[str, ...]) -> None:
+        """Restore a variant's insertion order.
+
+        Only the topological tie-break between independent cells rides on
+        it, so no result depends on this. What does depend on it is that a
+        variant left and returned to comes back *identical* — `cells` is
+        ordered, and re-adding a cell appends it.
+        """
+        if tuple(self.cells) == order:
+            return
+        known = [cid for cid in order if cid in self.cells]
+        rest = [cid for cid in self.cells if cid not in set(order)]
+        self.cells = {cid: self.cells[cid] for cid in [*known, *rest]}
+        self.graph = Graph.of(self.cells)
+
+    def _accumulators_in(self, edits: list[Edit], target: dict[str, Cell]) -> list[str]:
+        """Stateful cells a batch would disturb, from either side of it.
+
+        `plan` is the existing dry run: it reports the blast radius
+        without committing, which is exactly the question here. Both sides
+        because a cell can be stateful in the variant being left, in the
+        one being entered, or in both.
+        """
+        cone = self.plan(edits)
+        return sorted(
+            cid
+            for cid in cone
+            if any(
+                (cell := side.get(cid)) is not None and cell.stateful
+                for side in (self.cells, target)
+            )
+        )
+
+    def fork(self, name: str) -> None:
+        """Name a copy of the current program and move onto it.
+
+        Free, and never refused: a fork diverges from nothing yet, so
+        there is no blast radius to object to. The cost, if any, arrives
+        at the first switch back.
+        """
+        check_name(name)
+        if name in self.variants:
+            raise DuplicateNameError(f"variant {name!r} already exists")
+        self._checkpoint()
+        self.variants[name] = Variant(
+            name, self.current, dict(self.cells), tuple(self.cells)
+        )
+        self.current = name
+
+    def switch(
+        self,
+        name: str,
+        run: bool = True,
+        force: bool = False,
+        shallow: bool = False,
+    ) -> list[Result]:
+        """Move to another variant by applying the batch between them.
+
+        Nothing here executes anything the ordinary edit path would not.
+        Upstream of the divergence stays live in the namespace, the cells
+        that differ are re-run, and the ones this displaces are held in
+        the memo under the keys that produced them — so coming back is a
+        restore rather than a recomputation.
+        """
+        if name not in self.variants:
+            raise KeyError(f"no variant {name!r}")
+        if name == self.current:
+            return []
+        self._checkpoint()
+        target = self.variants[name]
+        edits = diff(self.cells, target.cells)
+
+        blocked = self._accumulators_in(edits, target.cells)
+        if blocked and not force:
+            raise StatefulVariantError(
+                f"switching to {name!r} would re-run stateful "
+                f"{', '.join(blocked)}, which advances rather than restores. "
+                f"Pass force to proceed."
+            )
+
+        self._stage(edits, commit=True)  # may refuse; leaves us where we were
+        self.current = name
+        self._reorder(target.order)
+        if not run:
+            return []
+        return self.run_shallow() if shallow else self.run()
+
+    def drop(self, name: str) -> None:
+        """Forget a variant. Invalidates nothing: the memo is addressed by
+        what a computation produced, never by who asked for it."""
+        if name not in self.variants:
+            raise KeyError(f"no variant {name!r}")
+        if name == self.current:
+            raise ValueError(f"variant {name!r} is the current one")
+        del self.variants[name]
+
+    def describe_variants(self) -> dict:
+        self._checkpoint()
+        live = self.variants[self.current]
+        return {
+            "current": self.current,
+            "variants": [
+                {
+                    "name": v.name,
+                    "parent": v.parent,
+                    "cells": len(v.cells),
+                    "differs": sorted(
+                        {e.id for e in diff(live.cells, v.cells) if e.id}
+                    ),
+                }
+                for v in self.variants.values()
+            ],
+        }
+
     # ---- side-effect-free evaluation
 
     def eval_src(self, src: str) -> Result:
@@ -192,26 +372,111 @@ class Notebook:
         untouched. A trailing expression becomes the value; defs the
         snippet happens to make just land in ns (as in Jupyter), but no
         cell owns them, so nothing depends on them."""
-        return run_cell(Cell.of(src, None), self.ns, "<eval>")
+        cell = Cell.of(src, None)
+        result = run_cell(cell, self.ns, "<eval>")
+        # A snippet is not supposed to own anything, but it execs in the
+        # live namespace, so `/py x = 5` can clobber a global some cell
+        # provides and `/py x.append(4)` can move one without rebinding it.
+        # Same exposure as a cell, so the same retraction.
+        self._retract((cell.defs | cell.refs) & set(self.provider))
+        return result
 
     # ---- execution
+
+    def _address_of(self, name: str) -> str | None:
+        """A global's content address, computed once and held until the
+        value it describes can have moved.
+
+        Hashing once per *reader* per run was the old cost: five cells
+        reading one frame pickled it five times a run. Holding the answer
+        instead is only sound while nothing can have changed the value,
+        and only execution can — so `_execute` retracts the addresses of
+        every name a cell reads or binds. Between runs that leaves the
+        answer standing; within a run where readers turn out to be cached
+        it leaves it standing too, which is the common case and the whole
+        saving. When readers really do re-execute this costs exactly what
+        hashing per read cost, never more.
+
+        An undigestable value is not cached: `None` means "assume always
+        changed", and caching that would be caching the absence of an
+        answer.
+        """
+        found = self.addr.get(name)
+        if found is not None:
+            return found[0]
+        computed = address(self.ns.get(name))
+        if computed is None:
+            self.opaque.add(name)
+            return None
+        self.opaque.discard(name)
+        self.addr[name] = computed
+        return computed[0]
+
+    def _retract(self, names) -> None:
+        """Forget the recorded addresses of these globals' values.
+
+        Addresses only. The opacity verdict is not a fact about a
+        particular value but about what `digest` can answer for a value of
+        that kind, and it is only ever overturned by an attempt that
+        succeeds — dropping it here would erase the finding one line after
+        making it, since the cell that reads an opaque global is also the
+        cell whose execution retracts it.
+        """
+        for name in names:
+            self.addr.pop(name, None)
 
     def _key(self, cid: str) -> str:
         """Content address of a cell's next run.
 
         Self-refs resolve to the previous committed version in ns at this
         point (pre-exec), so stateful cells key on their history.
+
+        `_address_of` answers exactly what `digest` used to answer here —
+        same rules, same bytes — so the key for a given namespace is the
+        key this always returned. What changed is only how often the
+        answer is recomputed rather than reused.
         """
         cell = self.cells[cid]
-        inputs = sorted(
-            (name, digest(self.ns.get(name)))
-            for name in cell.refs
-            if name in self.provider
-        )
+        inputs = []
+        for name in sorted(cell.refs):
+            if name not in self.provider:
+                continue
+            # An upstream value we simply do not have. Ordinary running can
+            # never reach this — a parent precedes its child in topological
+            # order, and a child whose parent failed is skipped — but a
+            # shallow restore leaves the interior deliberately unbuilt, and
+            # keying off `digest(None)` there would mint an address for a
+            # computation whose inputs were never established. The self-edge
+            # is exempt: an accumulator's first run reads nothing on purpose.
+            if name not in self.ns and self.provider[name] != cid:
+                return _hash(f"{time.time_ns()}")  # missing input: never cache
+            inputs.append((name, self._address_of(name)))
         if any(d is None for _, d in inputs):
             return _hash(f"{time.time_ns()}")  # unhashable input: never cache
         key = _hash(cell.src + repr(inputs))
         return _hash(key + self.env) if cell.imports else key
+
+    def descriptions(self) -> dict[str, str]:
+        """A Merkle hash per cell of its *description*: its source, the
+        environment if it imports, and the same for every ancestor.
+
+        The other identity in the kernel, and the complement of `_key`.
+        A key is built from what the inputs turned out to *be*, so it
+        cannot be known until they have been computed — but it converges,
+        because two programs that arrive at the same values share it. A
+        description is built from what the program *says*, so it can be
+        computed without running anything — but it never converges, since
+        two different sources describing the same value stay different.
+
+        Hence both: the description is what makes a value findable before
+        its inputs exist, the key is what makes it correct to share.
+        """
+        out: dict[str, str] = {}
+        for cid in self.topo():
+            cell = self.cells[cid]
+            base = _hash(cell.src + repr(sorted(out[p] for p in self.parents_of[cid])))
+            out[cid] = _hash(base + self.env) if cell.imports else base
+        return out
 
     def _execute(self, cid: str, key: str) -> Result:
         """Exec one cell against the namespace.
@@ -229,8 +494,103 @@ class Notebook:
                     self.ns.pop(name, None)
                 else:
                     self.ns[name] = was
+        # Refs as well as defs. A cell rebinds its defs, but it can mutate
+        # anything it *reads* in place — `data.append(4)` binds nothing —
+        # and an in-place mutation moves the value without moving the name.
+        # Hashing per read used to catch that for free; a recorded address
+        # has to be retracted instead, and execution is the only thing that
+        # can mutate, so this is the whole exposure. Dropping rather than
+        # recomputing keeps hashing lazy: a global nothing goes on to read
+        # is never hashed at all.
+        self._retract(cell.defs | cell.refs)
         self.done[cid] = Outcome(key, result)
+        if result.status == "ran":
+            self._remember(cid, key, result)
         return result
+
+    # ---- the memo: what a computation produced, keyed by its address
+
+    def _remember(self, cid: str, key: str, result: Result) -> None:
+        """Save a successful run's defs under the key that produced them.
+
+        All or nothing: a cell whose defs cannot all be written back is
+        not restorable, and half its namespace is worse than none of it.
+        """
+        if result.seconds < self.memo_min_seconds:
+            return
+        blobs: dict[str, bytes] = {}
+        for name in self.cells[cid].defs:
+            if name not in self.ns:
+                return  # a def the cell left unbound; `_fresh` refuses these too
+            frozen = freeze(self.ns[name])
+            if frozen is None:
+                return  # a module, a function, or something unpicklable
+            blobs[name] = frozen
+        self.memo[key] = Memo(blobs, sum(map(len, blobs.values())), result.seconds, result)
+        self.memo.move_to_end(key)
+        self._index(cid, key)
+        self._evict()
+
+    def _index(self, cid: str, key: str) -> None:
+        """Record that this description produced this key."""
+        described = self.desc.get(cid)
+        if described is not None:
+            self.by_desc[described] = key
+
+    def _deterministic(self, cid: str) -> bool:
+        """Whether a description can be trusted to name one value.
+
+        Two things break the equation "same program, same result", and the
+        kernel can see both. A stateful cell's value is a function of how
+        many times it has run, not of what it says. An opaque global is one
+        `digest` cannot identify, so nothing downstream of it was ever
+        established to be a function of anything. Either in the cone and
+        the description is a name for more than one value.
+        """
+        cone = self.graph.ancestors(cid) | {cid}
+        if any(self.cells[c].stateful for c in cone):
+            return False
+        return not ({n for c in cone for n in self.cells[c].refs} & self.opaque)
+
+    def _recall(self, cid: str, key: str) -> Result | None:
+        """Put back what this key produced before, or None for a miss."""
+        if cid in self._force:
+            return None
+        memo = self.memo.get(key)
+        if memo is None:
+            return None
+        try:
+            values = {name: thaw(blob) for name, blob in memo.blobs.items()}
+        except Exception:
+            del self.memo[key]  # an entry that will not load is not an answer
+            return None
+        self.ns.update(values)
+        self._retract(values)  # same content, new objects
+        self.memo.move_to_end(key)
+        self._index(cid, key)
+        # Attributed to this cell, not to whichever one first computed the
+        # key — under convergence they are not the same cell. Status stays
+        # `ran`, because that is what `_fresh` asks of a committed run; the
+        # `restored` status describes this event, not the stored one.
+        self.done[cid] = Outcome(key, dataclasses.replace(memo.result, cell=cid))
+        return Result(cid, "restored", 0.0, value=memo.result.value)
+
+    def _evict(self) -> None:
+        """Drop entries until the budget holds, cheapest first.
+
+        Cost per byte rather than recency: an LRU would drop a
+        twenty-minute model fit to keep a frame that reloads in forty
+        seconds. Both numbers are already on hand — `seconds` from the
+        run that produced the entry, `nbytes` from writing it.
+        """
+        total = sum(m.nbytes for m in self.memo.values())
+        if total <= self.memo_budget:
+            return
+        by_worth = sorted(self.memo, key=lambda k: self.memo[k].seconds / max(self.memo[k].nbytes, 1))
+        for key in by_worth:
+            if total <= self.memo_budget:
+                return
+            total -= self.memo.pop(key).nbytes
 
     def _fresh(self, cid: str, key: str) -> bool:
         """A cell may be skipped only if the same key already produced a
@@ -243,14 +603,54 @@ class Notebook:
             and all(name in self.ns for name in self.cells[cid].defs)
         )
 
+    def _candidates(self) -> set[str]:
+        out: set[str] = set()
+        for cid in self.pending:
+            out |= {cid} | self.descendants(cid)
+        return out & set(self.cells)
+
+    def run_shallow(self) -> list[Result]:
+        """Answer what can be answered without building the interior.
+
+        Deepest first: a cell whose description is already indexed is put
+        back directly, and everything it was built out of is then not
+        needed — which is the point, and the reason this walks the
+        topological order backwards. What is skipped stays `pending`, so
+        the namespace is honestly partial and an ordinary `run` fills it in.
+
+        Narrower than it looks, deliberately. This can only skip work whose
+        *inputs* are absent, since anything still live in the namespace is
+        answered more cheaply by the ordinary path — so what it really buys
+        is the answer to a question without the intermediates behind it.
+        """
+        if not self.pending:
+            return []
+        candidates = self._candidates()
+        self.desc = self.descriptions()
+
+        results: list[Result] = []
+        covered: set[str] = set()
+        for cid in reversed(self.topo(candidates)):
+            if cid in covered or not self._deterministic(cid):
+                continue
+            key = self.by_desc.get(self.desc.get(cid, ""))
+            if key is None or key not in self.memo:
+                continue
+            restored = self._recall(cid, key)
+            if restored is None:
+                continue
+            results.append(restored)
+            covered |= self.graph.ancestors(cid) | {cid}
+
+        self.pending = candidates - {r.cell for r in results}
+        return results
+
     def run(self) -> list[Result]:
         if not self.pending:
             return []
 
-        candidates: set[str] = set()
-        for cid in self.pending:
-            candidates |= {cid} | self.descendants(cid)
-        candidates &= set(self.cells)
+        candidates = self._candidates()
+        self.desc = self.descriptions()
 
         results: list[Result] = []
         failed: set[str] = set()
@@ -264,12 +664,20 @@ class Notebook:
                 value = self.done[cid].result.value
                 results.append(Result(cid, "cached", 0.0, value=value))
                 continue
+            # Not live in the namespace, but this computation may have been
+            # done before — under this cell, or under another program that
+            # arrived at the same inputs.
+            restored = self._recall(cid, key)
+            if restored is not None:
+                results.append(restored)
+                continue
             result = self._execute(cid, key)
             if result.status == "error":
                 failed.add(cid)
                 skip |= self.descendants(cid)
             results.append(result)
 
+        self._force.clear()
         self.pending = failed | skip
         return results
 
@@ -282,6 +690,7 @@ class Notebook:
         if cid not in self.cells:
             raise KeyError(f"no cell {cid!r}")
         self.done.pop(cid, None)  # a matching key would short-circuit the force
+        self._force.add(cid)  # ...and so would the memo, one layer down
         self.pending |= {cid} | self.descendants(cid)
         return self.run()
 
@@ -292,6 +701,13 @@ class Notebook:
         if restart:
             self.ns = fresh_namespace()
             self.done.clear()
+            self.addr.clear()
+            self.opaque.clear()
+            # The memo too, and the index over it: this is the recovery
+            # move, and a replay that answers itself out of the cache has
+            # replayed nothing.
+            self.memo.clear()
+            self.by_desc.clear()
         self.pending = set(self.cells)
         return self.run()
 
@@ -311,6 +727,7 @@ class Notebook:
         """The view the agent gets back, instead of a scrolling transcript."""
         failing = set(self.failing())
         return {
+            "variant": self.current,
             "cells": [
                 {
                     "id": cid,
@@ -326,4 +743,9 @@ class Notebook:
             "globals": self.globals_brief(),
             "pending": sorted(self.pending),
             "failing": sorted(failing),
+            # Values the kernel cannot identify — a socket, a handle, a live
+            # model. A cell reading one never caches, never restores, and is
+            # re-run every time. Nothing here is broken; it is the boundary
+            # of what `digest` can answer, and it was previously invisible.
+            "opaque": sorted(self.opaque & set(self.provider)),
         }

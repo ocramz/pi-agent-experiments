@@ -18,6 +18,11 @@ import { join } from "node:path";
 export interface IncrementalPySettings {
 	/** Hide superseded kernel output from the model. Default true. */
 	contextFilter?: boolean;
+	/**
+	 * Bytes of computed value to keep so that switching back to a variant
+	 * restores rather than recomputes. Default 256 MB; 0 disables the memo.
+	 */
+	memoBudgetBytes?: number;
 }
 
 export type ConfigOverrides = IncrementalPySettings;
@@ -44,6 +49,35 @@ function readBool(value: string | undefined): boolean | undefined {
 	const v = value?.trim().toLowerCase();
 	if (!v) return undefined;
 	return !(v === "0" || v === "false" || v === "no" || v === "off");
+}
+
+/** A non-negative integer, or undefined so the next source gets a turn. */
+function readBytes(value: string | undefined): number | undefined {
+	const v = value?.trim();
+	if (!v) return undefined;
+	const n = Number(v);
+	return Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * How many bytes of computed value the kernel may keep.
+ *
+ * This is what makes switching back to a variant a restore rather than a
+ * re-run, so the cost of setting it to 0 is paid in recomputation, not in
+ * correctness. Same resolution order as above; `undefined` means "leave the
+ * kernel's own default alone".
+ */
+export function resolveMemoBudget(opts: {
+	cwd?: string;
+	overrides?: ConfigOverrides;
+	env?: NodeJS.ProcessEnv;
+}): number | undefined {
+	const { cwd, overrides = {}, env = process.env } = opts;
+	return (
+		overrides.memoBudgetBytes ??
+		readBytes(env.PI_PY_MEMO_BUDGET) ??
+		readSettings(cwd).memoBudgetBytes
+	);
 }
 
 /**

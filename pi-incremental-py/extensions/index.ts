@@ -11,15 +11,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Kernel, pinPython, type KernelResponse } from "../src/kernel.ts";
-import { resolveContextFilter } from "../src/config.ts";
+import { resolveContextFilter, resolveMemoBudget } from "../src/config.ts";
 import { filterPyContext, type PyDetails, type PyPayload } from "../src/context-filter.ts";
 import {
 	formatEval,
 	formatInspect,
 	formatResults,
+	formatVariants,
 	type CellResult,
 	type InspectResponse,
 	type MutatingResponse,
+	type VariantsResponse,
 } from "../src/format.ts";
 
 const LOST_STATE_NOTE =
@@ -34,6 +36,12 @@ const MUTATING = new Set([
 	"run_all",
 	"apply_edits",
 	"install",
+	// A switch rebuilds part of the namespace, so results above it can be
+	// stale. It never loses the *process*, though, so it moves `mut` and
+	// not `gen`.
+	"fork_variant",
+	"switch_variant",
+	"drop_variant",
 ]);
 
 export default function (pi: ExtensionAPI) {
@@ -204,6 +212,75 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── py_variant: alternative programs over one namespace ─────────
+	pi.registerTool({
+		name: "py_variant",
+		label: "Python Variant",
+		description:
+			"Keep several versions of the program side by side. Ops: fork (name a copy of the " +
+			"current program and move onto it), switch (move to a named variant), list (names, " +
+			"parents, and which cells differ from the current one), drop (forget a name). Two cells " +
+			"cannot both define `model`, so trying an alternative means a variant, not a second cell. " +
+			"Switching re-runs only the cells that actually differ; everything upstream stays live, " +
+			"and a version you switch away from comes back without recomputing.",
+		promptSnippet:
+			"py_variant: fork/switch between alternative versions of the program, reusing shared results.",
+		promptGuidelines: [
+			"Fork before trying an alternative, not after: forking is free, and it is what lets you get the current results back without recomputing them.",
+			"Comparing alternatives is switch plus reading the globals — the values of the version you left are kept, so switching back is cheap however long its cells took.",
+			"A switch that would re-run a stateful cell is refused by name, because re-running an accumulator advances it instead of restoring it. Use force only if that cell's value is not what you are comparing.",
+			"shallow gives you a variant's results without rebuilding what produced them — use it to compare outcomes across many variants. The cells behind those results stay pending and their globals absent, so run_all or any ordinary edit fills them back in.",
+		],
+		parameters: Type.Object({
+			op: Type.Union(
+				[
+					Type.Literal("fork"),
+					Type.Literal("switch"),
+					Type.Literal("list"),
+					Type.Literal("drop"),
+				],
+				{ description: "Variant operation." },
+			),
+			name: Type.Optional(
+				Type.String({ description: "Variant name (fork, switch, drop); lowercase, digits and dashes." }),
+			),
+			force: Type.Optional(
+				Type.Boolean({ description: "Switch even across a stateful cell, advancing it." }),
+			),
+			shallow: Type.Optional(
+				Type.Boolean({
+					description:
+						"Switch (switch only): restore only the results already known, leaving the " +
+						"cells behind them unbuilt and pending. For comparing outcomes across many " +
+						"variants without materialising each one's intermediates.",
+				}),
+			),
+		}),
+		async execute(_id, params) {
+			if (params.op === "list") {
+				const resp = await call({ tool: "variants" });
+				return text(formatVariants(resp as VariantsResponse));
+			}
+			if (!params.name) return text(`Error: name required for ${params.op}`);
+			if (params.op === "drop") {
+				const resp = await call({ tool: "drop_variant", name: params.name });
+				return text(formatVariants(resp as VariantsResponse));
+			}
+			const resp = await call(
+				params.op === "fork"
+					? { tool: "fork_variant", name: params.name }
+					: {
+							tool: "switch_variant",
+							name: params.name,
+							force: params.force ?? false,
+							shallow: params.shallow ?? false,
+						},
+			);
+			const response = resp as MutatingResponse;
+			return text(formatResults(response), { kind: "py.cells", response });
+		},
+	});
+
 	// ── py_install: package installs with env tracking ──────────────
 	pi.registerTool({
 		name: "py_install",
@@ -274,7 +351,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /py commands: the human shares the namespace ────────────────
 	pi.registerCommand("py", {
 		description:
-			"Poke the incremental Python kernel: /py <expr> evaluates, /py add [name] <src>, /py rerun <id>, /py run-all, /py inspect",
+			"Poke the incremental Python kernel: /py <expr> evaluates, /py add [name] <src>, /py rerun <id>, /py run-all, /py inspect, /py variants, /py variant fork|switch|drop <name>",
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			const notify = (msg: string, level: "info" | "error" = "info") => {
@@ -290,6 +367,24 @@ export default function (pi: ExtensionAPI) {
 			if (input === "run-all") {
 				const resp = await call({ tool: "run_all" });
 				notify(formatResults(resp as { results?: CellResult[] } & typeof resp));
+				return;
+			}
+			if (input === "variants") {
+				const resp = await call({ tool: "variants" });
+				notify(formatVariants(resp as VariantsResponse), resp.ok ? "info" : "error");
+				return;
+			}
+			const variant = input.match(/^variant\s+(fork|switch|drop)\s+(\S+)/);
+			if (variant) {
+				const [, op, name] = variant;
+				const tool = { fork: "fork_variant", switch: "switch_variant", drop: "drop_variant" }[op];
+				const resp = await call({ tool, name });
+				notify(
+					op === "drop"
+						? formatVariants(resp as VariantsResponse)
+						: formatResults(resp as { results?: CellResult[] } & typeof resp),
+					resp.ok ? "info" : "error",
+				);
 				return;
 			}
 			const rerun = input.match(/^rerun\s+(\S+)/);
@@ -318,11 +413,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		contextFilter = resolveContextFilter({
-			// An untrusted project's settings are not honoured — the same rule pi
-			// applies to .pi/settings.json before loading anything out of it.
-			cwd: ctx.isProjectTrusted() ? ctx.cwd : undefined,
-		});
+		// An untrusted project's settings are not honoured — the same rule pi
+		// applies to .pi/settings.json before loading anything out of it.
+		const cwd = ctx.isProjectTrusted() ? ctx.cwd : undefined;
+		contextFilter = resolveContextFilter({ cwd });
+		// The kernel spawns lazily, so setting this before the first tool call
+		// is enough; it is kept on the Kernel so a respawn is configured too.
+		const budget = resolveMemoBudget({ cwd });
+		if (budget !== undefined) kernel.env.PI_PY_MEMO_BUDGET = String(budget);
 	});
 
 	// ── the context filter ──────────────────────────────────────────
