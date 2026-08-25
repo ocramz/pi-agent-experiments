@@ -55,6 +55,46 @@ class TestAnalyze(unittest.TestCase):
         _, refs = analyze("n = len(rows)")
         self.assertEqual(refs, {"len", "rows"})
 
+    # `refs` means "globals read from the incoming namespace". symtable
+    # reports what is assigned and what is referenced but never in what
+    # order, so it is wrong at both ends about names a cell binds *and*
+    # mentions. These pin both corrections.
+
+    def test_trailing_display_expression_is_not_a_read(self):
+        # The display idiom this kernel recommends. symtable sees `total`
+        # assigned and referenced, exactly as in `total = total + 1`, but the
+        # tail runs after the body against the same namespace: it reads back
+        # what the body just wrote. Keeping it would put the cell's own value
+        # in its own cache key, costing it a re-run on every change.
+        defs, refs = analyze("total = 1\ntotal")
+        self.assertEqual(defs, {"total"})
+        self.assertNotIn("total", refs)
+
+    def test_a_conditional_binding_keeps_its_self_reference(self):
+        # The other branch of the same question, and the reason `_certainly_bound`
+        # only counts the body's own top level: when `flag` is false nothing
+        # binds x, so the tail really does read the previous committed value.
+        # Every uncertain case keeps the ref.
+        defs, refs = analyze("if flag:\n    x = 1\nx")
+        self.assertEqual(defs, {"x"})
+        self.assertIn("x", refs)
+        self.assertIn("flag", refs)
+
+    def test_augmented_assignment_is_a_read(self):
+        # `x += 1` binds through a Store with no Load node anywhere, so
+        # symtable calls it assigned and not referenced.
+        defs, refs = analyze("n += 1")
+        self.assertEqual(defs, {"n"})
+        self.assertEqual(refs, {"n"})
+
+    def test_augmented_assignment_respects_scope(self):
+        declared = analyze("def f():\n    global n\n    n += 1")
+        self.assertIn("n", declared[1])
+        # A function-local accumulator is nobody else's business: claiming it
+        # would invent a dependency on an unrelated global of the same name.
+        local = analyze("def f():\n    n = 0\n    n += 1")
+        self.assertNotIn("n", local[1])
+
 
 class TestIdentity(unittest.TestCase):
     def test_generated_ids(self):
@@ -190,22 +230,53 @@ class TestVersionedNamespaces(unittest.TestCase):
         self.assertTrue(nb.stateful(acc))
         self.assertFalse(nb.stateful(plain))
 
-    def test_a_trailing_display_expression_is_not_a_self_edge(self):
-        # `x = 1` then a bare `x` is the display idiom the kernel recommends,
-        # and symtable sees x as both assigned and referenced — the same shape
-        # as `x = x + 1`. But the tail runs after the body against the same
-        # namespace, so it reads back what the body just wrote. Only the body
-        # proper makes a self-edge temporal.
+    def test_displaying_a_value_does_not_make_a_cell_stateful(self):
+        # `stateful` is `refs & defs`, so it inherits whatever `refs` decided.
+        # See TestAnalyze for the two corrections that make it right.
         nb = Notebook(seed=1)
         display, _ = nb.add("shown = 1\nshown", run=False)
         self.assertFalse(nb.stateful(display))
-        # ...while the accumulator keeps its flag when it displays too.
+        # ...while an accumulator keeps its flag when it displays too.
         both, _ = nb.add(f"{self.COUNTER}\ncount", run=False)
         self.assertTrue(nb.stateful(both))
-        # An augmented assignment binds without a Load node; displaying it is
-        # what puts it in refs, and the body is still where it is read.
-        aug, _ = nb.add("try:\n    n += 1\nexcept NameError:\n    n = 0\nn", run=False)
-        self.assertTrue(nb.stateful(aug))
+
+    def test_the_two_accumulator_spellings_are_indistinguishable(self):
+        # `n += 1` and `n = n + 1` are the same computation, so nothing
+        # downstream should be able to tell them apart: not the stateful flag,
+        # not the cache key, not whether a plain run() advances them.
+        plus_equals = "try:\n    n += 1\nexcept NameError:\n    n = 0"
+        rebinding = "try:\n    n = n + 1\nexcept NameError:\n    n = 0"
+        seen = []
+        for src in (plus_equals, rebinding):
+            nb = Notebook(seed=1)
+            cid, _ = nb.add(src)
+            self.assertTrue(nb.stateful(cid), src)
+            values = []
+            for _ in range(3):
+                nb.pending = {cid}
+                nb.run()  # run(), not rerun(): this must advance on its own
+                values.append(nb.ns["n"])
+            seen.append(values)
+        self.assertEqual(seen[0], [1, 2, 3])
+        self.assertEqual(seen[0], seen[1])
+
+    def test_a_displaying_cell_caches_like_any_other(self):
+        # A cell that displays its own global used to carry that global in its
+        # own cache key — absent before the first run, present after — so it
+        # re-ran once at creation and again after every real change.
+        nb = Notebook(seed=1)
+        a, _ = nb.add("a = 1\na")
+        b, _ = nb.add("b = a + 1\nb")
+
+        def statuses():
+            nb.pending = {b}
+            return [r.status for r in nb.run()]
+
+        self.assertEqual(statuses(), ["cached"])
+        self.assertEqual(statuses(), ["cached"])
+        nb.set(a, "a = 2\na")  # one real change; b re-runs there
+        self.assertEqual(nb.ns["b"], 3)
+        self.assertEqual(statuses(), ["cached"])
 
     def test_failure_restores_committed_version(self):
         nb = Notebook(seed=1)

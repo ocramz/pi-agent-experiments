@@ -54,7 +54,7 @@ out="$(RUN_FLAGS="-v $STAGED:/pkg:ro" in_image '
 assert_not_contains "the package is readable by the image user" "COPY_FAILED" "$out"
 assert_contains     "runs as the unprivileged image user"       "USER_ID=65532" "$out"
 
-# The floor is 3.12: py/kernel.py reads comprehension scopes the way PEP 709
+# The floor is 3.12: py/kernel/analysis.py reads comprehension scopes the way PEP 709
 # made them, and getting this wrong is a wrong dependency graph, not a crash.
 version="$(printf '%s\n' "$out" | sed -n 's/^PYVER=//p')"
 major="${version%%.*}"

@@ -13,7 +13,7 @@
 # Why this base and not the debian-slim one the dev image uses: that image is
 # published arm64-only, and CI is amd64. It also ships Debian 12's python3.11,
 # which is below this package's requires-python floor AND below PEP 709 — and
-# py/kernel.py's comprehension analysis is written against PEP 709 scoping, so
+# py/kernel/analysis.py's comprehension analysis is written against PEP 709 scoping, so
 # 3.11 would produce a subtly wrong dependency graph rather than an error.
 # Deriving from the distroless image the rest of the repo already tests against
 # means the tier exercises that exact userland, with one thing added.

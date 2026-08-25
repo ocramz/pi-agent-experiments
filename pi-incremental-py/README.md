@@ -23,8 +23,9 @@ Node's native type stripping, so there is no build step and nothing to
 compile.
 
 It also needs a **CPython 3.12 or later** it can find, which the other
-extensions in this repo do not. That floor is not a preference: `py/kernel.py`
-reads comprehension scopes the way PEP 709 made them in 3.12, so on an older
+extensions in this repo do not. That floor is not a preference:
+`py/kernel/analysis.py` reads comprehension scopes the way PEP 709 made them
+in 3.12, so on an older
 interpreter the dependency analysis is *wrong* rather than absent. The
 extension resolves one at first use, in this order — `PI_PYTHON`, an
 interpreter or venv pinned in `.incremental/python-pin` (set it with
@@ -43,7 +44,7 @@ pi -e /path/to/pi-incremental-py           # this run only, nothing written
 Project-scoped packages (`-l`) load only once the project is trusted; a
 user-scoped install has no such gate.
 
-The published tarball carries `py/kernel.py` and `py/protocol.py` — the
+The published tarball carries `py/kernel/` and `py/protocol.py` — the
 kernel is resolved relative to the installed `src/`, so the Python half
 travels with the npm package and needs no separate install. `pyproject.toml`
 and `uv.lock` are for working *on* the kernel (ruff, hypothesis) and are
@@ -74,15 +75,25 @@ deliberately not shipped.
   cell should start from.) The try/except structure is what makes it
   converge between incremental runs and `run_all` replays.
 
-  `stateful` is asked of the cell body with the trailing display
-  expression split off. `x = 1` followed by a bare `x` is the display
-  idiom, not an accumulator: symtable sees x assigned *and* referenced,
-  exactly as in `x = x + 1`, but the tail runs after the body against the
-  same namespace and reads back what the body just wrote. Only a read in
-  the body proper makes the self-edge temporal. Note that `refs` still
-  keeps both — the dependency graph and the cache key are unchanged — so
-  a cell that displays its own global has that global in its own key, and
-  re-runs once before it can report `cached`.
+  `refs` means *globals read from the incoming namespace* — what a cell's
+  result depends on, and so what belongs in its cache key. `symtable`
+  reports which names are assigned and which are referenced but never in
+  what order, so two corrections make it mean that:
+
+  - A **trailing display expression** reads back what the body just
+    wrote. `x = 1` followed by a bare `x` is the display idiom, not an
+    accumulator, even though symtable sees x assigned *and* referenced
+    exactly as in `x = x + 1`. Discounted only when the body's own top
+    level is certain to have bound the name — `if flag: x = 1` followed
+    by `x` keeps its self-reference, because when the branch is not taken
+    the tail really does read the previous committed value.
+  - An **augmented assignment** is a read. `x += 1` binds through a
+    Store with no Load node anywhere, so symtable calls it assigned and
+    not referenced. Without this, `n += 1` and `n = n + 1` would behave
+    differently: only the second would be `stateful` and rekey.
+
+  Everything the analysis is unsure about keeps the reference, so it can
+  only ever drop a dependency it has proved spurious.
 - **Builtin shadowing.** If a cell defines `len`, dependents of `len` get
   a real DAG edge and re-run when it changes.
 - **Failure isolation.** A cell that raises leaves its dependents
@@ -92,16 +103,27 @@ deliberately not shipped.
 
 ## Kernel layout
 
-Two modules, one `Notebook` class.
+The `py/kernel/` package is everything that determines a key or an edge.
+Each module imports only from the ones above it, so the list is also the
+dependency order:
 
-- `py/kernel.py` — everything that determines a key or an edge: `analyze`
-  (symtable), `digest`/`env_digest`, and `Notebook` (ids, staging with
-  atomic rollback, versioned execution, topo-ordered run, digest-keyed
-  early cutoff, the installed-distribution set as a synthetic root of the
-  DAG).
-- `py/protocol.py` — the tool surface: the `handle`/`serve` JSON-lines
-  protocol, and `install` as a function over a notebook (pip acts on a
-  kernel; it is not part of one).
+| module | holds |
+|---|---|
+| `errors.py` | the three ways a set of cells fails to be a notebook |
+| `values.py` | `digest` (is this value still the same?) and `brief` (what is it?) |
+| `analysis.py` | `analyze`: defs/refs/imports recovered from source via `symtable`, plus the AST corrections symtable needs |
+| `cell.py` | `Cell` (analysed and compiled), `Result`, `Outcome`, `run_cell` |
+| `edits.py` | `Edit`: the vocabulary of a change |
+| `graph.py` | `Graph`: providers, parents, kids, topological order — built whole, validated at construction |
+| `notebook.py` | `Notebook`: ids, staging with atomic rollback, versioned execution, topo-ordered run, digest-keyed early cutoff |
+
+`py/kernel/__init__.py` re-exports the public surface (`Notebook`, `Edit`,
+`Result`, `analyze`, `digest`, `env_digest`, the errors), so `from kernel
+import …` is the only import anything outside the package needs.
+
+- `py/protocol.py` — the tool surface, one level out: the `handle`/`serve`
+  JSON-lines protocol, and `install` as a function over a notebook (pip
+  acts on a kernel; it is not part of one).
 
 A cell's cache key is a hash of its source plus the digests of every
 global it reads. Cells containing an `import` also mix in the digest of
@@ -197,8 +219,8 @@ it.
 
 ```bash
 uv sync --group dev                        # ruff + hypothesis
-uv run python -m unittest discover -s test-py   # kernel tests (79)
-uvx ruff check py test-py
+uv run python -m unittest discover -s test-py   # kernel tests (86)
+uvx ruff check py test-py                  # also a CI job; pinned in shared/versions.env
 python3 py/protocol.py                     # speak the protocol on stdin/stdout
 ```
 

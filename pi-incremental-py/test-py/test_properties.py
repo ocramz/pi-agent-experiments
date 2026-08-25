@@ -171,7 +171,12 @@ class TestIncrementalEqualsFromScratch(unittest.TestCase):
     # answer, not a crash, and only a value comparison catches it.
     @given(st.integers(-50, 50), st.integers(-50, 50))
     def test_a_changed_capture_reaches_dependents(self, before, after):
-        maker = "def make(n):\n    def inner(x):\n        return x * n\n    return inner\n"
+        maker = (
+            "def make(n):\n"
+            "    def inner(x):\n"
+            "        return x * n\n"
+            "    return inner\n"
+        )
         nb = Notebook(seed=1)
         cid, _ = nb.add(f"{maker}adder = make({before})")
         nb.add("total = adder(14)")

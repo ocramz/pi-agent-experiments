@@ -109,14 +109,9 @@ test("C4: a cached cell does not bury the message holding its value", async (t) 
 	// identical, so b re-reports as cached. Cached means *unchanged since it
 	// last ran*, which makes the older message still true — collapsing it would
 	// delete the only copy of b's value, since a cached cell renders as a count.
-	//
-	// `b` deliberately has no trailing display expression. A cell that displays
-	// its own global reads it, so the global lands in `refs` and therefore in
-	// the cell's own cache key — where it is absent on the first run and present
-	// on the next. Such a cell re-runs once before it can ever report cached.
 	const s = await run(t, [
 		{ tool: "py_cell", args: { src: "a = 1\na" } },
-		{ tool: "py_cell", args: { src: "b = a + 1" } },
+		{ tool: "py_cell", args: { src: "b = a + 1\nb" } },
 		{ tool: "py_cell", args: { id: nthId(1), src: "a = 1  # touched\na" } },
 		{ text: DONE },
 	]);
@@ -126,7 +121,7 @@ test("C4: a cached cell does not bury the message holding its value", async (t) 
 	assert.ok(idB, `no cell id in:\n${madeB}`);
 
 	assert.match(edited, /cached \(unchanged\)/, `expected a cached cell in:\n${edited}`);
-	assert.match(madeB, new RegExp(`^\\* ${idB} ran`, "m"));
+	assert.match(madeB, new RegExp(`^\\* ${idB} ran .*\\s2$`, "m"));
 	assert.doesNotMatch(madeB, /superseded/);
 	// `a` really was re-run, so its own earlier value is gone.
 	const idA = madeA.match(/^id: (\S+)/m)?.[1];

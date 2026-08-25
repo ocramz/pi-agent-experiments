@@ -35,3 +35,7 @@ export IMAGE="${IMAGE:-$TEST_IMAGE}"
 # with a Python added. Empty until it is first published — run.sh builds locally
 # in that case, so an unset pin degrades to a slower run rather than a broken one.
 export PY_TEST_IMAGE="${PY_TEST_IMAGE:-$DEFAULT_PY_TEST_IMAGE}"
+
+# The ruff the lint job runs. Nothing in the container tiers reads this — it is
+# for the one CI job and for a human who wants to lint with exactly what CI does.
+export RUFF_VERSION="${RUFF_VERSION:-$DEFAULT_RUFF_VERSION}"
