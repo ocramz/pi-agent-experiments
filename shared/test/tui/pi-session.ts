@@ -124,7 +124,9 @@ const normalise = (text: string): string => stripAnsi(text).replace(/\s+/g, " ")
  * pi-issue-tracker/test/tui/session.ts.
  *
  * `extension` is likewise the caller's: it is the path to the package's
- * extension entry point, passed to pi as `-e`.
+ * extension entry point, passed to pi as `-e`. Several may be given — pi's
+ * `-e` is repeatable — which is how a package loads a test-only extension
+ * beside the one under test.
  *
  * Cleanup of the pi process is registered on the test context, so a failing case
  * cannot leak one. Removing the fixture directory belongs to whoever created it,
@@ -133,7 +135,13 @@ const normalise = (text: string): string => stripAnsi(text).replace(/\s+/g, " ")
 export async function startPi(
 	t: TestContext,
 	dir: string,
-	opts: { extension: string; live?: boolean; afterExit?: () => void },
+	opts: {
+		extension: string | string[];
+		live?: boolean;
+		/** Extra environment for the pi process. Overrides the defaults below. */
+		env?: NodeJS.ProcessEnv;
+		afterExit?: () => void;
+	},
 ): Promise<PiSession> {
 	mkdirSync(AGENT_DIR, { recursive: true });
 
@@ -145,9 +153,11 @@ export async function startPi(
 		GIT_CONFIG_GLOBAL: join(dir, ".gitconfig"),
 		GIT_CONFIG_SYSTEM: "/dev/null",
 		PI_CODING_AGENT_DIR: AGENT_DIR,
+		...opts.env,
 	};
 
-	const flags = ["--tui-mode regular", "--approve", `-e ${opts.extension}`];
+	const extensions = Array.isArray(opts.extension) ? opts.extension : [opts.extension];
+	const flags = ["--tui-mode regular", "--approve", ...extensions.map((e) => `-e ${e}`)];
 	if (opts.live) {
 		// No literal fallbacks. The provider and model are pinned once, in
 		// shared/versions.env, and `npm run test:tui` sources it — a default

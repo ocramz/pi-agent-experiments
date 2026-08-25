@@ -11,6 +11,7 @@ import {
 	findCycle,
 	formatFindings,
 	isBranchEscapingCommand,
+	pruneStaleInjections,
 	refsToPrune,
 	reviewPlan,
 	reviewWork,
@@ -213,6 +214,64 @@ describe("refsToPrune", () => {
 		// A name outside the fixed-width era sorts wrong lexically but right numerically.
 		const mixed = [`${prefix}/999`, `${prefix}/1700000000001`, `${prefix}/scratch`];
 		assert.deepEqual(refsToPrune(mixed, 1), [`${prefix}/999`, `${prefix}/scratch`]);
+	});
+});
+
+describe("pruneStaleInjections", () => {
+	// The shape the `context` hook hands over: a turn is a user message, the
+	// context block injected alongside it, then the assistant's reply.
+	const user = (text: string) => ({ role: "user", text });
+	const reply = (text: string) => ({ role: "assistant", text });
+	const ctx = (text: string) => ({ role: "custom", customType: "story-context", text });
+
+	it("keeps only the newest injection", () => {
+		const messages = [
+			user("start"),
+			ctx("work on #1"),
+			reply("done"),
+			user("next"),
+			ctx("work on #2"),
+			reply("done"),
+			user("next"),
+			ctx("work on #3"),
+		];
+		assert.deepEqual(pruneStaleInjections(messages, "story-context"), [
+			user("start"),
+			reply("done"),
+			user("next"),
+			reply("done"),
+			user("next"),
+			ctx("work on #3"),
+		]);
+	});
+
+	it("preserves order and every message it does not own", () => {
+		const other = { role: "custom", customType: "other-extension", text: "keep me" };
+		const messages = [ctx("stale"), other, user("hi"), ctx("current")];
+		assert.deepEqual(pruneStaleInjections(messages, "story-context"), [other, user("hi"), ctx("current")]);
+	});
+
+	it("returns the same array by identity when there is nothing to prune", () => {
+		// The caller distinguishes on identity to leave the chain untouched, so
+		// this is load-bearing rather than an optimisation.
+		const messages = [user("hi"), reply("hello")];
+		assert.equal(pruneStaleInjections(messages, "story-context"), messages);
+
+		const one = [user("hi"), ctx("work on #1")];
+		assert.equal(pruneStaleInjections(one, "story-context"), one);
+	});
+
+	it("does not match a custom message on customType alone", () => {
+		// `role` is the discriminant; a non-custom message carrying the same field
+		// is not an injection.
+		const impostor = { role: "user", customType: "story-context", text: "user said this" };
+		const messages = [impostor, ctx("current")];
+		assert.deepEqual(pruneStaleInjections(messages, "story-context"), messages);
+	});
+
+	it("prunes nothing for a customType it was not asked about", () => {
+		const messages = [ctx("one"), ctx("two")];
+		assert.equal(pruneStaleInjections(messages, "other-extension"), messages);
 	});
 });
 

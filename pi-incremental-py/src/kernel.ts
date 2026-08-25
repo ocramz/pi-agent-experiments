@@ -76,7 +76,7 @@ export function pythonCommand(): string {
 }
 
 /**
- * The kernel's floor. `py/kernel.py` reads comprehension scopes the way PEP 709
+ * The kernel's floor. `py/kernel/analysis.py` reads comprehension scopes the way PEP 709
  * made them in 3.12, and `py/protocol.py` uses `match`; on an older interpreter
  * the analysis is wrong rather than absent, and below 3.10 the module does not
  * even parse — which is why this cannot be a `sys.version_info` guard inside

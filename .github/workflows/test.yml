@@ -82,6 +82,28 @@ jobs:
       # release workflow as well as it: a tag is too late to find out.
       - run: npm run pack-check --if-present
 
+  # The Python half. Outside the matrix on purpose: pi-incremental-py is the only
+  # package with Python in it, so fanning this out would run three jobs to lint
+  # one directory. It is also the only automation ruff has ever had — the README
+  # documents the same command for a human to type, and an E501 lived in main
+  # until someone did.
+  lint:
+    name: ruff (pi-incremental-py)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # An exact version, unlike the actions/* above: astral-sh publishes no
+      # floating major tag (there is no `v10`, only `v10.0.1`), so a shorthand
+      # here fails to resolve rather than tracking the major.
+      - uses: astral-sh/setup-uv@v10.0.1
+      # RUFF_VERSION comes from shared/versions.env, like every other pin in this
+      # file. `--output-format=github` puts violations on the diff as annotations
+      # rather than only in the log.
+      - run: >
+          SHARED_DIR=shared . shared/versions.sh
+          && cd pi-incremental-py
+          && uvx ruff@"$RUFF_VERSION" check --output-format=github py test-py
+
   tui:
     name: interactive (pty)
     runs-on: ubuntu-24.04

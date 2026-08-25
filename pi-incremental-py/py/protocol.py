@@ -79,7 +79,7 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
         "ok": True,
         "environment_changed": nb.env != before,
         "restart_required": loaded,
-        "results": [asdict(r) for r in nb.run()],
+        "results": [_result_json(nb, r) for r in nb.run()],
     }
 
 
@@ -95,10 +95,23 @@ EXPECTED_ERRORS = (
 )
 
 
+def _result_json(nb: Notebook, r: Result) -> dict:
+    """A result, plus the one thing about it the wire cannot otherwise carry.
+
+    `stateful` is a property of the cell rather than of the run, but a
+    consumer holding only results has no way to ask: a self-referential
+    cell's successive values are a history (the accumulator advanced),
+    where an ordinary cell's are stale copies of one truth. Anything
+    deciding which of its recorded output is still current has to be able
+    to tell those apart. A deleted cell has no cell left to ask.
+    """
+    return {**asdict(r), "stateful": r.cell in nb.cells and nb.stateful(r.cell)}
+
+
 def _response(nb: Notebook, results: list[Result], **extra) -> dict:
     return {
         "ok": True,
-        "results": [asdict(r) for r in results],
+        "results": [_result_json(nb, r) for r in results],
         "pending": sorted(nb.pending),
         "failing": nb.failing(),
         "globals": nb.globals_brief(),

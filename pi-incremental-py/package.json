@@ -39,6 +39,7 @@
 		"extensions/",
 		"src/",
 		"py/*.py",
+		"py/kernel/*.py",
 		"LICENSE",
 		"README.md",
 		"package.json"

@@ -11,31 +11,67 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Kernel, pinPython, type KernelResponse } from "../src/kernel.ts";
+import { resolveContextFilter } from "../src/config.ts";
+import { filterPyContext, type PyDetails, type PyPayload } from "../src/context-filter.ts";
 import {
 	formatEval,
 	formatInspect,
 	formatResults,
 	type CellResult,
 	type InspectResponse,
+	type MutatingResponse,
 } from "../src/format.ts";
 
 const LOST_STATE_NOTE =
 	"\n\nNOTE: the kernel process was restarted; all Python state was lost. Rebuild with py_cell calls or py_kernel run_all.";
 
+/** Requests that change kernel state. `eval`, `inspect` and `plan_edits` do not. */
+const MUTATING = new Set([
+	"add_cell",
+	"set_cell",
+	"delete_cell",
+	"rerun_cell",
+	"run_all",
+	"apply_edits",
+	"install",
+]);
+
 export default function (pi: ExtensionAPI) {
 	const kernel = new Kernel(undefined, process.cwd());
 
+	// Where the kernel is in its own history, stamped onto every result so the
+	// context filter can tell a current value from one that has been recomputed
+	// since. `mut` counts mutations from the /py commands too, which is the only
+	// way to notice state that changed with no message in the transcript to
+	// show for it.
+	let gen = 0;
+	let mut = 0;
+
+	// Environment and default only: at load time there is no trust decision yet,
+	// and a project's settings are not read before there is one. `session_start`
+	// resolves it again with a cwd once there is.
+	let contextFilter = resolveContextFilter({});
+
 	async function call(req: Record<string, unknown>): Promise<KernelResponse> {
 		const resp = await kernel.call(req);
+		if (MUTATING.has(req.tool as string)) mut++;
 		if (kernel.lostState) {
 			kernel.lostState = false;
+			gen++;
 			return { ...resp, _lostState: true };
 		}
 		return resp;
 	}
 
-	function text(t: string) {
-		return { content: [{ type: "text" as const, text: t }], details: {} };
+	/**
+	 * A tool result, with the structured response kept alongside the rendered
+	 * text. `details` never reaches the provider, so tagging costs nothing even
+	 * when the filter is switched off — and leaving it on means turning the flag
+	 * on mid-project works against the transcript already on disk.
+	 */
+	function text(t: string, payload?: PyPayload) {
+		const details: PyDetails | Record<string, never> = payload ? { ...payload, gen, mut } : {};
+		return { content: [{ type: "text" as const, text: t }], details };
 	}
 
 	// ── py_cell: the everyday verb ──────────────────────────────────
@@ -78,9 +114,13 @@ export default function (pi: ExtensionAPI) {
 						name: params.name,
 						run: params.run ?? true,
 					});
-			let out = formatResults(resp as { results?: CellResult[] } & typeof resp);
-			if ((resp as Record<string, unknown>)._lostState) out += LOST_STATE_NOTE;
-			return text(out);
+			const note = (resp as Record<string, unknown>)._lostState ? LOST_STATE_NOTE : undefined;
+			const response = resp as MutatingResponse;
+			return text(formatResults(response) + (note ?? ""), {
+				kind: "py.cells",
+				response,
+				note,
+			});
 		},
 	});
 
@@ -131,8 +171,8 @@ export default function (pi: ExtensionAPI) {
 			let req: Record<string, unknown>;
 			switch (params.op) {
 				case "inspect": {
-					const resp = await call({ tool: "inspect" });
-					return text(formatInspect(resp as InspectResponse));
+					const response = (await call({ tool: "inspect" })) as InspectResponse;
+					return text(formatInspect(response), { kind: "py.inspect", response });
 				}
 				case "rerun":
 					if (!params.id) return text("Error: id required for rerun");
@@ -159,8 +199,8 @@ export default function (pi: ExtensionAPI) {
 					req = { tool: "apply_edits", edits: params.edits, run: params.run ?? true };
 					break;
 			}
-			const resp = await call(req);
-			return text(formatResults(resp as { results?: CellResult[] } & typeof resp));
+			const response = (await call(req)) as MutatingResponse;
+			return text(formatResults(response), { kind: "py.cells", response });
 		},
 	});
 
@@ -186,22 +226,27 @@ export default function (pi: ExtensionAPI) {
 				upgrade: params.upgrade ?? false,
 			});
 			if (!resp.ok) return text(`Error: ${resp.error}`);
-			const lines: string[] = [];
-			lines.push(resp.environment_changed ? "installed (environment changed)" : "already up to date");
+			// The header is what the install itself did — a historical fact, kept
+			// verbatim on re-render. Only the cell results underneath it go stale.
+			const header: string[] = [
+				resp.environment_changed ? "installed (environment changed)" : "already up to date",
+			];
 			const restart = resp.restart_required as string[];
 			if (restart?.length) {
-				lines.push(
+				header.push(
 					`restart_required: ${restart.join(", ")} — already imported; run py_kernel {op: "run_all"} to pick up the new code`,
 				);
 			}
-			if (Array.isArray(resp.results) && resp.results.length) {
-				lines.push(formatResults(resp as { results?: CellResult[] } & typeof resp));
-			}
-			return text(lines.join("\n"));
+			const response = resp as MutatingResponse;
+			const body = response.results?.length ? formatResults(response) : "";
+			return text([...header, body].filter(Boolean).join("\n"), {
+				kind: "py.install",
+				header,
+				response,
+			});
 		},
 	});
 
-	// ── /py-python: pin the interpreter the kernel runs under ────────
 	// ── /py-python: pin the interpreter the kernel runs under ────────
 	pi.registerCommand("py-python", {
 		description:
@@ -219,6 +264,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			pinPython(process.cwd(), target);
 			kernel.kill(); // next tool call respawns under the pinned interpreter
+			// State changed with nothing in the transcript to show for it. `gen`
+			// follows on the next call, when the respawn reports the loss.
+			mut++;
 			notify(`Kernel python pinned to ${target}; kernel will restart (python state lost).`);
 		},
 	});
@@ -267,5 +315,23 @@ export default function (pi: ExtensionAPI) {
 				resp.ok ? "info" : "error",
 			);
 		},
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		contextFilter = resolveContextFilter({
+			// An untrusted project's settings are not honoured — the same rule pi
+			// applies to .pi/settings.json before loading anything out of it.
+			cwd: ctx.isProjectTrusted() ? ctx.cwd : undefined,
+		});
+	});
+
+	// ── the context filter ──────────────────────────────────────────
+	// Fires before every LLM call, over a deep copy: what the session file
+	// records and what the human sees are unaffected either way. Returning
+	// undefined is pi's no-op, so switched off this is not merely equivalent
+	// to the old behaviour, it is the old behaviour.
+	pi.on("context", (event) => {
+		if (!contextFilter) return;
+		return { messages: filterPyContext(event.messages, { gen, mut }) as typeof event.messages };
 	});
 }
