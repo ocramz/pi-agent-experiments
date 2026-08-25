@@ -406,6 +406,12 @@ class TestDigestStability(unittest.TestCase):
             ),
             ("def f(k=1):\n    return k", "def f(k=2):\n    return k"),
             ("def f(*, k=1):\n    return k", "def f(*, k=2):\n    return k"),
+            # Nothing about `f` changes here except the global it calls,
+            # which its code names but does not describe.
+            (
+                "def _h():\n    return 1\ndef f():\n    return _h()",
+                "def _h():\n    return 2\ndef f():\n    return _h()",
+            ),
         ]
     )
 
@@ -438,6 +444,61 @@ class TestDigestStability(unittest.TestCase):
         backward = set(reversed(sorted(members)))
         self.assertEqual(digest(forward), digest(backward))
         self.assertNotEqual(digest(forward), digest(frozenset(members)))
+
+    def test_editing_a_called_global_invalidates_the_readers_of_the_caller(self):
+        """The staleness this catches is the expensive kind: every cell on
+        the path re-runs, the last one reports `cached`, and the value it
+        keeps was computed by code that no longer exists."""
+        nb = Notebook()
+        helper, _ = nb.add("def helper():\n    return 1")
+        nb.add("def f():\n    return helper()")
+        nb.add("y = f()")
+        self.assertEqual(nb.ns["y"], 1)
+
+        results = nb.set(helper, "def helper():\n    return 999")
+
+        self.assertNotIn("cached", [r.status for r in results])
+        self.assertEqual(nb.ns["y"], 999)
+
+    def test_a_library_functions_globals_are_not_walked(self):
+        """A cell function's globals are the notebook; a library
+        function's are the library. Walking the latter would digest a
+        module dict to answer a question about one of its functions, and
+        would report a change nobody made."""
+        import json
+
+        before = digest(json.dumps)
+        self.assertIsNotNone(before)
+        self.assertEqual(digest(json.dumps), before)
+
+    def test_a_set_nested_in_a_container_is_canonicalised_too(self):
+        """`_digest_set` fixes the hash-order problem only where it runs.
+        A container was pickled whole, which put the nested set back in
+        iteration order — the same instability, one level down."""
+        members = {"alpha", "beta", "gamma", "delta"}
+        forward = list(members)
+        backward = list(reversed(forward))
+
+        self.assertEqual(digest([set(forward)]), digest([set(backward)]))
+        self.assertEqual(digest({"k": set(forward)}), digest({"k": set(backward)}))
+        self.assertNotEqual(digest([set(members)]), digest([frozenset(members)]))
+
+    def test_containers_keep_the_distinctions_their_types_make(self):
+        """Walking a container must not flatten it: kind and order are
+        content, and a dict's insertion order is observable through
+        `list(d)` even when two dicts compare equal."""
+        self.assertNotEqual(digest([1, 2]), digest((1, 2)))
+        self.assertNotEqual(digest([1, 2]), digest([2, 1]))
+        self.assertNotEqual(digest([]), digest(()))
+        self.assertNotEqual(digest({"a": 1, "b": 2}), digest({"b": 2, "a": 1}))
+        self.assertEqual(digest({"a": 1, "b": 2}), digest({"a": 1, "b": 2}))
+
+    def test_a_self_referential_container_stays_digestable(self):
+        """Walking a container by hand loses pickle's memo, so the cycle
+        guard has to cover containers as well as functions and sets."""
+        loop: list = [1]
+        loop.append(loop)
+        self.assertIsNotNone(digest(loop))
 
     def test_an_undigestable_capture_makes_the_function_uncacheable(self):
         """A capture that cannot be digested has to poison the function,
