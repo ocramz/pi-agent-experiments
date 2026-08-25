@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import pickle
+import sys
 import types
 
 
@@ -40,6 +41,20 @@ def _code_fingerprint(code: types.CodeType) -> tuple:
     )
 
 
+def _code_names(code: types.CodeType) -> frozenset[str]:
+    """Every global name the code could read, nested functions included.
+
+    `co_names` also holds attribute and method names, so this over-collects.
+    The caller intersects it with the actual globals, and a coincidental
+    match there costs one extra invalidation, never a wrong answer.
+    """
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _code_names(const)
+    return frozenset(names)
+
+
 # Markers for the two structural cases that have no content of their own.
 # Fixed strings, because they end up in a key that has to be reproducible.
 _CYCLE = "<cycle>"
@@ -61,9 +76,12 @@ def digest(obj: object) -> str | None:
     4. Cheap. It runs once per ref, per key computation.
 
     Rule 1 is why functions are decomposed rather than hashed by code
-    alone: two closures from one `def` differ only in what they captured.
+    alone: two closures from one `def` differ only in what they captured,
+    and two functions with one body can call different globals.
     Rule 2 is why sets are canonicalised rather than pickled: pickle
-    walks them in iteration order, which is hash-randomised.
+    walks them in iteration order, which is hash-randomised. It is also
+    why lists, tuples and dicts are walked at all — pickling one emits
+    any set inside it in that same randomised order.
     """
     return _digest(obj, frozenset())
 
@@ -87,6 +105,24 @@ def _digest(obj: object, seen: frozenset[int]) -> str | None:
         if id(obj) in seen:
             return _CYCLE
         return _digest_set(obj, seen | {id(obj)})
+    # Containers are walked rather than pickled so that the rules above
+    # reach what they hold: a set nested in a list is as hash-order
+    # dependent as a bare one, and pickle would emit it in that order.
+    # This is rule 2 bought with rule 4 — a Python-level walk costs ~30x
+    # a single `pickle.dumps` on a large container (measured: 755ms vs
+    # 27ms for 100k JSON-shaped records). Rule 2 outranks rule 4, and the
+    # values this persona actually holds at that size are arrays and
+    # frames, which are not exact containers and still take the pickle
+    # path below. If a large *Python* container ever dominates a key
+    # computation, the fix is a size guard here, not abandoning the walk.
+    if type(obj) in (list, tuple):
+        if id(obj) in seen:
+            return _CYCLE
+        return _digest_sequence(obj, seen | {id(obj)})
+    if type(obj) is dict:
+        if id(obj) in seen:
+            return _CYCLE
+        return _digest_mapping(obj, seen | {id(obj)})
     try:
         return _hash(pickle.dumps(obj, protocol=4))
     except Exception:
@@ -94,7 +130,7 @@ def _digest(obj: object, seen: frozenset[int]) -> str | None:
 
 
 def _digest_function(fn: types.FunctionType, seen: frozenset[int]) -> str | None:
-    """Code, captures and defaults — everything that decides what it does.
+    """Code, captures, defaults and globals — all that decides what it does.
 
     Pickle would serialise a function *by name*, so an edited body would
     hash identically; the code fingerprint fixes that. But the code is
@@ -102,6 +138,13 @@ def _digest_function(fn: types.FunctionType, seen: frozenset[int]) -> str | None
     code object and differing only in a captured cell, so a code-only
     digest calls them equal and every dependent silently keeps a stale
     value. Defaults are the same story with different storage.
+
+    Globals are the same story a third time, and the one that bites
+    hardest: `def f(): return helper()` captures nothing and its code
+    never mentions what `helper` does, so editing `helper` used to leave
+    `digest(f)` untouched and every cell reading `f` reported `cached`
+    over a stale value. A global is read at call time, so it decides the
+    result exactly as a capture does.
 
     Sections are labelled so that a capture and a default holding the
     same value cannot produce the same digest by rearrangement.
@@ -134,7 +177,30 @@ def _digest_function(fn: types.FunctionType, seen: frozenset[int]) -> str | None
             return None
         parts.append(f"kwdefault:{name}={digested}")
 
+    if _is_dynamic(fn):
+        for name in sorted(_code_names(fn.__code__) & fn.__globals__.keys()):
+            digested = _digest(fn.__globals__[name], seen)
+            if digested is None:
+                return None
+            parts.append(f"global:{name}={digested}")
+
     return _hash("\x00".join(parts))
+
+
+def _is_dynamic(fn: types.FunctionType) -> bool:
+    """Was this function defined outside any importable module?
+
+    True for anything a cell defined — a cell's namespace belongs to no
+    module — and false for a library's own functions. The distinction
+    decides whether the globals walk runs: a cell function's globals are
+    the notebook, which the user edits between runs, while a library
+    function's are the library, which only moves on an upgrade and is
+    already covered by `env_digest`. Walking a library's globals would
+    also mean digesting numpy's module dict to answer a question about
+    `np.mean`.
+    """
+    module = sys.modules.get(fn.__globals__.get("__name__") or "")
+    return getattr(module, "__dict__", None) is not fn.__globals__
 
 
 def _digest_set(value: set | frozenset, seen: frozenset[int]) -> str | None:
@@ -154,6 +220,43 @@ def _digest_set(value: set | frozenset, seen: frozenset[int]) -> str | None:
         digested.append(element_digest)
     kind = "frozenset" if isinstance(value, frozenset) else "set"
     return _hash(kind + ":" + "\x00".join(sorted(digested)))
+
+
+def _digest_sequence(value: list | tuple, seen: frozenset[int]) -> str | None:
+    """Ordered digest of a list or tuple.
+
+    Order is content here — `[1, 2]` and `[2, 1]` are different values —
+    so unlike a set's members these are not sorted. The kind is labelled
+    because a list and a tuple of the same items are not interchangeable
+    either.
+    """
+    digested = []
+    for element in value:
+        element_digest = _digest(element, seen)
+        if element_digest is None:
+            return None
+        digested.append(element_digest)
+    kind = "list" if type(value) is list else "tuple"
+    return _hash(kind + ":" + "\x00".join(digested))
+
+
+def _digest_mapping(value: dict, seen: frozenset[int]) -> str | None:
+    """Digest of a dict, in insertion order.
+
+    Not sorted, for the reason sets are: a dict's iteration order is
+    already reproducible across processes (insertion order since 3.7),
+    and it is observable — `list(d)` tells two dicts with the same items
+    apart, so canonicalising them would call two distinguishable values
+    identical.
+    """
+    digested = []
+    for key, item in value.items():
+        key_digest = _digest(key, seen)
+        item_digest = _digest(item, seen)
+        if key_digest is None or item_digest is None:
+            return None
+        digested.append(f"{key_digest}={item_digest}")
+    return _hash("dict:" + "\x00".join(digested))
 
 
 _env_digest: str | None = None
