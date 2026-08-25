@@ -99,7 +99,7 @@ def fresh_namespace() -> dict[str, object]:
 def run_cell(cell: Cell, ns: dict, cid: str) -> Result:
     """Run a cell against a namespace and describe what happened.
 
-    NB: uses `exec` and `eval`. 
+    NB: uses `exec` and `eval`.
 
     stdout/stderr are captured rather than leaked: on the JSON-lines
     protocol a stray print would corrupt the wire. A trailing expression

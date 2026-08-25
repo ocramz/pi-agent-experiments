@@ -2,13 +2,14 @@
 
 Cells declare nothing, so every edge here is derived: a cell that binds a
 global *provides* it, a cell that reads one *depends* on its provider.
-Invariant : The three tables (`provider`, `parents_of`, `kids`) must be 
+Invariant : The three tables (`provider`, `parents_of`, `kids`) must be
 built or replaced in parallel.
 
-Immutable, and validated at construction: a valid `Graph` has 
-- a single provider per name and 
-- no cycles. 
-That is also what lets the notebook's staging roll back, by keeping the previous instance.
+Immutable, and validated at construction: a valid `Graph` has
+- a single provider per name and
+- no cycles.
+That is also what lets the notebook's staging roll back, by keeping the
+previous instance.
 """
 
 from __future__ import annotations
@@ -82,8 +83,8 @@ class Graph:
         return seen
 
     def topo(self, subset: set[str] | None = None) -> list[str]:
-        """topological sort by Kahn's algorithm: insertion order as 
-        the tie-break so the execution order of independent cells 
+        """topological sort by Kahn's algorithm: insertion order as
+        the tie-break so the execution order of independent cells
         never depends on their ids.
         In-degree is counted within `subset` only: parents outside it
         are, by definition, already up to date."""
