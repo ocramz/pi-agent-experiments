@@ -148,11 +148,11 @@ test("only the newest message keeps the globals tail", () => {
 test("an older inspect collapses whole", () => {
 	const older = py({
 		kind: "py.inspect",
-		response: { ok: true, cells: [{ id: "c1", name: null, defines: ["x"], depends_on: [], stateful: false, failing: false }] },
+		response: { ok: true, cells: [{ id: "c1", name: null, defines: ["x"], depends_on: [], stateful: false, volatile: false, reads: [], failing: false }] },
 	});
 	const newer = py({
 		kind: "py.inspect",
-		response: { ok: true, cells: [{ id: "c1", name: null, defines: ["x"], depends_on: [], stateful: false, failing: false }] },
+		response: { ok: true, cells: [{ id: "c1", name: null, defines: ["x"], depends_on: [], stateful: false, volatile: false, reads: [], failing: false }] },
 	});
 
 	const out = filterPyContext([older, newer], LIVE);

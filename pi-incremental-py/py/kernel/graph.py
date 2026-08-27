@@ -82,6 +82,23 @@ class Graph:
                     stack.append(kid)
         return seen
 
+    def taint(self, seeds: set[str]) -> set[str]:
+        """Seeds plus everything downstream of them.
+
+        Volatility is a property of *values*, not only of cells, and it
+        travels along edges `digest` cannot see. `def now(): return
+        time.time()` has a perfectly stable digest — code, closures,
+        defaults and globals all sit still — so a cell calling `now()`
+        keys constant and caches a stale answer forever. Marking the
+        defining cell alone fixes nothing; its readers have to inherit.
+
+        Coarser than strictly necessary: `t1 = t0 + 1` would have
+        re-keyed on its own, because t0's digest really does move. Taking
+        the whole cone over-invalidates in that case, which is the
+        direction the analysis already errs in everywhere else.
+        """
+        return seeds | {d for cid in seeds for d in self.descendants(cid)}
+
     def topo(self, subset: set[str] | None = None) -> list[str]:
         """topological sort by Kahn's algorithm: insertion order as
         the tie-break so the execution order of independent cells

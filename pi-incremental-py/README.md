@@ -96,6 +96,38 @@ deliberately not shipped.
   only ever drop a dependency it has proved spurious.
 - **Builtin shadowing.** If a cell defines `len`, dependents of `len` get
   a real DAG edge and re-run when it changes.
+- **The world is observed, not inferred.** A cell reading the clock, a
+  file or a URL has an input that appears nowhere in `refs`, so its key
+  is constant over a varying input and it reports `cached` over a stale
+  value. Python cannot be statically analysed for this — `f = time.time`,
+  `getattr`, and any C extension that opens a socket all defeat a name
+  blacklist — so an audit hook watches each run and sorts what it sees by
+  whether it can be digested:
+
+  - **Files read** become cache-key inputs. The cell caches until the
+    file's *contents* change, so a regenerated-but-identical file
+    propagates nothing. Digests are stat-gated: an unchanged size and
+    mtime reuse the memo without a re-read, so the steady-state cost is
+    one `stat`. The hole this leaves is an overwrite that *preserves*
+    mtime (`cp -p`, `rsync -t`, `tar -x`), which is missed; closing it
+    would mean re-reading every file on every key computation. Files
+    under the interpreter's own prefixes are ignored — `import json`
+    really does open a dozen of them, and `env` already covers those.
+    A non-regular file (FIFO, `/dev/*`) or one over 8 MiB is refused
+    rather than hashed, and the cell goes volatile instead.
+  - **Sockets and subprocesses** make the cell **volatile**: there is no
+    digest for "the internet", so it must run every time.
+
+- **`volatile`.** What the hook cannot see — `time.time()` raises no
+  audit event — is declared, as a parameter on `py_cell` and on an edit.
+  It means one thing: *never served from cache*. Everything downstream
+  inherits it, because `digest` sees a function's code, closures,
+  defaults and globals, all of which sit still for
+  `def now(): return time.time()` — so marking only its defining cell
+  would leave every caller caching a stale answer. It is **not** a claim
+  about side effects: `run_all` replays a volatile cell like any other,
+  because running a Python program twice sends the request twice, and the
+  kernel has no store of past values with which to do otherwise.
 - **Failure isolation.** A cell that raises leaves its dependents
   `pending` (skipped, not poisoned); `failing` lists the broken ones.
   Cell stdout/stderr is captured into each result's `output` field and
@@ -110,11 +142,11 @@ dependency order:
 | module | holds |
 |---|---|
 | `errors.py` | the three ways a set of cells fails to be a notebook |
-| `values.py` | `digest` (is this value still the same?) and `brief` (what is it?) |
+| `values.py` | `digest` (is this value still the same?), `file_digest` (the same, for a file a cell read) and `brief` (what is it?) |
 | `analysis.py` | `analyze`: defs/refs/imports recovered from source via `symtable`, plus the AST corrections symtable needs |
-| `cell.py` | `Cell` (analysed and compiled), `Result`, `Outcome`, `run_cell` |
+| `cell.py` | `Cell` (analysed and compiled), `Result`, `Outcome`, `run_cell`, and the audit hook that watches one run |
 | `edits.py` | `Edit`: the vocabulary of a change |
-| `graph.py` | `Graph`: providers, parents, kids, topological order — built whole, validated at construction |
+| `graph.py` | `Graph`: providers, parents, kids, topological order, and the `taint` that carries volatility downstream — built whole, validated at construction |
 | `notebook.py` | `Notebook`: ids, staging with atomic rollback, versioned execution, topo-ordered run, digest-keyed early cutoff |
 
 `py/kernel/__init__.py` re-exports the public surface (`Notebook`, `Edit`,
@@ -125,13 +157,22 @@ import …` is the only import anything outside the package needs.
   JSON-lines protocol, and `install` as a function over a notebook (pip
   acts on a kernel; it is not part of one).
 
-A cell's cache key is a hash of its source plus the digests of every
-global it reads. Cells containing an `import` also mix in the digest of
-the installed distribution set, so `pip install` invalidates exactly the
-importing cells and their descendants — coarse, all-or-nothing, never
-wrong. Keys are pure content addresses: they must not vary between
-processes, which is why function digests walk nested code objects instead
-of `repr`-ing them.
+A cell's cache key is a hash of its source, the digests of every global
+it reads, and the digests of every file it read last run. Cells
+containing an `import` also mix in the digest of the installed
+distribution set, so `pip install` invalidates exactly the importing
+cells and their descendants — coarse, all-or-nothing, never wrong. Keys
+are pure content addresses: they must not vary between processes, which
+is why function digests walk nested code objects instead of `repr`-ing
+them, and why a file contributes its contents rather than its timestamp.
+
+The key has two halves, taken at different moments. The globals half must
+be computed *before* the cell runs, because a self-reference reads the
+previous committed version. The files half is completed *after*, because
+a cell's file inputs are only discovered by running it — keying the
+result on the set known beforehand would make every file-reading cell pay
+for itself twice: once to learn what it reads, once more because the key
+then moved underneath it.
 
 ## Protocol
 
@@ -142,6 +183,7 @@ mid-line).
 
 ```json
 {"tool": "add_cell", "src": "rows = [1, 2, 3]", "name": "load", "run": true}
+{"tool": "add_cell", "src": "t = time.time()", "volatile": true}
 {"tool": "set_cell", "id": "k7x2qm", "src": "rows = [4, 5, 6]", "run": false}
 {"tool": "delete_cell", "id": "k7x2qm"}
 {"tool": "rerun_cell", "id": "k7x2qm"}

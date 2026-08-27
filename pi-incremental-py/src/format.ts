@@ -23,6 +23,10 @@ export interface CellResult {
 	output?: string;
 	/** Reads something it also defines, so its successive values are a history. */
 	stateful?: boolean;
+	/** Never served from cache: it reads something the kernel cannot digest. */
+	volatile?: boolean;
+	/** Audit events that forced `volatile`. Empty unless this run caused it. */
+	effects?: string[];
 }
 
 export interface MutatingResponse {
@@ -81,7 +85,13 @@ export function formatResults(resp: MutatingResponse, opts: RenderOptions = {}):
 		}
 		const ms = (r.seconds * 1000).toFixed(1);
 		const tail = r.status === "error" ? (r.error ?? "") : (r.value ?? "");
-		lines.push(`${MARK[r.status]} ${r.cell} ${r.status} ${ms}ms${tail ? `  ${tail}` : ""}`);
+		// Only when this run is what demoted the cell. A volatile cell
+		// reports `ran` forever after, and tagging every one of those
+		// lines would bury the one line that explains why.
+		const why = r.effects?.length ? `  (volatile: ${r.effects.join(", ")})` : "";
+		lines.push(
+			`${MARK[r.status]} ${r.cell} ${r.status} ${ms}ms${tail ? `  ${tail}` : ""}${why}`,
+		);
 		if (!stale && r.output?.trim()) lines.push(indent(r.output.trimEnd()));
 	}
 	if (cached) lines.push(`- ${cached} cell${cached === 1 ? "" : "s"} cached (unchanged)`);
@@ -109,6 +119,9 @@ export interface InspectResponse {
 		defines: string[];
 		depends_on: string[];
 		stateful: boolean;
+		volatile: boolean;
+		/** Files the cell read last run: cache-key inputs alongside its globals. */
+		reads: string[];
 		failing: boolean;
 	}[];
 	globals?: Record<string, string>;
@@ -121,12 +134,19 @@ export function formatInspect(resp: InspectResponse): string {
 	const lines: string[] = [];
 	for (const c of resp.cells ?? []) {
 		const label = c.name ? `${c.id} (${c.name})` : c.id;
-		const flags = [c.stateful ? "stateful" : "", c.failing ? "FAILING" : ""]
+		const flags = [
+			c.stateful ? "stateful" : "",
+			c.volatile ? "volatile" : "",
+			c.failing ? "FAILING" : "",
+		]
 			.filter(Boolean)
 			.join(" ");
 		const deps = c.depends_on.length ? ` <- ${c.depends_on.join(", ")}` : "";
+		// Files are inputs, so they belong next to the globals the cell
+		// depends on rather than in the flags.
+		const reads = c.reads?.length ? ` <- ${c.reads.join(", ")}` : "";
 		lines.push(
-			`${label}: defines [${c.defines.join(", ")}]${deps}${flags ? `  ${flags}` : ""}`,
+			`${label}: defines [${c.defines.join(", ")}]${deps}${reads}${flags ? `  ${flags}` : ""}`,
 		);
 	}
 	if (!lines.length) lines.push("(no cells)");

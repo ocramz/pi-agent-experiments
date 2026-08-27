@@ -13,6 +13,7 @@ rather than quietly remove them from it.
 import os
 import sys
 import unittest
+from dataclasses import replace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
@@ -528,6 +529,45 @@ class TestDigestStability(unittest.TestCase):
             return loop
 
         self.assertIsNotNone(digest(outer()))
+
+
+class TestVolatilityIsInherited(unittest.TestCase):
+    """Over any DAG, a volatile cell's whole cone re-runs.
+
+    The per-cell rule is easy to get right and easy to get *narrowly*
+    right: `digest` cannot tell that a function reads the clock, so a
+    reader of a volatile cell's value has to inherit the flag or it
+    caches a stale answer forever. Stated over random graphs, that is
+    just "nothing in the cone ever reports `cached`".
+    """
+
+    @SLOW
+    @given(dags(), st.data())
+    def test_no_cell_in_the_cone_is_ever_cached(self, cells, data):
+        nb, _ = build(cells)
+        picks = st.lists(st.sampled_from(sorted(nb.cells)), unique=True)
+        declared = set(data.draw(picks))
+        for cid in declared:
+            cell = nb.cells[cid]
+            nb.cells[cid] = replace(cell, volatile=True)
+
+        cone = nb.volatile()
+        self.assertLessEqual(declared, cone)
+
+        nb.pending = set(nb.cells)
+        statuses = {r.cell: r.status for r in nb.run()}
+        for cid in cone:
+            self.assertEqual(statuses.get(cid), "ran", f"{cid} in cone was cached")
+
+    @SLOW
+    @given(dags())
+    def test_declaring_nothing_leaves_everything_cacheable(self, cells):
+        """The control: taint must not leak into an ordinary notebook."""
+        nb, _ = build(cells)
+        self.assertEqual(nb.volatile(), set())
+        nb.pending = set(nb.cells)
+        statuses = {r.cell: r.status for r in nb.run()}
+        self.assertEqual(set(statuses.values()), {"cached"})
 
 
 if __name__ == "__main__":

@@ -92,6 +92,7 @@ export default function (pi: ExtensionAPI) {
 			"Self-reference is temporal: `x = x + 1` reads the previous committed value. Write accumulators as `try: x = x + 1 / except NameError: x = None` so run_all replays converge (pick the initial value that fits; None means \"nothing yet\"). Rerunning such a stateful cell ADVANCES it — it is not a refresh.",
 			"If a cell fails, its dependents stay pending (not poisoned). Fix the cell and they re-run. Check `failing`/`pending` in the response.",
 			"On ImportError, use py_install — never pip/uv from bash, which bypasses the kernel's environment tracking and leaves cached cells stale.",
+			"Set volatile: true when the cell's value depends on something the kernel cannot digest — the clock, an RNG, an environment variable, a network response. Such a cell is never served from cache, and neither is anything downstream of it. Do NOT set it for file reads or imports: files are digested automatically and package installs are already tracked, so declaring those only throws away caching you would otherwise get.",
 		],
 		parameters: Type.Object({
 			id: Type.Optional(
@@ -104,15 +105,28 @@ export default function (pi: ExtensionAPI) {
 			run: Type.Optional(
 				Type.Boolean({ description: "Execute immediately (default true). False stages the edit." }),
 			),
+			volatile: Type.Optional(
+				Type.Boolean({
+					description:
+						"Declare that this cell reads something the kernel cannot digest (clock, RNG, env var, network), so it must never be served from cache. Files and imports are tracked automatically and do NOT need this. On modify, omitting it keeps the current setting; pass false to clear.",
+				}),
+			),
 		}),
 		async execute(_id, params) {
 			const resp = params.id
-				? await call({ tool: "set_cell", id: params.id, src: params.src, run: params.run ?? true })
+				? await call({
+						tool: "set_cell",
+						id: params.id,
+						src: params.src,
+						run: params.run ?? true,
+						volatile: params.volatile,
+					})
 				: await call({
 						tool: "add_cell",
 						src: params.src,
 						name: params.name,
 						run: params.run ?? true,
+						volatile: params.volatile ?? false,
 					});
 			const note = (resp as Record<string, unknown>)._lostState ? LOST_STATE_NOTE : undefined;
 			const response = resp as MutatingResponse;
@@ -161,6 +175,12 @@ export default function (pi: ExtensionAPI) {
 						id: Type.Optional(Type.String()),
 						name: Type.Optional(Type.String()),
 						src: Type.Optional(Type.String()),
+						volatile: Type.Optional(
+							Type.Boolean({
+								description:
+									"Never serve this cell from cache: it reads something undigestible (clock, RNG, network). Omit on `set` to keep the current setting.",
+							}),
+						),
 					}),
 					{ description: "Batch edits (plan, apply)." },
 				),
