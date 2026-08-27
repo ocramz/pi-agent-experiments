@@ -158,6 +158,53 @@ test("eval leaves no cell behind", async (t) => {
 	}
 });
 
+test("a volatile cell is never served from cache, through a real kernel", async (t) => {
+	const { k } = kernelIn(t);
+	try {
+		const add = await k.call({
+			tool: "add_cell",
+			src: "import time\nstamp = time.time()",
+			volatile: true,
+		});
+		assert.equal(add.ok, true);
+		const results = add.results as { volatile?: boolean }[];
+		assert.equal(results[0].volatile, true);
+
+		// Same source, same (absent) inputs: without the flag this is the
+		// textbook cache hit, and the timestamp would never move again.
+		const again = await k.call({ tool: "run_all", restart: false });
+		const rerun = again.results as { status: string }[];
+		assert.equal(rerun[0].status, "ran");
+	} finally {
+		k.kill();
+	}
+});
+
+test("a file a cell reads is a cache-key input, through a real kernel", async (t) => {
+	const { k, dir } = kernelIn(t);
+	const data = join(dir, "data.txt");
+	try {
+		writeFileSync(data, "one");
+		const src = `rows = open(${JSON.stringify(data)}).read()`;
+		assert.equal((await k.call({ tool: "add_cell", src })).ok, true);
+
+		const inspect = (await k.call({ tool: "inspect" })) as unknown as {
+			cells: { reads: string[] }[];
+		};
+		assert.deepEqual(inspect.cells[0].reads, [data]);
+
+		const still = await k.call({ tool: "run_all", restart: false });
+		assert.equal((still.results as { status: string }[])[0].status, "cached");
+
+		writeFileSync(data, "one and two");
+		const moved = await k.call({ tool: "run_all", restart: false });
+		assert.equal((moved.results as { status: string }[])[0].status, "ran");
+		assert.deepEqual(moved.globals, { rows: "str(11)" });
+	} finally {
+		k.kill();
+	}
+});
+
 test("cell stdout is captured, the wire stays clean", async (t) => {
 	const { k } = kernelIn(t);
 	try {
@@ -265,8 +312,8 @@ test("formatInspect renders the graph with labels and flags", () => {
 	const text = formatInspect({
 		ok: true,
 		cells: [
-			{ id: "abc123", name: "load", defines: ["rows"], depends_on: [], stateful: false, failing: false },
-			{ id: "def456", name: null, defines: ["n"], depends_on: ["abc123"], stateful: true, failing: true },
+			{ id: "abc123", name: "load", defines: ["rows"], depends_on: [], stateful: false, volatile: false, reads: [], failing: false },
+			{ id: "def456", name: null, defines: ["n"], depends_on: ["abc123"], stateful: true, volatile: false, reads: [], failing: true },
 		],
 		globals: { rows: "list(3)" },
 		pending: ["def456"],

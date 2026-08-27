@@ -24,7 +24,7 @@ from .cell import Cell, Outcome, Result, fresh_namespace, run_cell
 from .edits import Edit
 from .errors import DuplicateNameError
 from .graph import Graph
-from .values import _hash, brief, digest, env_digest
+from .values import _hash, brief, digest, env_digest, file_digest
 
 _MISSING = object()
 
@@ -44,6 +44,10 @@ class Notebook:
         self.pending: set[str] = set()
         self.done: dict[str, Outcome] = {}
         self.env: str = env_digest()
+        # What the audit hook saw, per cell, on its last run. Neither is
+        # in _STATE: staging never executes, so it cannot move them.
+        self.reads: dict[str, tuple[str, ...]] = {}  # files: key inputs
+        self.detected: set[str] = set()  # touched something undigestible
         self._rng = random.Random(seed)
 
     # ---- identity
@@ -90,6 +94,17 @@ class Notebook:
     def stateful(self, cid: str) -> bool:
         return self.cells[cid].stateful
 
+    def volatile(self) -> set[str]:
+        """Cells that may never be served from cache.
+
+        The seeds are the two ways a cell earns it — the author declared
+        it, or the audit hook caught it touching something with no digest
+        — and the cone below them is inherited, because a volatile cell's
+        *values* are volatile too. See `Graph.taint`.
+        """
+        declared = {cid for cid, cell in self.cells.items() if cell.volatile}
+        return self.graph.taint(declared | (self.detected & set(self.cells)))
+
     # ---- staging
 
     def _save(self) -> dict:
@@ -120,13 +135,22 @@ class Notebook:
                         if cid in self.cells:
                             raise KeyError(f"cell {cid!r} already exists")
                         self._check_name(edit.name)
-                        self.cells[cid] = Cell.of(edit.src or "", edit.name)
+                        self.cells[cid] = Cell.of(
+                            edit.src or "", edit.name, bool(edit.volatile)
+                        )
                         created.append(cid)
                     case "set":
                         if edit.id not in self.cells:
                             raise KeyError(f"no cell {edit.id!r}")
-                        name = self.cells[edit.id].name
-                        self.cells[edit.id] = Cell.of(edit.src or "", name)
+                        prior = self.cells[edit.id]
+                        # An omitted flag inherits: rewriting a cell's
+                        # source must not silently un-declare it.
+                        volatile = (
+                            prior.volatile if edit.volatile is None else edit.volatile
+                        )
+                        self.cells[edit.id] = Cell.of(
+                            edit.src or "", prior.name, volatile
+                        )
                     case "delete":
                         if edit.id not in self.cells:
                             raise KeyError(f"no cell {edit.id!r}")
@@ -152,7 +176,19 @@ class Notebook:
         for name in set(saved["graph"].provider) - set(self.provider):
             self.ns.pop(name, None)  # retract dropped globals
         for cid in set(saved["cells"]) - set(self.cells):
-            self.done.pop(cid, None)  # a recycled id must not inherit a cache hit
+            # A recycled id must not inherit a cache hit, a set of file
+            # inputs, or somebody else's demotion to volatile.
+            self.done.pop(cid, None)
+            self.reads.pop(cid, None)
+            self.detected.discard(cid)
+        for edit in edits:
+            # Observations describe source. Once that source is replaced
+            # they describe code that no longer exists, so a cell edited
+            # away from its `requests.get` must be allowed to cache again,
+            # and must not keep keying on a file it no longer opens.
+            if edit.op == "set" and edit.id in self.cells:
+                self.reads.pop(edit.id, None)
+                self.detected.discard(edit.id)
         self.pending |= affected
         return affected, created
 
@@ -169,15 +205,24 @@ class Notebook:
     # ---- public editing API
 
     def add(
-        self, src: str, name: str | None = None, run: bool = True
+        self,
+        src: str,
+        name: str | None = None,
+        run: bool = True,
+        volatile: bool = False,
     ) -> tuple[str, list[Result]]:
         """Create a new cell; returns (generated_id, results)."""
-        results, created = self.apply([Edit("add", src=src, name=name)], run=run)
+        results, created = self.apply(
+            [Edit("add", src=src, name=name, volatile=volatile)], run=run
+        )
         return created[0], results
 
-    def set(self, cid: str, src: str, run: bool = True) -> list[Result]:
-        """Modify an existing cell."""
-        return self.apply([Edit("set", id=cid, src=src)], run=run)[0]
+    def set(
+        self, cid: str, src: str, run: bool = True, volatile: bool | None = None
+    ) -> list[Result]:
+        """Modify an existing cell. `volatile=None` keeps the flag as it
+        was — rewriting source must not silently un-declare a cell."""
+        return self.apply([Edit("set", id=cid, src=src, volatile=volatile)], run=run)[0]
 
     def delete(self, cid: str, run: bool = True) -> list[Result]:
         """Deleting a cell retracts its globals. This is the behaviour
@@ -196,11 +241,13 @@ class Notebook:
 
     # ---- execution
 
-    def _key(self, cid: str) -> str:
-        """Content address of a cell's next run.
+    def _inputs_key(self, cid: str) -> str | None:
+        """Source, globals and environment. 'None' means: no stable address.
 
         Self-refs resolve to the previous committed version in ns at this
-        point (pre-exec), so stateful cells key on their history.
+        point (pre-exec), so stateful cells key on their history — which
+        is why this half must be computed *before* the cell runs and can
+        never be recomputed after.
         """
         cell = self.cells[cid]
         inputs = sorted(
@@ -209,16 +256,65 @@ class Notebook:
             if name in self.provider
         )
         if any(d is None for _, d in inputs):
-            return _hash(f"{time.time_ns()}")  # unhashable input: never cache
-        key = _hash(cell.src + repr(inputs))
-        return _hash(key + self.env) if cell.imports else key
+            return None
+        else:
+            key = _hash(cell.src + repr(inputs))
+            if cell.imports:
+                return _hash(key + self.env)
+            else:
+                return key
 
-    def _execute(self, cid: str, key: str) -> Result:
+    def _files_key(self, paths: tuple[str, ...]) -> str | None:
+        """Files the cell read. 'None' means: no stable address.
+
+        Unlike the globals, this half *is* recomputed after the run, by
+        `_execute`. A cell's file inputs are only discovered by running
+        it, so keying the result on the set we knew beforehand would make
+        every file-reading cell pay for itself twice — once to learn what
+        it reads, once more because the key then changed underneath it.
+        """
+        files = sorted((path, file_digest(path)) for path in paths)
+        if any(d is None for _, d in files):
+            return None
+        else:
+            return _hash(repr(files))
+
+    @staticmethod
+    def _combine(inputs: str | None, files: str | None) -> str:
+        """One address from the two halves, or one that cannot match.
+
+        A None from either half means an input we cannot identify — a
+        socket in the namespace, a FIFO on disk. The timestamp is not a
+        key so much as a guarantee of a miss.
+        """
+        if inputs is None or files is None:
+            return _hash(f"{time.time_ns()}")
+        else:
+            return _hash(inputs + files)
+
+    def _key(self, cid: str) -> str:
+        """Content address of a cell's next run.
+
+        Both halves, against the files the cell read last time. That set
+        is sound for the same reason the rest of the kernel is: for the
+        cell to read a *different* file this time, something in its
+        namespace must have changed — or it is volatile, and never
+        cached at all.
+        """
+        return self._combine(
+            self._inputs_key(cid), self._files_key(self.reads.get(cid, ()))
+        )
+
+    def _execute(self, cid: str, inputs_key: str | None) -> Result:
         """Exec one cell against the namespace.
 
         Self-references read the last committed version, because defs are
         not popped before exec; on failure the namespace is restored from
         that committed version, so a crash leaves no half-written state.
+
+        Takes the *inputs* half of the key, computed before the run when
+        the namespace still held the previous version, and completes it
+        afterwards with the files the cell turned out to read.
         """
         cell = self.cells[cid]
         prior = {n: self.ns.get(n, _MISSING) for n in cell.defs}
@@ -229,15 +325,42 @@ class Notebook:
                     self.ns.pop(name, None)
                 else:
                     self.ns[name] = was
+        self._record(cid, result)
+        key = self._combine(inputs_key, self._files_key(self.reads.get(cid, ())))
         self.done[cid] = Outcome(key, result)
         return result
 
-    def _fresh(self, cid: str, key: str) -> bool:
+    def _record(self, cid: str, result: Result) -> None:
+        """Turn what the hook saw into what the next key will use.
+
+        A file read becomes an input; anything undigestible demotes the
+        cell instead. The classification happens once, here, rather than
+        on every key computation — and a path that stops being digestible
+        later (a file that grows past the cap) still cannot cause a stale
+        hit, because `_key` refuses to trust a None digest.
+        """
+        if result.effects:
+            self.detected.add(cid)
+        undigestible = [p for p in result.reads if file_digest(p) is None]
+        if undigestible:
+            self.detected.add(cid)
+            self.reads.pop(cid, None)
+        else:
+            self.reads[cid] = result.reads
+
+    def _fresh(self, cid: str, key: str, volatile: set[str]) -> bool:
         """A cell may be skipped only if the same key already produced a
-        successful run *and* every global it owns is still in place."""
+        successful run, every global it owns is still in place, and it is
+        not volatile.
+
+        Volatility belongs here rather than in `_key`: a key is a content
+        address and must stay one, while "may I skip this?" is the policy
+        question, and this is where the policy already lives.
+        """
         done = self.done.get(cid)
         return (
-            done is not None
+            cid not in volatile
+            and done is not None
             and done.key == key
             and done.result.status == "ran"
             and all(name in self.ns for name in self.cells[cid].defs)
@@ -255,19 +378,26 @@ class Notebook:
         results: list[Result] = []
         failed: set[str] = set()
         skip: set[str] = set()
+        volatile = self.volatile()
 
         for cid in self.topo(candidates):
             if cid in skip:
                 continue
-            key = self._key(cid)
-            if self._fresh(cid, key):
+            inputs_key = self._inputs_key(cid)
+            key = self._combine(inputs_key, self._files_key(self.reads.get(cid, ())))
+            if self._fresh(cid, key, volatile):
                 value = self.done[cid].result.value
                 results.append(Result(cid, "cached", 0.0, value=value))
                 continue
-            result = self._execute(cid, key)
+            result = self._execute(cid, inputs_key)
             if result.status == "error":
                 failed.add(cid)
                 skip |= self.descendants(cid)
+            # A cell demoted by what it just did taints its descendants,
+            # and they have not run yet in this pass — so extend the set
+            # now rather than leaving them cacheable until the next run.
+            if cid in self.detected and cid not in volatile:
+                volatile |= self.graph.taint({cid})
             results.append(result)
 
         self.pending = failed | skip
@@ -288,7 +418,18 @@ class Notebook:
     def run_all(self, restart: bool = True) -> list[Result]:
         """Evaluate everything from the top. With restart (the default)
         the namespace and the cache are dropped first, so this is a true
-        replay: the notebook is a program, not a transcript."""
+        replay: the notebook is a program, not a transcript.
+
+        A volatile cell re-executes here, side effects and all. That is
+        the strict reading and the unsurprising one — running a Python
+        program twice sends the request twice — and the kernel's business
+        is to stop reporting `cached` over a stale value, not to decide
+        which of a cell's effects the author meant.
+
+        `reads` and `detected` survive a restart: they are knowledge
+        about what a cell does, not state it left behind, and dropping
+        them would only mean re-learning the same facts.
+        """
         if restart:
             self.ns = fresh_namespace()
             self.done.clear()
@@ -310,6 +451,7 @@ class Notebook:
     def describe(self) -> dict:
         """The view the agent gets back, instead of a scrolling transcript."""
         failing = set(self.failing())
+        volatile = self.volatile()
         return {
             "cells": [
                 {
@@ -318,6 +460,8 @@ class Notebook:
                     "defines": sorted(self.cells[cid].defs),
                     "depends_on": sorted(self.parents_of[cid]),
                     "stateful": self.cells[cid].stateful,
+                    "volatile": cid in volatile,
+                    "reads": list(self.reads.get(cid, ())),
                     "failing": cid in failing,
                 }
                 for cid in self.topo()

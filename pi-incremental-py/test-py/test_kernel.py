@@ -6,7 +6,9 @@ No third-party packages required.
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
@@ -17,8 +19,11 @@ from kernel import (  # noqa: E402
     Edit,
     MultipleDefinitionError,
     Notebook,
+    Result,
     analyze,
+    file_digest,
 )
+from kernel.values import _hash_file  # noqa: E402
 from protocol import handle  # noqa: E402
 
 
@@ -456,6 +461,290 @@ class TestEnvironmentIsATrackedInput(unittest.TestCase):
         self.assertEqual(nb._key(probe), before)
 
 
+class TestVolatile(unittest.TestCase):
+    """A declared-volatile cell is never served from cache, and neither
+    is anything downstream of it.
+
+    The downstream half is not a nicety. `digest` sees a function's code,
+    closures, defaults and globals — all of which sit perfectly still for
+    `def now(): return time.time()` — so a cell calling `now()` keys
+    constant and would cache a stale answer forever.
+    """
+
+    def statuses(self, results):
+        return {r.cell: r.status for r in results}
+
+    def test_declared_volatile_never_reports_cached(self):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("import time\nstamp = time.time()", volatile=True)
+        first = nb.ns["stamp"]
+        results = nb.run_all(restart=False)
+        self.assertEqual(self.statuses(results)[cid], "ran")
+        self.assertNotEqual(nb.ns["stamp"], first)
+
+    def test_an_ordinary_neighbour_still_caches(self):
+        # The flag must not be a blunt instrument on the whole notebook.
+        nb = Notebook(seed=1)
+        vol, _ = nb.add("import time\nstamp = time.time()", volatile=True)
+        plain, _ = nb.add("total = 1 + 1")
+        results = nb.run_all(restart=False)
+        self.assertEqual(self.statuses(results)[vol], "ran")
+        self.assertEqual(self.statuses(results)[plain], "cached")
+
+    def test_volatility_reaches_readers_through_a_function(self):
+        nb = Notebook(seed=1)
+        src, _ = nb.add("import time\ndef now(): return time.time()", volatile=True)
+        reader, _ = nb.add("t = now()")
+        self.assertEqual(nb.volatile(), {src, reader})
+
+        before = nb.ns["t"]
+        nb.pending = {src, reader}
+        self.assertEqual(self.statuses(nb.run())[reader], "ran")
+        self.assertNotEqual(nb.ns["t"], before)
+
+    def test_undeclared_volatility_is_still_stale(self):
+        """What the declaration buys, stated as what its absence costs.
+
+        `now`'s digest never moves — code, closures, defaults and globals
+        all sit still — so the reader's key never moves and it reports
+        `cached` over a timestamp from minutes ago. `time` raises no
+        audit event, so nothing can catch this for us: it is exactly the
+        case the flag exists for.
+        """
+        nb = Notebook(seed=1)
+        nb.add("import time\ndef now(): return time.time()")
+        reader, _ = nb.add("t = now()")
+        nb.pending = {reader}
+        self.assertEqual(self.statuses(nb.run())[reader], "cached")
+
+    def test_editing_a_cell_reconsiders_its_demotion(self):
+        """A demotion describes source, so replacing the source drops it.
+
+        Otherwise a cell that once called `requests.get` would keep
+        re-running forever after being rewritten into `x = 1`.
+        """
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("x = 1")
+        nb.detected.add(cid)
+        nb.reads[cid] = ("/tmp/gone.csv",)
+        nb.set(cid, "x = 2")  # re-runs, so `reads` is re-recorded as empty
+        self.assertNotIn(cid, nb.detected)
+        self.assertEqual(nb.reads.get(cid, ()), ())
+        self.assertEqual(self.statuses(nb.run_all(restart=False))[cid], "cached")
+
+    def test_set_without_the_flag_keeps_it(self):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("x = 1", volatile=True)
+        nb.set(cid, "x = 2")
+        self.assertTrue(nb.cells[cid].volatile)
+
+    def test_set_can_clear_the_flag_explicitly(self):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("x = 1", volatile=True)
+        nb.set(cid, "x = 2", volatile=False)
+        self.assertFalse(nb.cells[cid].volatile)
+        self.assertEqual(nb.volatile(), set())
+
+    def test_a_recycled_id_inherits_nothing(self):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("x = 1")
+        nb.detected.add(cid)
+        nb.reads[cid] = ("/tmp/whatever",)
+        nb.delete(cid)
+        self.assertNotIn(cid, nb.detected)
+        self.assertNotIn(cid, nb.reads)
+
+
+class TestTrackedFileReads(unittest.TestCase):
+    """A file a cell reads is an input, not a surrender.
+
+    The audit hook cannot digest a socket, so a cell touching one has to
+    re-run forever. A file is different: it has content, so the honest
+    move is to put that content in the key and let the cell cache until
+    the file actually changes.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = os.path.join(self.tmp, "data.csv")
+        self.write("a,b\n1,2\n")
+        _hash_file.cache_clear()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, text):
+        # mtime has coarse granularity on some filesystems, and the stat
+        # gate keys on it. Stepping it explicitly keeps these cases off
+        # the clock instead of sleeping through it.
+        with open(self.data, "w") as handle:
+            handle.write(text)
+        stamp = os.stat(self.data).st_mtime_ns + 10_000_000_000
+        os.utime(self.data, ns=(stamp, stamp))
+
+    def reader(self):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add(f"rows = open({self.data!r}).read()")
+        return nb, cid
+
+    def status(self, nb, cid):
+        nb.pending = {cid}
+        return {r.cell: r.status for r in nb.run()}[cid]
+
+    def test_the_file_becomes_an_input(self):
+        nb, cid = self.reader()
+        self.assertEqual(nb.reads[cid], (self.data,))
+
+    def test_unchanged_file_caches(self):
+        nb, cid = self.reader()
+        self.assertEqual(self.status(nb, cid), "cached")
+
+    def test_changed_contents_rerun(self):
+        nb, cid = self.reader()
+        self.write("a,b\n1,2\n3,4\n")
+        self.assertEqual(self.status(nb, cid), "ran")
+        self.assertEqual(nb.ns["rows"].count("\n"), 3)
+
+    def test_identical_rewrite_still_caches(self):
+        """The case that pins the content hash.
+
+        mtime moves, so the stat gate opens and the file is re-read — but
+        the digest comes back the same, the key does not move, and early
+        cutoff holds. An mtime-only comparison would re-run here, and
+        would drag every downstream cell along with it.
+        """
+        nb, cid = self.reader()
+        self.write("a,b\n1,2\n")
+        self.assertEqual(self.status(nb, cid), "cached")
+
+    def test_creating_a_missing_file_invalidates(self):
+        missing = os.path.join(self.tmp, "later.txt")
+        nb = Notebook(seed=1)
+        src = f"try:\n    v = open({missing!r}).read()\nexcept OSError:\n    v = None"
+        cid, _ = nb.add(src)
+        self.assertEqual(nb.reads[cid], (missing,))
+        self.assertEqual(self.status(nb, cid), "cached")
+
+        with open(missing, "w") as handle:
+            handle.write("hello")
+        self.assertEqual(self.status(nb, cid), "ran")
+        self.assertEqual(nb.ns["v"], "hello")
+
+    def test_writes_are_not_inputs(self):
+        # A cell does not depend on what it produced itself.
+        out = os.path.join(self.tmp, "out.txt")
+        nb = Notebook(seed=1)
+        cid, _ = nb.add(f"open({out!r}, 'w').write('x')\ndone = True")
+        self.assertEqual(nb.reads.get(cid, ()), ())
+
+    def test_the_stat_gate_skips_the_read(self):
+        # Invisible from the notebook, and the whole point of the memo:
+        # an unchanged file costs one stat, not a re-read.
+        file_digest(self.data)
+        before = _hash_file.cache_info()
+        file_digest(self.data)
+        after = _hash_file.cache_info()
+        self.assertEqual(after.hits, before.hits + 1)
+        self.assertEqual(after.misses, before.misses)
+
+    def test_a_transient_failure_is_not_memoised(self):
+        """`chmod` moves ctime, not mtime.
+
+        So caching a read failure would keep serving `<missing-file>`
+        under an unchanged key long after the file became readable — the
+        reason the failure path sits outside the memo.
+        """
+        os.chmod(self.data, 0o000)
+        if os.access(self.data, os.R_OK):
+            self.skipTest("running as root: permissions do not bite")
+        self.assertEqual(file_digest(self.data), "<missing-file>")
+        os.chmod(self.data, 0o644)
+        self.assertNotEqual(file_digest(self.data), "<missing-file>")
+
+    def test_a_fifo_is_refused_rather_than_hashed(self):
+        """Hashing a FIFO would hang, not raise — so S_ISREG comes first."""
+        fifo = os.path.join(self.tmp, "pipe")
+        os.mkfifo(fifo)
+        self.assertIsNone(file_digest(fifo))
+
+    def test_an_undigestible_read_demotes_the_cell(self):
+        fifo = os.path.join(self.tmp, "pipe")
+        os.mkfifo(fifo)
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("opened = True")
+        nb._record(cid, Result(cid, "ran", 0.0, reads=(fifo,)))
+        self.assertIn(cid, nb.detected)
+        self.assertNotIn(cid, nb.reads)
+        self.assertEqual(self.status(nb, cid), "ran")
+
+    def test_too_many_reads_degrades_to_volatile(self):
+        for i in range(70):
+            with open(os.path.join(self.tmp, f"f{i}.txt"), "w") as handle:
+                handle.write(str(i))
+        pattern = os.path.join(self.tmp, "f*.txt")
+        nb = Notebook(seed=1)
+        cid, _ = nb.add(
+            f"import glob\n"
+            f"blobs = [open(p).read() for p in sorted(glob.glob({pattern!r}))]"
+        )
+        self.assertIn(cid, nb.detected)
+        self.assertEqual(nb.reads.get(cid, ()), ())
+        self.assertEqual(self.status(nb, cid), "ran")
+
+    def test_an_importing_cell_tracks_nothing(self):
+        """The regression that would silently destroy the whole cache.
+
+        `import json` really does open a dozen files. Without the
+        interpreter-path filter every importing cell would either carry a
+        dozen spurious inputs or trip the count guard and stop caching.
+        """
+        nb = Notebook(seed=1)
+        cid, _ = nb.add("import json\nblob = json.dumps({'a': 1})")
+        self.assertEqual(nb.reads.get(cid, ()), ())
+        self.assertEqual(nb.detected, set())
+        self.assertEqual(self.status(nb, cid), "cached")
+
+
+class TestUndigestibleEffects(unittest.TestCase):
+    """What the hook catches that no static analysis could.
+
+    Hermetic: `socket.connect` fires before the connection is made, so
+    the event is raised whether or not anything is listening.
+    """
+
+    SRC = (
+        "import socket\n"
+        "_s = socket.socket()\n"
+        "_s.settimeout(0.01)\n"
+        "try:\n"
+        "    _s.connect(('127.0.0.1', 1))\n"
+        "except OSError:\n"
+        "    pass\n"
+        "finally:\n"
+        "    _s.close()\n"
+        "reached = True\n"
+    )
+
+    def test_a_socket_demotes_the_cell(self):
+        nb = Notebook(seed=1)
+        cid, results = nb.add(self.SRC)
+        self.assertIn("socket.connect", results[0].effects)
+        self.assertIn(cid, nb.detected)
+        self.assertIn(cid, nb.volatile())
+
+    def test_the_demoted_cell_stops_caching(self):
+        nb = Notebook(seed=1)
+        cid, _ = nb.add(self.SRC)
+        nb.pending = {cid}
+        self.assertEqual({r.cell: r.status for r in nb.run()}[cid], "ran")
+
+    def test_an_ordinary_cell_records_nothing(self):
+        nb = Notebook(seed=1)
+        _, results = nb.add("total = sum(range(10))")
+        self.assertEqual(results[0].effects, ())
+        self.assertEqual(results[0].reads, ())
+
+
 class TestEval(unittest.TestCase):
     def test_eval_reads_namespace_without_creating_a_cell(self):
         nb = Notebook(seed=1)
@@ -513,6 +802,72 @@ class TestProtocol(unittest.TestCase):
         src = "c = c + 1 if 'c' in dir() else 0"
         acc = handle(nb, {"tool": "add_cell", "src": src})
         self.assertTrue(acc["results"][0]["stateful"])
+
+    def test_volatile_crosses_the_wire(self):
+        nb = Notebook(seed=1)
+        resp = handle(
+            nb,
+            {
+                "tool": "add_cell",
+                "src": "import time\nt = time.time()",
+                "volatile": True,
+            },
+        )
+        cid = resp["id"]
+        self.assertTrue(nb.cells[cid].volatile)
+        self.assertTrue(resp["results"][0]["volatile"])
+
+        again = handle(nb, {"tool": "run_all", "restart": False})
+        self.assertEqual(again["results"][0]["status"], "ran")
+
+    def test_set_over_the_wire_keeps_the_flag(self):
+        nb = Notebook(seed=1)
+        cid = handle(nb, {"tool": "add_cell", "src": "x = 1", "volatile": True})["id"]
+        handle(nb, {"tool": "set_cell", "id": cid, "src": "x = 2"})
+        self.assertTrue(nb.cells[cid].volatile)
+        handle(nb, {"tool": "set_cell", "id": cid, "src": "x = 3", "volatile": False})
+        self.assertFalse(nb.cells[cid].volatile)
+
+    def test_a_non_boolean_flag_is_refused(self):
+        # `from_json` is the wire boundary, so it validates rather than
+        # silently coercing "no" into a truthy declaration.
+        nb = Notebook(seed=1)
+        resp = handle(
+            nb,
+            {
+                "tool": "apply_edits",
+                "edits": [{"op": "add", "src": "x = 1", "volatile": "yes"}],
+            },
+        )
+        self.assertFalse(resp["ok"])
+        self.assertIn("volatile", resp["error"])
+
+    def test_edits_accept_the_flag(self):
+        nb = Notebook(seed=1)
+        resp = handle(
+            nb,
+            {
+                "tool": "apply_edits",
+                "edits": [{"op": "add", "src": "x = 1", "volatile": True}],
+            },
+        )
+        self.assertTrue(resp["ok"])
+        self.assertTrue(nb.cells[resp["created"][0]].volatile)
+
+    def test_results_do_not_carry_read_paths(self):
+        # Dozens of paths per cell, unchanged between runs: `inspect`
+        # reports them once instead.
+        nb = Notebook(seed=1)
+        resp = handle(nb, {"tool": "add_cell", "src": "x = 1"})
+        self.assertNotIn("reads", resp["results"][0])
+
+    def test_inspect_reports_volatility_and_reads(self):
+        nb = Notebook(seed=1)
+        cid = handle(nb, {"tool": "add_cell", "src": "x = 1", "volatile": True})["id"]
+        desc = handle(nb, {"tool": "inspect"})
+        cell = next(c for c in desc["cells"] if c["id"] == cid)
+        self.assertTrue(cell["volatile"])
+        self.assertEqual(cell["reads"], [])
 
     def test_deleting_a_cell_still_serialises_its_dependents(self):
         # `stateful` is asked of the notebook, which no longer holds the cell.

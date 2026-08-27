@@ -27,6 +27,7 @@ from kernel import (
     MultipleDefinitionError,
     Notebook,
     Result,
+    as_flag,
     env_digest,
 )
 
@@ -75,11 +76,13 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
         {p.split("==")[0].split("[")[0].replace("-", "_") for p in packages}
         & set(sys.modules)
     )
+    results = nb.run()
+    volatile = nb.volatile()
     return {
         "ok": True,
         "environment_changed": nb.env != before,
         "restart_required": loaded,
-        "results": [_result_json(nb, r) for r in nb.run()],
+        "results": [_result_json(nb, r, volatile) for r in results],
     }
 
 
@@ -95,8 +98,8 @@ EXPECTED_ERRORS = (
 )
 
 
-def _result_json(nb: Notebook, r: Result) -> dict:
-    """A result, plus the one thing about it the wire cannot otherwise carry.
+def _result_json(nb: Notebook, r: Result, volatile: set[str]) -> dict:
+    """A result, plus the two things about it the wire cannot otherwise carry.
 
     `stateful` is a property of the cell rather than of the run, but a
     consumer holding only results has no way to ask: a self-referential
@@ -104,14 +107,31 @@ def _result_json(nb: Notebook, r: Result) -> dict:
     where an ordinary cell's are stale copies of one truth. Anything
     deciding which of its recorded output is still current has to be able
     to tell those apart. A deleted cell has no cell left to ask.
+
+    `volatile` is the same kind of fact, and it explains an otherwise
+    baffling run: a cell that reports `ran` every single time, with
+    nothing upstream of it moving, is not a bug. `effects` rides along
+    because it names *why* — an empty tuple almost always, and the one
+    audit event that demoted the cell when it is not.
+
+    `reads` is deliberately dropped. It can be dozens of paths per cell,
+    it does not change between runs, and `inspect` already reports it
+    where a reader can look it up once instead of on every result.
     """
-    return {**asdict(r), "stateful": r.cell in nb.cells and nb.stateful(r.cell)}
+    payload = asdict(r)
+    payload.pop("reads", None)
+    return {
+        **payload,
+        "stateful": r.cell in nb.cells and nb.stateful(r.cell),
+        "volatile": r.cell in volatile,
+    }
 
 
 def _response(nb: Notebook, results: list[Result], **extra) -> dict:
+    volatile = nb.volatile()
     return {
         "ok": True,
-        "results": [_result_json(nb, r) for r in results],
+        "results": [_result_json(nb, r, volatile) for r in results],
         "pending": sorted(nb.pending),
         "failing": nb.failing(),
         "globals": nb.globals_brief(),
@@ -125,11 +145,19 @@ def handle(nb: Notebook, req: dict) -> dict:
         match req.get("tool"):
             case "add_cell":
                 cid, results = nb.add(
-                    req["src"], name=req.get("name"), run=req.get("run", True)
+                    req["src"],
+                    name=req.get("name"),
+                    run=req.get("run", True),
+                    volatile=bool(as_flag(req.get("volatile"))),
                 )
                 return _response(nb, results, id=cid)
             case "set_cell":
-                results = nb.set(req["id"], req["src"], run=req.get("run", True))
+                results = nb.set(
+                    req["id"],
+                    req["src"],
+                    run=req.get("run", True),
+                    volatile=as_flag(req.get("volatile")),
+                )
                 return _response(nb, results)
             case "delete_cell":
                 results = nb.delete(req["id"], run=req.get("run", True))
@@ -149,7 +177,12 @@ def handle(nb: Notebook, req: dict) -> dict:
                 return {"ok": True, **nb.describe()}
             case "eval":
                 r = nb.eval_src(req["src"])
-                return {"ok": r.status != "error", **asdict(r)}
+                payload = asdict(r)
+                # No cell owns this, so there is nothing for observations
+                # to key or demote. Dropping them keeps `/py` terse.
+                payload.pop("reads", None)
+                payload.pop("effects", None)
+                return {"ok": r.status != "error", **payload}
             case "install":
                 return install(nb, *req["packages"], upgrade=req.get("upgrade", False))
             case other:

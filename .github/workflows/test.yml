@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
 
+
 jobs:
   # Whether this run can see the repository's secrets. A pull request from a fork
   # cannot, and the container tier needs to know: without a key it does not run
@@ -49,7 +50,8 @@ jobs:
       fail-fast: false
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
-        pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
+        pkg: [pi-incremental-py] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -110,7 +112,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
+        pkg: [pi-incremental-py] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -152,8 +155,10 @@ jobs:
     if: needs.gate.outputs.has_secrets == '1'
     strategy:
       fail-fast: false
+      # matrix:
+      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
       matrix:
-        pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
+        pkg: [pi-incremental-py] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}

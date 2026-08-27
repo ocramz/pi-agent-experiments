@@ -3,17 +3,22 @@ describe it.
 
 `digest` is identity — the answer to "if a cell reads this again, could
 its result differ?", and therefore the thing cache keys are built from.
-`brief` is description — a one-line summary for an agent that wants shape
-rather than contents. Nothing here knows about cells or the graph.
+`file_digest` answers the same question for a file a cell read, which is
+an input the namespace cannot see. `brief` is description — a one-line
+summary for an agent that wants shape rather than contents. Nothing here
+knows about cells or the graph.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import os
 import pickle
+import stat
 import sys
 import types
+from functools import lru_cache
 
 
 def _hash(data: str | bytes) -> str:
@@ -277,6 +282,80 @@ def env_digest(refresh: bool = False) -> str:
         )
         _env_digest = _hash("\n".join(names))
     return _env_digest
+
+
+# A file a cell read is an input the namespace cannot see, so it belongs
+# in the key the same way a global does. These three constants are the
+# whole policy: what we refuse to hash, and how big a bite we read.
+_MISSING_FILE = "<missing-file>"
+_MAX_HASHED = 8 * 1024 * 1024
+_FILE_CHUNK = 1 << 20
+
+
+@lru_cache(maxsize=1024)
+def _hash_file(path: str, size: int, mtime_ns: int) -> str:
+    """Content digest of a regular file, memoised on its stat signature.
+
+    `size` and `mtime_ns` are *arguments* rather than a check inside the
+    body, and that is the whole trick: a file that moved has a different
+    cache key, so a stale digest is unreachable by construction rather
+    than by remembering to invalidate. Callers stat first and pass what
+    they saw.
+
+    Eviction is correctness-neutral — a miss re-reads and recomputes, so
+    `maxsize` is a cost knob with no soundness surface. That is unusual
+    for a cache and it is why this one needs no invalidation logic.
+
+    NB: this opens a file, which raises an `open` audit event. It is only
+    ever called from key computation, which happens between cells and
+    never while `cell.py` is watching, so the kernel does not record its
+    own reads as a cell's.
+    """
+    digest_ = hashlib.blake2b(digest_size=12)
+    with open(path, "rb") as handle:
+        while chunk := handle.read(_FILE_CHUNK):
+            digest_.update(chunk)
+    return "file:" + digest_.hexdigest()
+
+
+def file_digest(path: str) -> str | None:
+    """Digest of a file a cell read, or None meaning 'assume changed'.
+
+    Same four rules as `digest`, and None means the same thing: this
+    input cannot be identified, so nothing keyed on it may be cached.
+
+    `S_ISREG` is checked before anything else because the alternative is
+    not a wrong answer but a *hang*: reading `/dev/urandom`, a FIFO or
+    `/dev/stdin` to hash it never returns, and rule 3 (never raise) is
+    small comfort to a kernel that stopped. Oversized files are refused
+    for a duller reason — hashing a multi-GB frame on every key
+    computation is not viable, and refusing is honest where silently
+    swapping in a weaker comparison would not be.
+
+    A path that does not exist, or exists and cannot be read, digests to
+    a fixed marker rather than None: "not there" is itself content, so
+    *creating* the file moves the key and re-runs the cell that failed to
+    find it — the same shape as the `cowsay` story in the design essay.
+
+    The trade: a digest is reused whenever size and mtime both match, so
+    an overwrite that *preserves* mtime (`cp -p`, `rsync -t`, `tar -x`)
+    is missed. Closing that would mean re-reading every file on every key
+    computation. This is the one soundness hole here, and it is the same
+    one git's index and ccache accept.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _MISSING_FILE
+    if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_HASHED:
+        return None
+    try:
+        return _hash_file(path, st.st_size, st.st_mtime_ns)
+    except OSError:
+        # Deliberately outside the memo. `chmod` moves ctime, not mtime,
+        # so caching this would keep serving "<missing-file>" under an
+        # unchanged key after the file became readable again.
+        return _MISSING_FILE
 
 
 def brief(value: object, limit: int = 120) -> str:
