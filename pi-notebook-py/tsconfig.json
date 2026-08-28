@@ -1,0 +1,13 @@
+{
+	// Everything but `include` lives in the shared base.
+	"extends": "../shared/tsconfig.base.json",
+	// The fourth pattern is the pty harness the interactive tier imports. It
+	// resolves `cli-testing-library`/`strip-ansi` out of ../shared/test/tui,
+	// which is why `typecheck` installs that scope before running tsc.
+	"include": [
+		"src/**/*.ts",
+		"extensions/**/*.ts",
+		"test/**/*.ts",
+		"../shared/test/tui/**/*.ts"
+	]
+}

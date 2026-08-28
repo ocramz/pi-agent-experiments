@@ -50,8 +50,8 @@ jobs:
       fail-fast: false
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
-        # pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
-        pkg: [pi-incremental-py] # to save CI minutes
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
+        pkg: [pi-notebook-py] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -84,14 +84,20 @@ jobs:
       # release workflow as well as it: a tag is too late to find out.
       - run: npm run pack-check --if-present
 
-  # The Python half. Outside the matrix on purpose: pi-incremental-py is the only
-  # package with Python in it, so fanning this out would run three jobs to lint
-  # one directory. It is also the only automation ruff has ever had — the README
-  # documents the same command for a human to type, and an E501 lived in main
-  # until someone did.
+  # The Python half. Its own matrix rather than the one above, because only some
+  # packages have Python in them — fanning the main matrix out would run a job to
+  # lint a directory that does not exist. It is also the only automation ruff has
+  # ever had — the README documents the same command for a human to type, and an
+  # E501 lived in main until someone did.
   lint:
-    name: ruff (pi-incremental-py)
+    name: ruff (${{ matrix.pkg }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # Adding a Python extension: one entry here, alongside the two in the
+      # matrices above. Only packages with a py/ directory belong in it.
+      matrix:
+        pkg: [pi-notebook-py]
     steps:
       - uses: actions/checkout@v4
       # An exact version, unlike the actions/* above: astral-sh publishes no
@@ -103,7 +109,7 @@ jobs:
       # rather than only in the log.
       - run: >
           SHARED_DIR=shared . shared/versions.sh
-          && cd pi-incremental-py
+          && cd ${{ matrix.pkg }}
           && uvx ruff@"$RUFF_VERSION" check --output-format=github py test-py
 
   tui:
@@ -112,8 +118,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
-        pkg: [pi-incremental-py] # to save CI minutes
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
+        pkg: [pi-notebook-py] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -156,9 +162,9 @@ jobs:
     strategy:
       fail-fast: false
       # matrix:
-      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-web-search]
+      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
       matrix:
-        pkg: [pi-incremental-py] # to save CI minutes
+        pkg: [pi-notebook-py] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}

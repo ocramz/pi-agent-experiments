@@ -1,0 +1,7 @@
+node_modules/
+
+# Bytecode beside the kernel sources. The root .gitignore covers this too, but
+# `files` in package.json is an allowlist and a `py/` entry would match
+# __pycache__ along with the sources it meant. The allowlist is `py/*.py` plus
+# `py/nbkernel/*.py`; this line is the second lock on the same door.
+**/__pycache__/

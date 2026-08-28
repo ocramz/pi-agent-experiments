@@ -1,0 +1,65 @@
+{
+	"name": "@ocramz/pi-notebook-py",
+	"version": "0.1.0",
+	"description": "A Jupyter-shaped Python notebook for the pi agent: an ordered list of cells over one persistent namespace, with staleness hints, percent-format persistence and plots the model can see.",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"python",
+		"notebook",
+		"jupyter",
+		"jupytext"
+	],
+	"license": "MIT",
+	"type": "module",
+	"scripts": {
+		"test": "node --test 'test/*.test.ts'",
+		"typecheck": "npm --prefix ../shared/typecheck install --no-audit --no-fund --silent && npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && node ../shared/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+		"test:tui": "npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && ../shared/with-versions.sh node --test 'test/tui/*.test.ts'",
+		"test:container": "test/container/run.sh",
+		"dev:log": "../shared/dev/log-session.sh pi-notebook-py",
+		"pack-check": "../shared/check-tarball.mjs"
+	},
+	"author": "Marco Zocca",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ocramz/pi-agent-experiments.git",
+		"directory": "pi-notebook-py"
+	},
+	"homepage": "https://github.com/ocramz/pi-agent-experiments/tree/main/pi-notebook-py#readme",
+	"bugs": {
+		"url": "https://github.com/ocramz/pi-agent-experiments/issues"
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"files": [
+		"extensions/",
+		"src/",
+		"py/*.py",
+		"py/nbkernel/*.py",
+		"LICENSE",
+		"README.md",
+		"package.json"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-ai": { "optional": true },
+		"@earendil-works/pi-coding-agent": { "optional": true },
+		"@earendil-works/pi-tui": { "optional": true },
+		"typebox": { "optional": true }
+	}
+}
