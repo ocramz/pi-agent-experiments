@@ -100,7 +100,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Notebook Cell",
 		description:
 			"Create or edit a cell in a persistent Python notebook, and run it. Cells are an ordered " +
-			"list over one shared namespace and execute top to bottom, exactly as in Jupyter. Omit " +
+			"list over one shared namespace and execute top to bottom, as in Jupyter. Omit " +
 			"`id` to create a cell (the generated id comes back; quote it to edit that cell later); " +
 			"pass `after` to insert somewhere other than the end. Set `run: false` to write without " +
 			"executing. Prefer this over running python in bash: the namespace persists between calls.",

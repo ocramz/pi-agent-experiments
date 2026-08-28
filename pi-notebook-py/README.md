@@ -67,7 +67,7 @@ kernel exists to report.
 | Tool | What it does |
 |---|---|
 | `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing. |
-| `nb_run` | `cell`, `all`, `above`, `below`. `all` restarts the namespace by default — Restart & Run All. |
+| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh namespace (Restart & Run All) |
 | `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open`. |
 | `nb_install` | pip, into the interpreter the kernel is actually running. |
 
