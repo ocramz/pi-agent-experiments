@@ -1,0 +1,26 @@
+[project]
+name = "pi-notebook-py"
+version = "0.1.0"
+description = "Jupyter-shaped notebook kernel for agent-driven Python sessions"
+requires-python = ">=3.12"
+
+# No runtime dependencies: the kernel is stdlib-only (ast, io, json). matplotlib
+# is detected at runtime if the user installed it, never imported by us.
+# Its tests are not stdlib-only — test_percent.py imports hypothesis
+# unconditionally, so the dev group is required to run the suite at all.
+#     uv sync --group dev
+#     uv run python -m unittest discover -s test-py
+#     uvx ruff check py test-py
+
+[dependency-groups]
+dev = ["ruff", "hypothesis"]
+
+[tool.ruff]
+target-version = "py312"
+src = ["py", "test-py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nbkernel", "protocol"]
