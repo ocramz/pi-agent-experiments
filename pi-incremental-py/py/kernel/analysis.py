@@ -16,15 +16,16 @@ The `analyze_source` analysis pipeline is four passes over the AST and the `symt
    augmented assignment leaves no Load node at all — so `x += 1` has to
    be re-read off the AST or the cell never depends on its own previous
    value.
-3. **The survey** (`_survey_bindings`). Three AST facts symtable gets
+3. **The survey** (`_survey_bindings`). Four AST facts symtable gets
    wrong or cannot see: comprehension targets that PEP 709 inlined into
-   the enclosing table, names removed by `del`, and whether the cell
-   imports anything (an edge from the synthetic environment root).
-4. **Correction two.** A trailing display expression reads back what the
-   body just wrote, and symtable cannot tell `total = 1` followed by a
-   bare `total` from `total = total + 1`. Only a read in the body proper,
-   of a name the body is certain to have bound by then, is a read of the
-   *previous* committed value.
+   the enclosing table, names removed by `del`, names bound in a position
+   Python guarantees leaves nothing behind, and whether the cell imports
+   anything (an edge from the synthetic environment root).
+4. **Correction two** (`_shadowed_reads`). symtable cannot tell
+   `total = 1` followed by a bare `total` from `total = total + 1`, nor
+   `with open(p) as f: f.read()` from a read of an incoming `f`. A load
+   the cell has provably already bound is not a read of the *previous*
+   committed value.
 
 Convention : Every correction can only ever *drop* a dependency it has proved
 spurious, so an unsure case keeps the ref and the cell re-runs once too
@@ -40,16 +41,20 @@ from dataclasses import dataclass
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 # Statements that bind a name through an attribute rather than a Name node.
-_NAMED_BINDERS = (
-    ast.FunctionDef,
-    ast.AsyncFunctionDef,
-    ast.ClassDef,
-    ast.ExceptHandler,  # the only one whose `name` may be None
-)
+# `ExceptHandler` is deliberately absent: its name is *transient* (Python
+# unbinds it at the end of the block), so `_survey_bindings` routes it
+# there instead of into `bound`.
+_NAMED_BINDERS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 # Nodes that open a namespace of their own. A binding inside one is local
 # to it unless a `global` statement says otherwise.
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+# Statements that bind a name *for their own body*: the body cannot run
+# before the binding happened, so a read of the target in there is a read
+# of this cell's binding and never of the incoming namespace.
+_WITHS = (ast.With, ast.AsyncWith)
+_FORS = (ast.For, ast.AsyncFor)
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,7 @@ class Survey:
 
     phantom: frozenset[str]  # comprehension targets that never bind (PEP 709)
     deleted: frozenset[str]  # `del x` — symtable still calls it assigned
+    transient: frozenset[str]  # bound, then unbound again by the language
     imports: bool
 
 
@@ -125,14 +131,12 @@ def analyze_source(src: str, tree: ast.Module) -> Analysis:
     refs |= _augmented_reads(tree)
 
     survey = _survey_bindings(tree)
-    defs -= survey.phantom | survey.deleted
+    defs -= survey.phantom | survey.deleted | survey.transient
     refs -= survey.phantom
 
-    # Correction two: a trailing display expression reads back what the
-    # body just wrote, so a self-ref that appears nowhere but the tail is
-    # not a temporal dependency at all.
-    body = _body_without_tail(tree)
-    refs -= ((defs & refs) - _reads_in_body(body)) & _certainly_bound(body)
+    # Correction two: a load of a name this cell has provably already
+    # bound reads back its own binding, not the incoming namespace.
+    refs -= _shadowed_reads(tree)
 
     return Analysis(frozenset(defs), frozenset(refs), survey.imports)
 
@@ -148,13 +152,8 @@ def tail_expression(tree: ast.Module) -> ast.Expr | None:
     return None
 
 
-def _body_without_tail(tree: ast.Module) -> list[ast.stmt]:
-    """A cell's statements with the trailing display expression split off."""
-    return tree.body[:-1] if tail_expression(tree) is not None else tree.body
-
-
 def _survey_bindings(tree: ast.AST) -> Survey:
-    """One walk, three corrections to what `symtable` reports.
+    """One walk, four corrections to what `symtable` reports.
 
     *phantom*: since PEP 709 (Python 3.12) comprehensions are inlined, so
     `for x in ...` clauses show up in the enclosing symbol table as
@@ -164,36 +163,58 @@ def _survey_bindings(tree: ast.AST) -> Survey:
 
     *deleted*: `del x` does not define x; symtable marks it assigned.
 
+    *transient*: two positions where the language itself takes the name
+    back. `except E as e` is unbound at the end of the handler, and a
+    valueless `x: int` annotates without ever binding. symtable calls
+    both assigned, and a def that cannot be in the namespace afterwards
+    is a global claim the cell can never honour. Same nothing-else-binds
+    guard as *phantom*, for the same reason: `e = 1` next to an
+    `except E as e` really does bind e.
+
     Binding positions are read off `Name.ctx` rather than enumerated by
     statement type: `Store` is exactly the set of them, and it correctly
     declines to call `d` or `k` a binding in `d[k] = v`.
     """
     phantom: set[str] = set()
-    inside_comprehension: set[int] = set()
+    transient: set[str] = set()
+    excused: set[int] = set()  # Store nodes that do not count as bindings
     for node in ast.walk(tree):
         if isinstance(node, _COMPREHENSIONS):
             for gen in node.generators:
                 for name in ast.walk(gen.target):
                     if isinstance(name, ast.Name):
                         phantom.add(name.id)
-                        inside_comprehension.add(id(name))
+                        excused.add(id(name))
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is None
+            and isinstance(node.target, ast.Name)
+        ):
+            transient.add(node.target.id)
+            excused.add(id(node.target))
 
     bound: set[str] = set()
     deleted: set[str] = set()
     imports = False
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
-            phantom_target = id(node) in inside_comprehension
             if isinstance(node.ctx, ast.Del):
                 deleted.add(node.id)
-            elif isinstance(node.ctx, ast.Store) and not phantom_target:
+            elif isinstance(node.ctx, ast.Store) and id(node) not in excused:
                 bound.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            transient.add(node.name)
         elif isinstance(node, _NAMED_BINDERS) and node.name:
             bound.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             imports = True
             bound |= {(a.asname or a.name).split(".")[0] for a in node.names}
-    return Survey(frozenset(phantom - bound), frozenset(deleted), imports)
+    return Survey(
+        frozenset(phantom - bound),
+        frozenset(deleted),
+        frozenset(transient - bound),
+        imports,
+    )
 
 
 def _augmented_reads(tree: ast.Module) -> set[str]:
@@ -243,34 +264,114 @@ def _declared_global(scope: ast.AST) -> frozenset[str]:
     return frozenset(declared)
 
 
-def _reads_in_body(stmts: list[ast.stmt]) -> set[str]:
-    """Every name the body can read: Name loads, plus augmented targets.
+def _binder_targets(node: ast.AST) -> tuple[set[str], list[ast.stmt]]:
+    """Names a `for`/`with`/`except` binds, and the body that sees them.
 
-    Position-blind on purpose. `x = 1` followed by a bare `x` as a
-    *non-final* statement counts as a read even though it cannot see the
-    previous value, because the alternative is a definite-assignment
-    analysis for a shape nobody writes, and the error is in the safe
-    direction — an extra dependency is what happens today.
+    Empty for anything else. A `for`'s `orelse` is included because it
+    runs after the loop, where the target — if the loop ran at all — is
+    whatever the last iteration bound.
     """
-    reads: set[str] = set()
-    for stmt in stmts:
+    if isinstance(node, _FORS):
+        return _stored_names(node.target), [*node.body, *node.orelse]
+    if isinstance(node, _WITHS):
+        names: set[str] = set()
+        for item in node.items:
+            if item.optional_vars is not None:
+                names |= _stored_names(item.optional_vars)
+        return names, list(node.body)
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        return {node.name}, list(node.body)
+    return set(), []
+
+
+def _stored_names(target: ast.AST) -> set[str]:
+    """Names an assignment target binds, tuple-unpacking included."""
+    return {
+        node.id
+        for node in ast.walk(target)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+
+
+def _shadowed_load_ids(tree: ast.Module) -> set[int]:
+    """Loads that a `for`/`with`/`except` in scope has already bound.
+
+    `with open(p) as f:` followed by `f.read()` in its body is the shape
+    this exists for: symtable sees f assigned *and* referenced, exactly as
+    in `x = x + 1`, so without this the cell keys on the *previous* f —
+    a closed file handle, which has no digest, which makes the whole key
+    None and the cell uncacheable forever.
+
+    Nested scopes are skipped: a `lambda: r` inside a loop body reads r
+    when it is *called*, which is not this cell's business, so that load
+    keeps its reference.
+    """
+    shadowed: set[int] = set()
+    for node in ast.walk(tree):
+        names, body = _binder_targets(node)
+        if not names:
+            continue
+        stack: list[ast.AST] = list(body)
+        while stack:
+            inner = stack.pop()
+            if isinstance(inner, _SCOPES):
+                continue
+            if (
+                isinstance(inner, ast.Name)
+                and isinstance(inner.ctx, ast.Load)
+                and inner.id in names
+            ):
+                shadowed.add(id(inner))
+            stack.extend(ast.iter_child_nodes(inner))
+    return shadowed
+
+
+def _shadowed_reads(tree: ast.Module) -> frozenset[str]:
+    """Names every load of which reads a binding this cell already made.
+
+    Two ways a load is proved not to see the incoming namespace: it sits
+    inside the body of a binder that binds it (`_shadowed_load_ids`), or
+    a preceding top-level statement is certain to have bound it
+    (`_certainly_bound`). The second subsumes the trailing display
+    expression — `total = 1` followed by a bare `total` — since the tail
+    is just the last statement, and it also settles `flag = False`
+    followed by `if flag:`.
+
+    Only names actually seen loaded are returned, so a reference the walk
+    cannot account for keeps its dependency: the analysis may only ever
+    drop one it has proved spurious.
+    """
+    shadowed = _shadowed_load_ids(tree)
+    loaded: set[str] = set()
+    incoming: set[str] = set()
+    bound: set[str] = set()
+    for stmt in tree.body:
         for node in ast.walk(stmt):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                reads.add(node.id)
+                loaded.add(node.id)
+                if id(node) not in shadowed and node.id not in bound:
+                    incoming.add(node.id)
             elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-                reads.add(node.target.id)
-    return reads
+                # Binds through a Store with no Load node; see `_augmented_reads`.
+                loaded.add(node.target.id)
+                if node.target.id not in bound:
+                    incoming.add(node.target.id)
+        bound |= _certainly_bound([stmt])
+    return frozenset(loaded - incoming)
 
 
 def _certainly_bound(stmts: list[ast.stmt]) -> set[str]:
-    """Names the body is *guaranteed* to bind before the tail runs.
+    """Names these statements are *guaranteed* to have bound afterwards.
 
-    Only the body's own top level counts. A binding inside an `if`, a
-    `try`, or a loop may not happen, and then the trailing expression
-    really does read the previous committed value after all — so
-    `if flag:\\n    x = 1\\nx` keeps its self-ref. Every case this is unsure
-    about keeps the ref, which is exactly the old behaviour: the analysis
-    can only ever drop a dependency it has proved spurious.
+    Only the cell's own top level counts. A binding inside an `if`, a
+    `try`, or a loop may not happen, and then a later read really does
+    see the previous committed value after all — so `if flag:\\n    x = 1\\nx`
+    keeps its self-ref, and a `for` target is absent here because an empty
+    iterable binds nothing. Every case this is unsure about keeps the ref:
+    the analysis can only ever drop a dependency it has proved spurious.
+
+    A `with` target *is* counted: control only reaches the next statement
+    if the block completed, and it cannot have completed without binding.
     """
     bound: set[str] = set()
     for stmt in stmts:
@@ -279,9 +380,11 @@ def _certainly_bound(stmts: list[ast.stmt]) -> set[str]:
                 continue  # `x: int` annotates without binding
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
             for target in targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                        bound.add(node.id)
+                bound |= _stored_names(target)
+        elif isinstance(stmt, _WITHS):
+            for item in stmt.items:
+                if item.optional_vars is not None:
+                    bound |= _stored_names(item.optional_vars)
         elif isinstance(stmt, _NAMED_BINDERS) and stmt.name:
             bound.add(stmt.name)
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
