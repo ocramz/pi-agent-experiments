@@ -3,8 +3,8 @@
 The Jupyter model : Cells run top to bottom into a mutable
 dict, and editing one invalidates nothing on its own.
 
-What the kernel adds is *hints*. Stale state is possible here: 
-the notebook tracks enough to say which cells an edit left behind, 
+What the kernel adds is *hints*. Stale state is possible here:
+the notebook tracks enough to say which cells an edit left behind,
 and reports it on every response. It never acts
 on that itself; deciding to re-run is the agent's job.
 
