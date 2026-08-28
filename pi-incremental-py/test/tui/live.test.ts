@@ -3,6 +3,12 @@
 // These call a LLM API and cost money, and they always run — there is no opt-out.
 // They are the only coverage extensions/index.ts has, so refusing loudly beats
 // skipping quietly: an absent key fails the run rather than silently reducing it.
+//
+// Every live session loads shared/dev/pi-logger.ts (session.ts defaults `log` on
+// for `live`), so the payload the provider was sent is on disk under the
+// fixture. That turns a failure here from "the model did not say the word" —
+// which could mean the extension broke, or the model had an off day — into
+// something readable: `PI_TUI_KEEP=1` prints the log path.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -60,6 +66,21 @@ test("L3: superseded cell output is gone from the model's context", async (t) =>
 	);
 	await s.expect("superseded", { timeout: 300_000 });
 	await s.close();
+
+	// What the model quoted back is evidence, but indirect: it is the model's
+	// report of its own context, and a model can misreport. The logger recorded
+	// the payload the provider was actually sent, which is the claim itself.
+	// This is the one place it can be checked — the faux tier has no real
+	// provider, so `before_provider_request` never fires there.
+	const payloads = s.logEvents().filter((e) => e.event === "payload");
+	assert.ok(payloads.length, `the logger recorded no provider payload under ${s.logPath()}`);
+	const last = JSON.stringify(payloads[payloads.length - 1].payload);
+	assert.match(last, /superseded/, "the last payload carried no superseded marker");
+	assert.doesNotMatch(
+		last,
+		/total=1\b/,
+		"a value the kernel has recomputed twice was still in the payload",
+	);
 
 	// The structured copy the filter re-renders from rides on the tool result's
 	// `details`, which is persisted — so a resumed session can still filter a
