@@ -91,25 +91,40 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 			bullets.join("\n"),
 	);
 
-	const all = bullets.join("\n");
-	// One anchor per guideline that carries a rule the model can get wrong, in
-	// the wording that makes the rule a rule. Short fragments on purpose:
-	// the point is that the instruction survived, not that nobody may reword it.
-	for (const anchor of [
-		"never served from cache", // volatile, and what declaring it buys
-		"Do NOT set it for file reads or imports", // ...and what it costs
-		"except NameError", // the accumulator idiom
-		"ADVANCES it", // rerun on a stateful cell is not a refresh
-		"never pip/uv from bash", // py_install over the bash escape hatch
-		"stay pending (not poisoned)", // a failed cell is recoverable
+	// One anchor per guideline that carries a rule the model can get wrong. P2 and
+	// P4 divide the labour: P4 pins the exact prompt, so any reword is already a
+	// deliberate re-record, and P2 only has to say the *rule* survived it. An
+	// anchor that quotes phrasing P4 owns is therefore a duplicate that charges an
+	// extra failure for every intentional edit — which is what "is the recovery
+	// move" did when that sentence lost its opening clause.
+	//
+	// Each anchor is a conjunction matched against one bullet, not against the
+	// bullets joined. Both halves matter: joined, two guidelines could satisfy an
+	// anchor between them, and it is the per-bullet match that makes it safe to
+	// shorten the fragments this far. The `run_all` entry is the concrete case —
+	// `py_kernel {op: "run_all"}` also appears in the py_cell accumulator
+	// guideline, so the bare call form would still be found with the kernel
+	// guideline deleted outright; `/unstaged/` is its own payload and pins it.
+	const anchors: [string, ...(string | RegExp)[]][] = [
+		["volatile is exempt from caching", /volatile/, "never served from cache"],
+		["...and what declaring it costs", /volatile/, /file reads or imports/],
+		["the accumulator idiom", /py_cell/, /except NameError/],
+		["rerun advances a stateful cell", /rerun/, /advances/i],
+		["py_install over the bash escape hatch", /py_install/, /pip/, /bash/],
+		["a failed cell is recoverable", /py_cell/, /pending/, /poisoned/],
 		// The three py_kernel ops, spelled as the calls they are. Bare, they read
 		// as English — "plan before a multi-cell refactor" is indistinguishable
 		// from advice to think ahead, and a model treats it as such.
-		'`py_kernel {op: "inspect"}` to orient',
-		'`py_kernel {op: "run_all"}` is the recovery move',
-		'Call `py_kernel {op: "plan"}` before a multi-cell refactor',
-	]) {
-		assert.ok(all.includes(anchor), `no guideline mentions ${JSON.stringify(anchor)}:\n${all}`);
+		["inspect, spelled as the call it is", '`py_kernel {op: "inspect"}`'],
+		["run_all, spelled as the call it is", '`py_kernel {op: "run_all"}`', /unstaged/],
+		["plan, spelled as the call it is", '`py_kernel {op: "plan"}`'],
+	];
+
+	for (const [rule, ...needles] of anchors) {
+		const hit = bullets.some((b) =>
+			needles.every((n) => (typeof n === "string" ? b.includes(n) : n.test(b))),
+		);
+		assert.ok(hit, `no guideline carries the rule "${rule}":\n${bullets.join("\n")}`);
 	}
 });
 
