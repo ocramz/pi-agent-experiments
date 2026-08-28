@@ -91,11 +91,7 @@ export default function (pi: ExtensionAPI) {
 		// it is. pi concatenates each active tool's guidelines into one flat list
 		// alongside its own bash/edit/write advice, deduped and bulleted, with
 		// nothing recording whose is whose (agent-session.ts _rebuildSystemPrompt →
-		// buildSystemPrompt). So a guideline that says "use inspect to orient" is
-		// read by the model as free-floating advice about a word, not as an
-		// instruction to call py_kernel — and "plan before a refactor" degrades
-		// all the way into a platitude. The attribution has to be in the sentence,
-		// because there is nowhere else for it to live.
+		// buildSystemPrompt). 
 		promptGuidelines: [
 			"Give py_cell many small cells with one definition each rather than few big ones: smaller cells mean finer invalidation and less recompute.",
 			"In py_cell, a cell whose last line is an expression displays that value. Never print() for the user's benefit — stdout is captured in `output`, but the display value is the trailing expression.",
@@ -164,7 +160,7 @@ export default function (pi: ExtensionAPI) {
 		// guidelines for why the tool name cannot be left implicit here.
 		promptGuidelines: [
 			"Use `py_kernel {op: \"inspect\"}` to orient before editing cells you did not create — the user may have added their own via /py.",
-			"`py_kernel {op: \"run_all\"}` is the recovery move: it replays the notebook as a program and must converge to the same state. If it does not, a cell is relying on unstaged state.",
+			"`py_kernel {op: \"run_all\"}` replays the notebook as a program and must converge to the same state. If it does not, a cell is relying on unstaged state.",
 			"Call `py_kernel {op: \"plan\"}` before a multi-cell refactor: it returns exactly which cells would be invalidated, without running anything.",
 		],
 		parameters: Type.Object({
