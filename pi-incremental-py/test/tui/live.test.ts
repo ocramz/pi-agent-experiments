@@ -13,6 +13,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { payloadToolResults } from "./inspect.ts";
 import { session, sessionFilesFor } from "./session.ts";
 
 if (!process.env.OPENROUTER_API_KEY) {
@@ -72,14 +73,28 @@ test("L3: superseded cell output is gone from the model's context", async (t) =>
 	// the payload the provider was actually sent, which is the claim itself.
 	// This is the one place it can be checked — the faux tier has no real
 	// provider, so `before_provider_request` never fires there.
+	//
+	// The payload's *tool results*, specifically, and not the payload as a whole.
+	// The filter rewrites tool results; it does not touch what the model itself
+	// wrote, and no `context` handler should — an assistant message is the
+	// model's own memory, and editing it would be forging one. A model that
+	// reasons "the cell shows total=1" before editing has that sentence replayed
+	// into every later request, so a grep over the whole serialized payload
+	// fails on the model's prose while the filter is working perfectly. That is
+	// exactly how this case once broke.
 	const payloads = s.logEvents().filter((e) => e.event === "payload");
 	assert.ok(payloads.length, `the logger recorded no provider payload under ${s.logPath()}`);
-	const last = JSON.stringify(payloads[payloads.length - 1].payload);
-	assert.match(last, /superseded/, "the last payload carried no superseded marker");
+	const results = payloadToolResults(payloads[payloads.length - 1].payload);
+	// Without this the two checks below are vacuous: an unrecognised wire shape
+	// yields no results, and everything `doesNotMatch` an empty string.
+	assert.ok(results.length, `no tool results in the last payload under ${s.logPath()}`);
+	const shown = results.join("\n");
+	assert.match(shown, /superseded/, "the last payload's tool results carried no superseded marker");
+	assert.match(shown, /total=3/, "the newest result lost the live value");
 	assert.doesNotMatch(
-		last,
+		shown,
 		/total=1\b/,
-		"a value the kernel has recomputed twice was still in the payload",
+		"a value the kernel has recomputed twice was still in a tool result",
 	);
 
 	// The structured copy the filter re-renders from rides on the tool result's

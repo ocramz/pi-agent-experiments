@@ -105,6 +105,50 @@ export interface Inspector {
 	assertWellFormed(): void;
 }
 
+/**
+ * The tool-result text out of a provider payload, in wire order.
+ *
+ * `before_provider_request` carries `payload: unknown` — the provider's own wire
+ * shape, not pi's `AgentMessage`, so there is nothing to narrow it with but a
+ * shape check. Two shapes are handled: OpenAI/OpenRouter chat-completions, where
+ * a result is a `role: "tool"` message, and Anthropic messages, where it is a
+ * `tool_result` block inside a user message. Anything else yields nothing.
+ *
+ * That last sentence is the hazard: an empty result makes every
+ * `assert.doesNotMatch` against it pass, so a wire-format change would turn a
+ * negative assertion into a no-op that reads green. Callers must assert the
+ * array is non-empty before asserting anything about its contents.
+ */
+export function payloadToolResults(payload: unknown): string[] {
+	const messages = (payload as { messages?: unknown })?.messages;
+	if (!Array.isArray(messages)) return [];
+
+	const out: string[] = [];
+	for (const m of messages as { role?: unknown; content?: unknown }[]) {
+		// OpenAI/OpenRouter: the result is the whole message.
+		if (m?.role === "tool") {
+			out.push(blockText(m.content));
+			continue;
+		}
+		// Anthropic: the results ride inside the next user message.
+		if (m?.role === "user" && Array.isArray(m.content)) {
+			for (const c of m.content as { type?: unknown; content?: unknown }[]) {
+				if (c?.type === "tool_result") out.push(blockText(c.content));
+			}
+		}
+	}
+	return out;
+}
+
+/** A wire `content`: a bare string, or blocks of which only the text ones count. */
+function blockText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return (content as { type?: unknown; text?: unknown }[])
+		.map((c) => (c?.type === "text" && typeof c.text === "string" ? c.text : ""))
+		.join("");
+}
+
 export function inspector(dir: string): Inspector {
 	const contexts = (): RecordedContext[] => {
 		const fauxDir = join(dir, FAUX_DIR);
