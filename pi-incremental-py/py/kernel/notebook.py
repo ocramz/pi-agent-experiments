@@ -327,7 +327,14 @@ class Notebook:
                     self.ns[name] = was
         self._record(cid, result)
         key = self._combine(inputs_key, self._files_key(self.reads.get(cid, ())))
-        self.done[cid] = Outcome(key, result)
+        # After the restore above, so this describes the namespace as it
+        # actually stands. A failed run left nothing to be missing later.
+        produced = (
+            frozenset(n for n in cell.defs if n in self.ns)
+            if result.status == "ran"
+            else frozenset()
+        )
+        self.done[cid] = Outcome(key, result, produced)
         return result
 
     def _record(self, cid: str, result: Result) -> None:
@@ -350,8 +357,17 @@ class Notebook:
 
     def _fresh(self, cid: str, key: str, volatile: set[str]) -> bool:
         """A cell may be skipped only if the same key already produced a
-        successful run, every global it owns is still in place, and it is
-        not volatile.
+        successful run, everything that run put in the namespace is still
+        there, and it is not volatile.
+
+        The last clause is against `Outcome.produced` and not `Cell.defs`
+        on purpose. `defs` is what the cell *may* bind, and a name it
+        never binds — a false branch, an empty loop, a handler name Python
+        took back — is then permanently missing, which made the guard
+        permanently false and the cell re-run forever. What the guard is
+        actually asking is whether a global has gone missing *since the
+        run that produced it*, and the run is the only thing that knows
+        which globals those were.
 
         Volatility belongs here rather than in `_key`: a key is a content
         address and must stay one, while "may I skip this?" is the policy
@@ -363,7 +379,7 @@ class Notebook:
             and done is not None
             and done.key == key
             and done.result.status == "ran"
-            and all(name in self.ns for name in self.cells[cid].defs)
+            and all(name in self.ns for name in done.produced)
         )
 
     def run(self) -> list[Result]:

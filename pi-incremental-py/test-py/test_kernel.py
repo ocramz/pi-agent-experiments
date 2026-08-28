@@ -103,6 +103,68 @@ class TestAnalyze(unittest.TestCase):
         local = analyze("def f():\n    n = 0\n    n += 1")
         self.assertNotIn("n", local[1])
 
+    def test_a_with_target_read_in_its_own_body_is_not_a_read(self):
+        # The idiom that made this correction necessary. symtable sees `f`
+        # assigned and referenced, so `f` used to be a temporal self-ref and
+        # the key digested the *previous* f — a closed file handle, which has
+        # no digest, which made the whole key None and the cell uncacheable
+        # forever. The `with` header binds before its body can run.
+        defs, refs = analyze("with open(p) as f:\n    text = f.read()")
+        self.assertEqual(defs, {"f", "text"})
+        self.assertEqual(refs, {"open", "p"})
+
+    def test_a_loop_target_read_in_its_own_body_is_not_a_read(self):
+        defs, refs = analyze("out = []\nfor row in rows:\n    out.append(row)")
+        self.assertEqual(defs, {"out", "row"})
+        self.assertNotIn("row", refs)
+        self.assertIn("rows", refs)
+
+    def test_a_binder_target_read_after_its_body_keeps_the_ref(self):
+        # A `for` may not iterate at all, so `j` afterwards is whatever was
+        # there before. The unsure case keeps the ref; only `with`, which
+        # cannot complete without binding, is certain.
+        _, after_loop = analyze("for j in xs:\n    pass\nlast = j")
+        self.assertIn("j", after_loop)
+        _, after_with = analyze("with cm() as h:\n    pass\nname = h.name")
+        self.assertNotIn("h", after_with)
+
+    def test_a_deferred_read_of_a_loop_target_keeps_the_ref(self):
+        # `lambda: c` reads c when it is *called*, which is not this cell's
+        # execution, so the load is not shadowed by the loop that encloses it.
+        _, refs = analyze("fns = []\nfor c in xs:\n    fns.append(lambda: c)")
+        self.assertIn("c", refs)
+
+    def test_a_read_before_its_binding_keeps_the_ref(self):
+        # Position matters in both directions: this one really does read the
+        # previous committed value.
+        _, refs = analyze("echo = str(zz)\nzz = 1")
+        self.assertIn("zz", refs)
+
+    def test_an_except_name_is_not_a_def(self):
+        # Python unbinds the handler name at the end of the block, so a cell
+        # claiming it owns `e` claims a global it can never hold.
+        defs, refs = analyze("try:\n    q = 1\nexcept ValueError as e:\n    q = 0")
+        self.assertEqual(defs, {"q"})
+        self.assertNotIn("e", refs)
+
+    def test_an_except_name_bound_elsewhere_is_still_a_def(self):
+        # Same nothing-else-binds guard as the comprehension exemption.
+        defs, _ = analyze("e = 1\ntry:\n    m = 1\nexcept ValueError as e:\n    m = 0")
+        self.assertEqual(defs, {"e", "m"})
+
+    def test_a_valueless_annotation_is_not_a_def(self):
+        defs, refs = analyze("y: int\nz = 1")
+        self.assertEqual(defs, {"z"})
+        self.assertIn("int", refs)
+        # An annotation is not an assignment, but an annotated one is.
+        self.assertEqual(analyze("w: int = 3")[0], {"w"})
+
+    def test_a_valueless_annotation_still_reads_the_incoming_name(self):
+        # Unlike a comprehension target, `y` here may be somebody else's
+        # global: `y: int` does not bind it, so `print(y)` reads what was there.
+        _, refs = analyze("y: int\nprint(y)")
+        self.assertIn("y", refs)
+
 
 class TestIdentity(unittest.TestCase):
     def test_generated_ids(self):
@@ -205,6 +267,21 @@ class TestNotebook(unittest.TestCase):
         nb.ns["area"] = 999  # simulate drift
         nb.run_all()
         self.assertEqual(nb.ns["area"], 4)
+
+    def test_two_names_from_one_cell_make_one_edge(self):
+        """Multi-symbol edges are deduped by construction, and the dedup
+        is coupled: `topo` counts in-degree from `parents_of` but
+        decrements from `kids`, so a multiplicity mismatch shows up as a
+        spurious `CycleError` rather than as a wrong edge count. `add`
+        itself would raise it, since `Graph.of` topo-sorts to check.
+        """
+        nb = Notebook(seed=1)
+        src, _ = nb.add("a = 1\nb = 2")
+        dst, _ = nb.add("c = a + b")
+        self.assertEqual(nb.parents_of[dst], frozenset({src}))
+        self.assertEqual(nb.kids[src], frozenset({dst}))
+        self.assertEqual(nb.topo(), [src, dst])
+        self.assertEqual(nb.ns["c"], 3)
 
     def test_builtin_shadowing_is_an_edge(self):
         nb = Notebook(seed=1)
@@ -382,6 +459,116 @@ class TestCaching(unittest.TestCase):
             sys.stdout = old
         self.assertEqual(out.getvalue(), "")
         self.assertIn("hello from cell", results[0].output)
+
+
+class TestBindingsThatDoNotBind(unittest.TestCase):
+    """Ordinary Python that used to cache never, and silently.
+
+    Two mechanisms, one confusion — `defs` and `refs` are what a cell
+    *may* bind and read, and the cache needs what it *must*:
+
+    - `_fresh` required every static def to be in the namespace, so a name
+      that never binds (a false branch, an empty loop, a handler name the
+      language took back) made the guard permanently false. Fixed by
+      recording what a run produced, which is the only exact answer.
+    - `_inputs_key` treated a read of a name the cell had just bound as a
+      temporal self-ref, so `with open(p) as f: f.read()` keyed on the
+      previous `f` — a closed file handle, which has no digest, which
+      makes the whole key None. Fixed by proving those reads spurious.
+
+    Every case here re-ran forever. None of them looked wrong: such a cell
+    is not `volatile`, not `failing`, and now not `stateful` either.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = os.path.join(self.tmp, "data.txt")
+        with open(self.data, "w") as handle:
+            handle.write("hello")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def second_run(self, src):
+        """(first status, second status) for a lone cell run twice.
+
+        The *second* run is the assertion that matters. A partial fix —
+        one mechanism but not the other, or an AST-only patch to `defs` —
+        still converges by the third, so a later run would not tell the
+        working kernel from the broken one.
+        """
+        nb = Notebook(seed=1)
+        cid, first = nb.add(src)
+        nb.pending = {cid}
+        return nb, cid, (first[0].status, nb.run()[0].status)
+
+    def assertCaches(self, src):
+        nb, cid, statuses = self.second_run(src)
+        self.assertEqual(statuses, ("ran", "cached"), src)
+        return nb, cid
+
+    def test_a_handler_name_does_not_stop_the_cell_caching(self):
+        # `except ... as e` is unbound at the end of the block, so `e` was in
+        # defs and could never be in ns.
+        self.assertCaches('try:\n    q = int("1")\nexcept ValueError as e:\n    q = 0')
+
+    def test_a_bare_annotation_does_not_stop_the_cell_caching(self):
+        self.assertCaches("y: int\nz = 1")
+
+    def test_a_branch_not_taken_does_not_stop_the_cell_caching(self):
+        # Runtime-dependent: no AST pass can know whether `extra` binds. This
+        # is the row that rules out fixing this in the analysis alone.
+        self.assertCaches("flag = False\nif flag:\n    extra = 1\nbase = 2")
+
+    def test_a_loop_that_does_not_iterate_does_not_stop_the_cell_caching(self):
+        # `rows = []` then `for r in rows:` is ordinary defensive code, and
+        # the other half of the runtime-dependent pair.
+        nb, cid = self.assertCaches("rows = []\nfor r in rows:\n    pass\nn = 0")
+        self.assertIn("r", nb.cells[cid].defs)  # still owned: it may bind
+        self.assertNotIn("r", nb.ns)  # and this time it did not
+
+    def test_a_file_handle_read_in_its_own_with_block_caches(self):
+        # The flagship case, and the one `Outcome.produced` alone cannot
+        # reach: here every def *is* in the namespace and the key is the
+        # thing that was poisoned.
+        nb, cid = self.assertCaches(
+            f"with open({self.data!r}) as f:\n    text = f.read()"
+        )
+        self.assertFalse(nb.cells[cid].stateful)
+        self.assertIsNotNone(nb._inputs_key(cid))
+        self.assertEqual(nb.reads[cid], (self.data,))  # a real input, still tracked
+
+    def test_a_loop_variable_read_in_its_own_body_caches(self):
+        nb, cid = self.assertCaches("out = []\nfor row in [1, 2]:\n    out.append(row)")
+        self.assertFalse(nb.cells[cid].stateful)
+
+    def test_the_accumulator_idiom_still_advances(self):
+        # The guard against over-reaching: a genuine temporal self-ref must
+        # keep re-running. `count` is read before anything binds it.
+        nb, cid, statuses = self.second_run(
+            "try:\n    count = count + 1\nexcept NameError:\n    count = 0"
+        )
+        self.assertEqual(statuses, ("ran", "ran"))
+        self.assertTrue(nb.cells[cid].stateful)
+        self.assertEqual(nb.ns["count"], 1)
+
+    def test_two_cells_may_each_catch_an_exception_as_e(self):
+        # `e` was a notebook-wide claim, so the commonest idiom in Python
+        # collided with itself: 'e' defined by both <id> and <id>.
+        nb = Notebook(seed=1)
+        nb.add('try:\n    a = int("1")\nexcept ValueError as e:\n    a = 0')
+        nb.add('try:\n    b = int("2")\nexcept ValueError as e:\n    b = 0')
+        self.assertEqual(sorted(nb.provider), ["a", "b"])
+
+    def test_a_retracted_global_still_stops_the_cell_caching(self):
+        # What the guard is actually for, and what must survive narrowing it
+        # to `produced`: a global that goes missing *after* the run that made
+        # it means the cached namespace no longer matches the cached result.
+        nb, cid = self.assertCaches("kept = 1")
+        nb.eval_src("del kept")
+        nb.pending = {cid}
+        self.assertEqual(nb.run()[0].status, "ran")
+        self.assertEqual(nb.ns["kept"], 1)
 
 
 class TestEarlyCutoff(unittest.TestCase):

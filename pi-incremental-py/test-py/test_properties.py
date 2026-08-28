@@ -40,12 +40,32 @@ SLOW = settings(
 )
 
 
+def cell_src(k, parents, leaf=0):
+    """Cell k as *two* defs, each over both of each parent's names.
+
+    Two names per cell is what puts more than one symbol on an edge —
+    with one variable per cell every generated edge is structurally
+    single-symbol, and the dedup in `Graph.of` is never exercised.
+
+    Neither def may read the other: `Cell.stateful` is `refs & defs`, and
+    a stateful cell keys on the pre-exec value of its own binding, so
+    `w{k} = v{k}` would move every cell's key between the first run and
+    the second and nothing here would ever report `cached`.
+    """
+    if parents:
+        rhs = " + ".join(f"v{p} + w{p}" for p in parents)
+        return f"v{k} = {rhs}\nw{k} = ({rhs}) + 1"
+    return f"v{k} = {leaf}\nw{k} = {leaf} + 1"
+
+
 @st.composite
 def dags(draw, size=MAX_VARS):
     """A random DAG over variables v0..vn, as one cell per variable.
 
     Cell k reads a subset of {v0..v(k-1)}, which makes acyclicity
     structural: a cell can only ever read a lower-numbered variable.
+    Each cell binds `v{k}` and `w{k}`, and each edge reads both of its
+    parent's names, so every generated edge carries two symbols.
     Returns [(var, src)] in a random *insertion* order, so the graph the
     kernel sees is not pre-sorted.
     """
@@ -53,8 +73,7 @@ def dags(draw, size=MAX_VARS):
     cells = []
     for k in range(n):
         parents = draw(st.lists(st.sampled_from(range(k)), unique=True)) if k else []
-        rhs = " + ".join(f"v{p}" for p in parents) or str(draw(st.integers(0, 9)))
-        cells.append((f"v{k}", f"v{k} = {rhs}"))
+        cells.append((f"v{k}", cell_src(k, parents, leaf=draw(st.integers(0, 9)))))
     return draw(st.permutations(cells))
 
 
@@ -149,17 +168,15 @@ class TestIncrementalEqualsFromScratch(unittest.TestCase):
         sources = dict(cells)
 
         # A few edits: change a leaf constant or an interior expression.
+        # Both defs are rewritten together — dropping `w{k}` would delete
+        # every edge out of this cell instead of editing it.
         for _ in range(data.draw(st.integers(min_value=1, max_value=4))):
             var = data.draw(st.sampled_from(sorted(sources)))
             k = int(var[1:])
-            parents = [f"v{p}" for p in range(k)]
-            rhs = data.draw(
-                st.sampled_from(
-                    [str(data.draw(st.integers(0, 99)))]
-                    + ([" + ".join(parents)] if parents else [])
-                )
+            parents = data.draw(
+                st.sampled_from([[]] + ([list(range(k))] if k else []))
             )
-            sources[var] = f"{var} = {rhs}"
+            sources[var] = cell_src(k, parents, leaf=data.draw(st.integers(0, 99)))
             nb.set(ids[var], sources[var])
 
         fresh, _ = build(list(sources.items()))
@@ -275,7 +292,7 @@ class TestStaging(unittest.TestCase):
     def test_plan_does_not_commit_and_bounds_apply(self, cells):
         nb, ids = build(cells)
         var = sorted(ids)[0]
-        edit = [Edit("set", id=ids[var], src=f"{var} = 12345")]
+        edit = [Edit("set", id=ids[var], src=cell_src(int(var[1:]), [], leaf=12345))]
 
         before = full_state(nb)
         predicted = nb.plan(edit)
@@ -303,7 +320,7 @@ class TestStaging(unittest.TestCase):
         var = sorted(ids)[-1]
         cid = ids[var]
         nb.delete(cid)
-        again, results = nb.add(f"{var} = 4242")
+        again, results = nb.add(cell_src(int(var[1:]), [], leaf=4242))
         self.assertEqual({r.cell: r.status for r in results}[again], "ran")
 
 
@@ -313,7 +330,11 @@ class TestFailureIsolation(unittest.TestCase):
     def test_no_descendant_of_a_failure_reports_ran(self, cells, data):
         nb, ids = build(cells)
         var = data.draw(st.sampled_from(sorted(ids)))
-        results = nb.set(ids[var], f"{var} = undefined_name_xyz")
+        # Both names stay bound *statically*, so the cell keeps its
+        # children: drop `w{k}` and the descendants asserted over below
+        # are no longer descendants and the loop goes vacuous.
+        k = int(var[1:])
+        results = nb.set(ids[var], f"v{k} = undefined_name_xyz\nw{k} = 0")
         statuses = {r.cell: r.status for r in results}
         self.assertEqual(statuses[ids[var]], "error")
         for kid in nb.descendants(ids[var]):
@@ -326,7 +347,8 @@ class TestFailureIsolation(unittest.TestCase):
         nb, ids = build(cells)
         var = data.draw(st.sampled_from(sorted(ids)))
         before = nb.ns.get(var)
-        nb.set(ids[var], f"{var} = 1 / 0")
+        k = int(var[1:])
+        nb.set(ids[var], f"v{k} = 1 / 0\nw{k} = 0")
         self.assertEqual(nb.ns.get(var), before)  # restored, not left broken
 
 

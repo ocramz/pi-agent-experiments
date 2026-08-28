@@ -48,6 +48,14 @@ class Graph:
         # Self-edges are temporal, not topological, so a cell is never its
         # own parent; builtin names count only when some cell provides
         # (shadows) them, which is exactly when they are in `provider`.
+        #
+        # The `frozenset` is load-bearing: a cell reading
+        # several names from one parent must yield exactly one edge,
+        # because `topo` counts in-degree from `parents_of` and decrements
+        # it once per entry in `kids`. Let the two disagree on
+        # multiplicity and `indeg` never reaches zero, which surfaces as a
+        # spurious `CycleError` — a complaint about graph shape that says
+        # nothing about the dedup that actually broke.
         parents_of = {
             cid: frozenset(
                 provider[n] for n in cell.refs if n in provider and provider[n] != cid
