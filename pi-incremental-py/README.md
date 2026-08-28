@@ -80,13 +80,18 @@ deliberately not shipped.
   reports which names are assigned and which are referenced but never in
   what order, so two corrections make it mean that:
 
-  - A **trailing display expression** reads back what the body just
-    wrote. `x = 1` followed by a bare `x` is the display idiom, not an
-    accumulator, even though symtable sees x assigned *and* referenced
-    exactly as in `x = x + 1`. Discounted only when the body's own top
-    level is certain to have bound the name — `if flag: x = 1` followed
-    by `x` keeps its self-reference, because when the branch is not taken
-    the tail really does read the previous committed value.
+  - A **load of a name the cell has already bound** is not a read of the
+    incoming namespace at all. Two things prove that: the load sits
+    inside the body of the `for`, `with` or `except` that binds it, or a
+    preceding top-level statement is certain to have bound it. So
+    `with open(p) as f: text = f.read()` does not depend on the previous
+    `f` (which is a closed file handle, has no digest, and would make the
+    key unmatchable forever), and `total = 1` followed by a bare `total`
+    is the display idiom rather than an accumulator. `if flag: x = 1`
+    followed by `x` keeps its self-reference, because when the branch is
+    not taken the tail really does read the previous committed value —
+    and so does a `for` target read after its loop, since an empty
+    sequence binds nothing.
   - An **augmented assignment** is a read. `x += 1` binds through a
     Store with no Load node anywhere, so symtable calls it assigned and
     not referenced. Without this, `n += 1` and `n = n + 1` would behave
@@ -94,6 +99,16 @@ deliberately not shipped.
 
   Everything the analysis is unsure about keeps the reference, so it can
   only ever drop a dependency it has proved spurious.
+
+  `defs` gets the mirror-image treatment, since a name the cell cannot
+  hold is a global claim it cannot honour: a comprehension target
+  (inlined by PEP 709), a `del`, an `except ... as e` (unbound at the end
+  of the block) and a valueless `x: int` are all excused — each only when
+  nothing else in the cell binds that name. What a run *actually* bound
+  is a different question again, answered by looking rather than by
+  analysis, and that is what decides whether the cell may be skipped: a
+  branch not taken or a loop that did not iterate no longer costs the
+  cell its cache.
 - **Builtin shadowing.** If a cell defines `len`, dependents of `len` get
   a real DAG edge and re-run when it changes.
 - **The world is observed, not inferred.** A cell reading the clock, a

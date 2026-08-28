@@ -218,10 +218,18 @@ class Outcome:
     One store instead of three (an error flag on the cell, a key dict and
     a value-summary dict), so deleting a cell cannot leave two thirds of
     its history behind.
+
+    `produced` is the *observed* half of `Cell.defs`. Analysis can only
+    say what a cell might bind — `if flag: extra = 1` and `for r in rows:`
+    bind on a runtime condition, and `except E as e` unbinds again — so
+    the only exact answer for "what did this run leave in the namespace?"
+    comes from looking afterwards. `Notebook._fresh` needs that answer,
+    not the static claim.
     """
 
     key: str
     result: Result
+    produced: frozenset[str] = frozenset()
 
 
 def fresh_namespace() -> dict[str, object]:
