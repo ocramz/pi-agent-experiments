@@ -206,6 +206,21 @@ class TestNotebook(unittest.TestCase):
         nb.run_all()
         self.assertEqual(nb.ns["area"], 4)
 
+    def test_two_names_from_one_cell_make_one_edge(self):
+        """Multi-symbol edges are deduped by construction, and the dedup
+        is coupled: `topo` counts in-degree from `parents_of` but
+        decrements from `kids`, so a multiplicity mismatch shows up as a
+        spurious `CycleError` rather than as a wrong edge count. `add`
+        itself would raise it, since `Graph.of` topo-sorts to check.
+        """
+        nb = Notebook(seed=1)
+        src, _ = nb.add("a = 1\nb = 2")
+        dst, _ = nb.add("c = a + b")
+        self.assertEqual(nb.parents_of[dst], frozenset({src}))
+        self.assertEqual(nb.kids[src], frozenset({dst}))
+        self.assertEqual(nb.topo(), [src, dst])
+        self.assertEqual(nb.ns["c"], 3)
+
     def test_builtin_shadowing_is_an_edge(self):
         nb = Notebook(seed=1)
         shadower, _ = nb.add("def len(x):\n    return 42")
