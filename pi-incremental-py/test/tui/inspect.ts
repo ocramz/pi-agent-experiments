@@ -140,6 +140,93 @@ export function payloadToolResults(payload: unknown): string[] {
 	return out;
 }
 
+/** One tool call out of the logger's JSONL, joined to the result it got back. */
+export interface LoggedToolCall {
+	id: string;
+	tool: string;
+	input: unknown;
+	/**
+	 * Absent while the call is still in flight — a live case that closed the
+	 * session mid-turn has one of these, and it is not a failure by itself.
+	 */
+	result?: { isError?: boolean; content?: unknown; details?: unknown };
+}
+
+/**
+ * Every logged tool call, in call order, each carrying its own result.
+ *
+ * The logger writes `tool_call` and `tool_result` as separate lines joined only
+ * by an id, which is one join too many to do inline in an assertion. This is
+ * the counterpart of `payloadToolResults` for the other record the logger
+ * keeps: that one is what the *provider* was sent, this one is what the
+ * extension actually did — including `details`, which never goes on the wire.
+ */
+export function loggedToolCalls(events: LoggedEvent[]): LoggedToolCall[] {
+	const calls: LoggedToolCall[] = [];
+	const byId = new Map<string, LoggedToolCall>();
+	for (const e of events) {
+		if (typeof e.id !== "string") continue;
+		if (e.event === "tool_call") {
+			const call: LoggedToolCall = { id: e.id, tool: String(e.tool), input: e.input };
+			calls.push(call);
+			byId.set(call.id, call);
+		} else if (e.event === "tool_result") {
+			const call = byId.get(e.id);
+			if (call) {
+				call.result = {
+					isError: e.isError === true,
+					content: e.content,
+					details: e.details,
+				};
+			}
+		}
+	}
+	return calls;
+}
+
+/** What `waitForLog` needs of a session. Keeps it usable from any case. */
+interface Logged {
+	logEvents(): LoggedEvent[];
+	logPath(): string;
+}
+
+/**
+ * Poll the log until `ready` accepts the tool traffic recorded so far.
+ *
+ * The wait a live case wants, rather than one on the screen. What pi prints of
+ * a turn is the model's paraphrase of it — good evidence that *something*
+ * happened and none at all of what — so a case that waits for a phrase is
+ * really waiting for a model to choose a wording. The log moves when the
+ * extension moves.
+ *
+ * `ready` takes the whole call list rather than one call because the thing a
+ * case is waiting for is usually an outcome ("the kernel holds x") that no
+ * single call is guaranteed to be the one to report.
+ *
+ * On timeout it names the tools that *were* called, which is the question you
+ * ask next anyway when a live case fails.
+ */
+export async function waitForLog(
+	s: Logged,
+	what: string,
+	ready: (calls: LoggedToolCall[]) => boolean,
+	timeout = 300_000,
+): Promise<void> {
+	const deadline = Date.now() + timeout;
+	for (;;) {
+		const calls = loggedToolCalls(s.logEvents());
+		if (ready(calls)) return;
+		if (Date.now() >= deadline) {
+			assert.fail(
+				`${what} did not happen within ${timeout}ms.\n` +
+					`  tools called: ${calls.map((c) => c.tool).join(", ") || "(none)"}\n` +
+					`  log: ${s.logPath()}`,
+			);
+		}
+		await new Promise((done) => setTimeout(done, 500));
+	}
+}
+
 /** A wire `content`: a bare string, or blocks of which only the text ones count. */
 function blockText(content: unknown): string {
 	if (typeof content === "string") return content;

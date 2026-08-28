@@ -58,6 +58,19 @@ export interface RenderOptions {
 /** What an older `inspect` becomes once a newer one has replaced it wholesale. */
 export const SUPERSEDED_INSPECT = "- inspect (superseded)";
 
+/**
+ * Whether the response carries a whole-kernel snapshot — the tails.
+ *
+ * Two callers, and both are about what `formatResults` will emit: the filter
+ * uses it to keep the snapshot on the newest message only, and the install
+ * renderers use it to tell a response worth printing from one that would come
+ * out as `ok (nothing to run)`. It lives here because it is a fact about the
+ * rendering, not about the filtering.
+ */
+export function hasTails(r: MutatingResponse): boolean {
+	return Boolean(r.failing?.length || r.pending?.length || Object.keys(r.globals ?? {}).length);
+}
+
 const MARK: Record<string, string> = { ran: "*", cached: "-", error: "!" };
 
 export function formatResults(resp: MutatingResponse, opts: RenderOptions = {}): string {

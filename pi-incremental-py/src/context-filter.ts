@@ -25,6 +25,7 @@ import {
 	SUPERSEDED_INSPECT,
 	formatInspect,
 	formatResults,
+	hasTails,
 	type InspectResponse,
 	type MutatingResponse,
 } from "./format.ts";
@@ -127,7 +128,13 @@ function body(
 			// part of an old dump that a new dump does not restate.
 			return state.inspectShown ? SUPERSEDED_INSPECT : formatInspect(d.response);
 		case "py.install": {
-			const results = d.response.results?.length
+			// An install with nothing under it is just its header: rendering an
+			// empty response would put `ok (nothing to run)` there instead. The
+			// tails half of the guard has to agree with `state.tails`, or a
+			// re-render that suppresses the snapshot falls into exactly that case.
+			const worth =
+				Boolean(d.response.results?.length) || (state.tails && hasTails(d.response));
+			const results = worth
 				? formatResults(d.response, { superseded: state.claimed, tails: state.tails })
 				: "";
 			return [...d.header, results].filter(Boolean).join("\n");
@@ -150,10 +157,6 @@ function claim(resp: MutatingResponse, into: Set<string>): void {
 	for (const r of resp.results ?? []) {
 		if (r.status === "ran") into.add(r.cell);
 	}
-}
-
-function hasTails(r: MutatingResponse): boolean {
-	return Boolean(r.failing?.length || r.pending?.length || Object.keys(r.globals ?? {}).length);
 }
 
 function isPyResult(m: ContextMessage): m is ToolResultLike & { details: PyDetails } {

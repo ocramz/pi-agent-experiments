@@ -68,6 +68,12 @@ const after = statuses(installed);
 console.log("AFTER_IMPORTER=" + (after[importerId] ?? "absent"));
 console.log("AFTER_PLAIN=" + (after[plainId] ?? "absent"));
 
+// The install response itself, before anything asks the kernel a second
+// question: it re-ran cells, so it reports the state that left behind.
+console.log("INSTALL_GLOBAL=" + installed.globals.have_cowsay);
+console.log("INSTALL_FAILING=" + JSON.stringify(installed.failing));
+console.log("INSTALL_PENDING=" + JSON.stringify(installed.pending));
+
 const state = await kernel.call({ tool: "inspect" });
 console.log("HAVE_COWSAY=" + state.globals.have_cowsay);
 console.log("BASE=" + state.globals.base);
@@ -104,6 +110,13 @@ assert_contains "the environment is reported changed" "ENV_CHANGED=true"     "$o
 # invalidation is just "rerun everything" wearing a dependency graph.
 assert_contains     "the importing cell re-runs after the install" "AFTER_IMPORTER=ran" "$out"
 assert_not_contains "the non-importing cell is left alone"         "AFTER_PLAIN=ran"    "$out"
+
+# An install re-runs cells, so its own response carries the same pending/failing/
+# globals tails every other mutating op returns. Without them the agent has to
+# spend the `inspect` below just to see what the install it made had done.
+assert_contains "the install reports the recomputed value" "INSTALL_GLOBAL=True"  "$out"
+assert_contains "the install reports nothing left failing" "INSTALL_FAILING=[]"   "$out"
+assert_contains "the install reports nothing left pending" "INSTALL_PENDING=[]"   "$out"
 
 assert_contains "the import now succeeds"        "HAVE_COWSAY=True"  "$out"
 assert_contains "the untouched value survived"   "BASE=42"           "$out"

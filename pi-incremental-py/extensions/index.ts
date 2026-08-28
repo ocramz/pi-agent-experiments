@@ -17,6 +17,7 @@ import {
 	formatEval,
 	formatInspect,
 	formatResults,
+	hasTails,
 	type CellResult,
 	type InspectResponse,
 	type MutatingResponse,
@@ -266,7 +267,10 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 			const response = resp as MutatingResponse;
-			const body = response.results?.length ? formatResults(response) : "";
+			// An install that re-ran nothing and moved nothing is just its header;
+			// rendering that response would print `ok (nothing to run)` under it.
+			const worth = Boolean(response.results?.length) || hasTails(response);
+			const body = worth ? formatResults(response) : "";
 			return text([...header, body].filter(Boolean).join("\n"), {
 				kind: "py.install",
 				header,

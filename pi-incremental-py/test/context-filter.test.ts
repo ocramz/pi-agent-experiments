@@ -211,6 +211,53 @@ test("an install keeps its header and loses only the stale cells under it", () =
 	assert.match(shown(out[0]), /- superseded: c1/);
 });
 
+test("an install's globals snapshot survives on the newest message only", () => {
+	// An install reports the same tails as any other mutating op, so it takes
+	// part in the one-snapshot rule rather than sitting outside it.
+	const earlier = py({
+		kind: "py.cells",
+		response: cellsResponse([ran("c1", "None")], { have_cowsay: "False" }),
+	});
+	const install = py({
+		kind: "py.install",
+		header: ["installed (environment changed)"],
+		response: cellsResponse([ran("c1", "None")], { have_cowsay: "True" }),
+	});
+
+	const out = filterPyContext([earlier, install], LIVE);
+	assert.match(shown(out[1]), /globals: have_cowsay=True/);
+	assert.doesNotMatch(shown(out[0]), /globals:/);
+});
+
+test("an install that re-ran nothing still reports what the kernel holds", () => {
+	const install = py({
+		kind: "py.install",
+		header: ["already up to date"],
+		response: { ok: true, results: [], globals: { base: "42" } },
+	});
+
+	const out = filterPyContext([install], LIVE);
+	assert.equal(shown(out[0]), "already up to date\nglobals: base=42");
+});
+
+test("a superseded install collapses to its header, not to `ok (nothing to run)`", () => {
+	// The reason the install guard has to agree with `tails`: with the snapshot
+	// suppressed there is genuinely nothing under the header, and rendering the
+	// response anyway would put the empty-response filler there instead.
+	const install = py({
+		kind: "py.install",
+		header: ["already up to date"],
+		response: { ok: true, results: [], globals: { base: "42" } },
+	});
+	const after = py({
+		kind: "py.cells",
+		response: cellsResponse([ran("c1", "1")], { base: "42" }),
+	});
+
+	const out = filterPyContext([install, after], LIVE);
+	assert.equal(shown(out[0]), "already up to date");
+});
+
 test("messages that are not ours are never touched", () => {
 	const messages = [user("hello"), user("world")];
 	// Same array back, not a copy: nothing to rewrite means nothing to invalidate
