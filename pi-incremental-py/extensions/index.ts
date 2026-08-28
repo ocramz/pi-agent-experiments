@@ -17,6 +17,7 @@ import {
 	formatEval,
 	formatInspect,
 	formatResults,
+	hasTails,
 	type CellResult,
 	type InspectResponse,
 	type MutatingResponse,
@@ -81,18 +82,24 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Execute Python in a persistent, incrementally-recomputed namespace. Code forms cells; " +
 			"cells form a dependency graph derived from the globals they define and read, so editing " +
-			"a cell re-runs only it and its dependents. Omit `id` to create a cell (the generated id " +
-			"is returned — quote it back to modify that cell later). Set `run: false` to stage without " +
+			"a cell re-runs only it and its dependents. Omit the cell `id` to create a cell (the generated " +
+			"id is returned; quote it back to modify that cell later). Set `run: false` to stage without " +
 			"executing. Prefer this over running python in bash: state persists and recomputation is minimal.",
+		// pi renders this as `- py_cell: <snippet>`, so the name is already there.
 		promptSnippet:
-			"py_cell: run Python in a persistent incremental namespace; cells recompute minimally on edit.",
+			"run Python in a persistent incremental namespace; cells recompute minimally on edit.",
+		// Every guideline names the tool it is about, and spells an op as the call
+		// it is. pi concatenates each active tool's guidelines into one flat list
+		// alongside its own bash/edit/write advice, deduped and bulleted, with
+		// nothing recording whose is whose (agent-session.ts _rebuildSystemPrompt →
+		// buildSystemPrompt). 
 		promptGuidelines: [
-			"Prefer many small cells with one definition each over few big ones: smaller cells mean finer invalidation and less recompute.",
-			"A cell whose last line is an expression displays that value. Never print() for the user's benefit — stdout is captured in `output`, but the display value is the trailing expression.",
-			"Self-reference is temporal: `x = x + 1` reads the previous committed value. Write accumulators as `try: x = x + 1 / except NameError: x = None` so run_all replays converge (pick the initial value that fits; None means \"nothing yet\"). Rerunning such a stateful cell ADVANCES it — it is not a refresh.",
-			"If a cell fails, its dependents stay pending (not poisoned). Fix the cell and they re-run. Check `failing`/`pending` in the response.",
+			"Give py_cell many small cells with one definition each rather than few big ones: smaller cells mean finer invalidation and less recompute.",
+			"In py_cell, a cell whose last line is an expression displays that value. Never print() for the user's benefit — stdout is captured in `output`, but the display value is the trailing expression.",
+			"In py_cell, self-reference is temporal: `x = x + 1` reads the previous committed value. Write accumulators as `try: x = x + 1 / except NameError: x = None` so `py_kernel {op: \"run_all\"}` replays converge (pick the initial value that fits; None means \"nothing yet\"). `py_kernel {op: \"rerun\"}` on such a stateful cell ADVANCES it — it is not a refresh.",
+			"If a py_cell fails, its dependents stay pending (not poisoned). Fix the cell and they re-run. Check `failing`/`pending` in the response.",
 			"On ImportError, use py_install — never pip/uv from bash, which bypasses the kernel's environment tracking and leaves cached cells stale.",
-			"Set volatile: true when the cell's value depends on something the kernel cannot digest — the clock, an RNG, an environment variable, a network response. Such a cell is never served from cache, and neither is anything downstream of it. Do NOT set it for file reads or imports: files are digested automatically and package installs are already tracked, so declaring those only throws away caching you would otherwise get.",
+			"Pass `volatile: true` to py_cell when the cell's value depends on something the kernel cannot digest — the clock, an RNG, an environment variable, a network response. Such a cell is never served from cache, and neither is anything downstream of it. Do NOT set it for file reads or imports: files are digested automatically and package installs are already tracked, so declaring those only throws away caching you would otherwise get.",
 		],
 		parameters: Type.Object({
 			id: Type.Optional(
@@ -149,11 +156,13 @@ export default function (pi: ExtensionAPI) {
 			"py_install reports restart_required, or to recover from drift), delete (removes a cell AND " +
 			"retracts its globals), plan (blast radius of edits without executing), apply (atomic batch " +
 			"of add/set/delete edits).",
-		promptSnippet: "py_kernel: inspect, rerun, run_all, delete, plan or batch-apply cells.",
+		promptSnippet: "inspect, rerun, run_all, delete, plan or batch-apply cells.",
+		// An op is not a verb the model knows. See the note on py_cell's
+		// guidelines for why the tool name cannot be left implicit here.
 		promptGuidelines: [
-			"Use inspect to orient before editing cells you did not create — the user may have added their own via /py.",
-			"run_all is the recovery move: it replays the notebook as a program and must converge to the same state. If it does not, a cell is relying on unstaged state.",
-			"plan before a multi-cell refactor: it returns exactly which cells would be invalidated, without running anything.",
+			"Use `py_kernel {op: \"inspect\"}` to orient before editing cells you did not create — the user may have added their own via /py.",
+			"`py_kernel {op: \"run_all\"}` replays the notebook as a program and must converge to the same state. If it does not, a cell is relying on unstaged state.",
+			"Call `py_kernel {op: \"plan\"}` before a multi-cell refactor: it returns exactly which cells would be invalidated, without running anything.",
 		],
 		parameters: Type.Object({
 			op: Type.Union(
@@ -234,7 +243,7 @@ export default function (pi: ExtensionAPI) {
 			"cells that import anything automatically re-run after an install. If the result lists " +
 			"restart_required (already-imported modules cannot be reloaded), follow up with " +
 			"py_kernel {op: \"run_all\"}.",
-		promptSnippet: "py_install: pip-install packages with dependency-tracked re-runs.",
+		promptSnippet: "pip-install packages with dependency-tracked re-runs.",
 		parameters: Type.Object({
 			packages: Type.Array(Type.String(), { description: "Package specifiers, e.g. [\"pandas\", \"cowsay==6.1\"]." }),
 			upgrade: Type.Optional(Type.Boolean({ description: "Pass -U to pip." })),
@@ -258,7 +267,10 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 			const response = resp as MutatingResponse;
-			const body = response.results?.length ? formatResults(response) : "";
+			// An install that re-ran nothing and moved nothing is just its header;
+			// rendering that response would print `ok (nothing to run)` under it.
+			const worth = Boolean(response.results?.length) || hasTails(response);
+			const body = worth ? formatResults(response) : "";
 			return text([...header, body].filter(Boolean).join("\n"), {
 				kind: "py.install",
 				header,

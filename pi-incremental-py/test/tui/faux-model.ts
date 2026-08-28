@@ -9,8 +9,16 @@
 //
 //   driver    — it returns the next scripted assistant message, so real tools
 //               run against a real Python kernel with no model involved;
-//   recorder  — it writes each turn's `context.messages` to .faux/turn-N.json,
+//   recorder  — it writes each turn's whole `Context` to .faux/turn-N.json,
 //               which is the filtered payload, exactly.
+//
+// The `Context` is recorded whole — `{ systemPrompt, tools, messages }` — and not
+// just its messages. The other two are the only place the extension's
+// `promptSnippet`, `promptGuidelines` and typebox parameter descriptions can be
+// observed as the model receives them: none of it appears in a message, and
+// `before_provider_request` (the hook that carries the wire payload) never fires
+// here, because the faux provider does not call pi-ai's `onPayload`. Recording
+// the whole object is what makes test/tui/prompt.test.ts possible for free.
 //
 // No network, no API key, no cost, nothing to flake. Test-only: `files` in
 // package.json ships extensions/, src/ and py/*.py, so nothing under test/ can
@@ -56,7 +64,15 @@ export default function (pi: ExtensionAPI) {
 				turn++;
 				writeFileSync(
 					turnFile(ctx.cwd, turn),
-					JSON.stringify(context.messages, null, 1),
+					JSON.stringify(
+						{
+							systemPrompt: context.systemPrompt,
+							tools: context.tools,
+							messages: context.messages,
+						},
+						null,
+						1,
+					),
 					"utf8",
 				);
 				if ("text" in step) return fauxAssistantMessage(step.text);

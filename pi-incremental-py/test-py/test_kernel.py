@@ -7,12 +7,15 @@ No third-party packages required.
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
+import protocol  # noqa: E402
 from kernel import (  # noqa: E402
     CycleError,
     DuplicateNameError,
@@ -938,6 +941,66 @@ class TestProtocol(unittest.TestCase):
         resp = handle(nb, {"tool": "apply_edits", "edits": None})
         self.assertFalse(resp["ok"])
         self.assertTrue(resp["internal"])
+
+
+class TestInstallReportsWhatItDid(unittest.TestCase):
+    """An install re-runs cells, so it owes its caller the same tails every
+    other mutating op returns: `pending`, `failing` and the globals it was
+    called to move. Without them the agent has to spend a second `inspect`
+    to find out what the install it just made left behind — and an agent
+    that does not bother is left asserting from a bare `ran`.
+
+    Hermetic: pip is replaced by a success and the environment digest is
+    moved by hand, which is exactly the state change a real install causes.
+    See test/container/test_install_in_image.sh for the same claim against
+    a real PyPI round trip.
+    """
+
+    PROBE = (
+        "try:\n"
+        "    import cowsay\n"
+        "    have_cowsay = True\n"
+        "except ImportError:\n"
+        "    have_cowsay = False\n"
+    )
+
+    def install(self, nb, digest="cowsay just landed"):
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with (
+            mock.patch.object(protocol, "_pip", return_value=ok),
+            mock.patch.object(protocol, "env_digest", return_value=digest),
+        ):
+            return protocol.install(nb, "cowsay")
+
+    def test_install_reports_the_state_it_left(self):
+        nb = Notebook(seed=1)
+        nb.add("base = 6 * 7")
+        probe, _ = nb.add(self.PROBE)
+        resp = self.install(nb)
+
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp["environment_changed"])
+        self.assertEqual(resp["restart_required"], [])
+        # The re-run the install triggered, and its consequences — the three
+        # keys below used to be absent from an install response entirely.
+        statuses = {r["cell"]: r["status"] for r in resp["results"]}
+        self.assertEqual(statuses[probe], "ran")
+        self.assertEqual(resp["globals"]["have_cowsay"], "False")
+        self.assertEqual(resp["globals"]["base"], "42")  # untouched, still reported
+        self.assertEqual(resp["pending"], [])
+        self.assertEqual(resp["failing"], [])
+
+    def test_a_still_environment_still_reports_state(self):
+        # An install that changed nothing is not a no-op for the caller: it
+        # still wants to know what the kernel holds. `environment_changed`
+        # false answers a different question.
+        nb = Notebook(seed=1)
+        nb.add("base = 6 * 7")
+        resp = self.install(nb, digest=nb.env)
+
+        self.assertFalse(resp["environment_changed"])
+        self.assertEqual(resp["results"], [])
+        self.assertEqual(resp["globals"]["base"], "42")
 
 
 if __name__ == "__main__":

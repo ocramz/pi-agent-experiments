@@ -1,10 +1,16 @@
 {
 	// Everything but `include` lives in the shared base.
 	"extends": "../shared/tsconfig.base.json",
+	// The last pattern is the dev-only prompt logger, which test/tui loads beside
+	// the extension in live runs. It is not in any package, so no other tsconfig
+	// reaches it; checking it here is what keeps it compiling against pi's real
+	// declarations rather than rotting until the next time someone debugs a
+	// prompt with it.
 	"include": [
 		"src/**/*.ts",
 		"extensions/**/*.ts",
 		"test/**/*.ts",
-		"../shared/test/tui/**/*.ts"
+		"../shared/test/tui/**/*.ts",
+		"../shared/dev/**/*.ts"
 	]
 }

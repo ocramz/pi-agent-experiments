@@ -281,7 +281,47 @@ npm test              # node unit tests (kernel subprocess, formatting)
 npm run typecheck     # tsc against pi's real declarations
 npm run test:tui      # pi's real TUI in a pty, incl. live model cases
 npm run test:container # the tiers below, in the image userland
+npm run dev:log       # a scratch pi session with the prompt logger attached
 ```
+
+### What the model is told
+
+Three tools carry long descriptions, nine `promptGuidelines` and a documented
+parameter each. None of it appears in a message, so no assertion about a
+transcript can reach it — and a `promptSnippet` that goes missing costs the tool
+its line in the system prompt's *Available tools* section while every other tier
+stays green.
+
+`test/tui/prompt.test.ts` closes that. The faux provider is handed pi's whole
+`Context`, so `test/tui/faux-model.ts` records `systemPrompt` and `tools`
+alongside the messages, and the cases assert on the prompt as assembled, the
+schemas as sent, and a snapshot of this extension's own contribution:
+
+```bash
+node --test test/tui/prompt.test.ts                      # free: no key, no network
+PI_UPDATE_PROMPT=1 node --test test/tui/prompt.test.ts   # re-record the snapshot
+```
+
+The snapshot at `test/tui/__snapshots__/agent-prompt.txt` holds only the py_\*
+lines and this extension's guidelines — pi's own boilerplate is pinned in
+[shared/versions.env](../shared/versions.env) and is not this package's to keep.
+Reword a guideline and the diff shows up in review, where a human reads it.
+
+For everything the deterministic tier structurally cannot see — the payload on
+the wire, which needs a real provider — there is
+[shared/dev/pi-logger.ts](../shared/dev/pi-logger.ts), a dev-only extension that
+writes JSONL:
+
+```bash
+npm run dev:log                       # scratch cwd; prints the log directory as PI_PY_LOG_DIR
+jq -c 'select(.event=="context")' "$PI_PY_LOG_DIR"/*.jsonl   # payload size per call
+jq -r 'select(.event=="prompt").systemPromptOptions.toolSnippets' "$PI_PY_LOG_DIR"/*.jsonl
+```
+
+Live cases load it automatically and `PI_TUI_KEEP=1` prints where it went, so a
+failed live run leaves the model's actual inputs on disk rather than 2 kB of
+screen. Load order decides which side of the context filter it sees; the header
+of the file spells it out.
 
 The container tier is offline — no model, no API key — because the live TUI
 cases already cover a model reaching `py_cell` and `py_install`. What it

@@ -65,7 +65,8 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
     importlib.invalidate_caches()
 
     before, nb.env = nb.env, env_digest(refresh=True)
-    if nb.env != before:
+    changed = nb.env != before
+    if changed:
         for cid, cell in nb.cells.items():
             if cell.imports:
                 nb.pending |= {cid} | nb.descendants(cid)
@@ -76,14 +77,11 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
         {p.split("==")[0].split("[")[0].replace("-", "_") for p in packages}
         & set(sys.modules)
     )
-    results = nb.run()
-    volatile = nb.volatile()
-    return {
-        "ok": True,
-        "environment_changed": nb.env != before,
-        "restart_required": loaded,
-        "results": [_result_json(nb, r, volatile) for r in results],
-    }
+    # Through `_response` like every other mutating op: an install re-runs
+    # cells, so it can leave the notebook failing or pending, and it moves
+    # the globals it was called to fix. Reporting only `results` made the
+    # caller spend a second `inspect` to find out what it had just done.
+    return _response(nb, nb.run(), environment_changed=changed, restart_required=loaded)
 
 
 # -------------------------------------------------------------- protocol
