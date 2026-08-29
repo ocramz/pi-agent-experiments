@@ -84,7 +84,7 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// the bullets joined — joined, two guidelines could satisfy an anchor
 	// between them.
 	const anchors: [string, ...(string | RegExp)[]][] = [
-		["small cells, so a re-run is cheap", /nb_cell/, /one coherent step per cell/],
+		["small cells, so a re-run is cheap", /nb_cell/, /per cell/, /cheap/],
 		["the trailing expression is the display value", /nb_cell/, /trailing expression/],
 		["what stale means and what to do", /nb_cell/, /stale/, /re-run/],
 		["editing discards the old output", /nb_cell/, /discards its previous output/],

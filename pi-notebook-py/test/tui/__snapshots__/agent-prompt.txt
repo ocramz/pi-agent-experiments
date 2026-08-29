@@ -3,8 +3,8 @@
 - nb_notebook: list, read, delete, move, restart, save or open the notebook.
 - nb_install: pip-install packages into the notebook kernel's own interpreter.
 
-- Give nb_cell one coherent step per cell — a load, a transform, a plot — rather than one enormous cell: small cells are what make re-running a single step cheap.
-- In nb_cell, a cell whose last line is an expression displays that value, and that is how to show a result. print() also works and its output is captured, but the trailing expression is what summarises a value's shape.
+- Aim to use nb_cell with one small, self-contained statement per cell (eg. a data load, a transform, a plot): small cells are what make re-running a single step cheap.
+- In nb_cell, a cell whose last line is an expression displays that value; use that to show a result. print() also works and its output is captured, but the trailing expression also prints a summary or a value's shape.
 - nb_cell reports `stale` cells: ones that ran before something above them changed. Their variables are still in the namespace but the notebook no longer reproduces them — re-run with nb_run before trusting those values.
 - Editing a cell with nb_cell discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.
 - On ImportError, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.

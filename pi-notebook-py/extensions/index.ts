@@ -103,7 +103,7 @@ export default function (pi: ExtensionAPI) {
 			"list over one shared namespace and execute top to bottom, as in Jupyter. Omit " +
 			"`id` to create a cell (the generated id comes back; quote it to edit that cell later); " +
 			"pass `after` to insert somewhere other than the end. Set `run: false` to write without " +
-			"executing. Prefer this over running python in bash: the namespace persists between calls.",
+			"executing. Prefer this over running python in bash: the nb_cell namespace persists between calls.",
 		// pi renders this as `- nb_cell: <snippet>`, so the name is already there.
 		promptSnippet: "create or edit a cell in a persistent Python notebook and run it.",
 		// Every guideline names the tool it is about. pi concatenates each
@@ -111,8 +111,8 @@ export default function (pi: ExtensionAPI) {
 		// bash/edit/write advice, deduped and bulleted, with nothing recording
 		// whose is whose.
 		promptGuidelines: [
-			"Give nb_cell one coherent step per cell — a load, a transform, a plot — rather than one enormous cell: small cells are what make re-running a single step cheap.",
-			"In nb_cell, a cell whose last line is an expression displays that value, and that is how to show a result. print() also works and its output is captured, but the trailing expression is what summarises a value's shape.",
+			"Aim to use nb_cell with one small, self-contained statement per cell (eg. a data load, a transform, a plot): small cells are what make re-running a single step cheap.",
+			"In nb_cell, a cell whose last line is an expression displays that value; use that to show a result. print() also works and its output is captured, but the trailing expression also prints a summary or a value's shape.",
 			"nb_cell reports `stale` cells: ones that ran before something above them changed. Their variables are still in the namespace but the notebook no longer reproduces them — re-run with nb_run before trusting those values.",
 			"Editing a cell with nb_cell discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.",
 			"On ImportError, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.",
