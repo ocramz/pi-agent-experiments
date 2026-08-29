@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
 from nbkernel import CellNotFound, Notebook, NotebookError, brief  # noqa: E402
-from protocol import handle  # noqa: E402
+from protocol import bootstrap_path, handle  # noqa: E402
 
 
 def notebook(*sources: str) -> Notebook:
@@ -383,6 +383,38 @@ class TestProtocol(unittest.TestCase):
         response = self.call(tool="load", path="/nonexistent/nb.py")
         self.assertFalse(response["ok"])
         self.assertNotIn("internal", response)
+
+
+class TestBootstrapPath(unittest.TestCase):
+    """`__main__` only calls this, so the cases drive it directly.
+
+    Each restores sys.path: the kernel mutates the interpreter it is about
+    to serve from, whereas here it is the test runner's own.
+    """
+
+    def setUp(self):
+        saved = list(sys.path)
+        self.addCleanup(lambda: sys.path.__setitem__(slice(None), saved))
+
+    def test_puts_the_directory_first(self):
+        # First, not appended: a project's own module has to win, which is
+        # the whole point and also where the shadowing cost comes from.
+        bootstrap_path("/somewhere/project")
+        self.assertEqual(sys.path[0], "/somewhere/project")
+
+    def test_defaults_to_the_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            here = os.getcwd()
+            os.chdir(directory)
+            self.addCleanup(os.chdir, here)
+            bootstrap_path()
+            # macOS hands out /var -> /private/var, so compare resolved.
+            self.assertEqual(os.path.realpath(sys.path[0]), os.path.realpath(directory))
+
+    def test_is_idempotent(self):
+        bootstrap_path("/somewhere/project")
+        bootstrap_path("/somewhere/project")
+        self.assertEqual(sys.path.count("/somewhere/project"), 1)
 
 
 if __name__ == "__main__":

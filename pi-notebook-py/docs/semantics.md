@@ -85,6 +85,14 @@ leaving it in both. `failing` is read off the last output. A cell is in at most 
 | move a cell | the moved cell becomes unrun; everything from the earlier of its two positions down is stale |
 | restart | every cell becomes unrun; nothing is stale |
 
+Restart is the one entry that is not a notebook operation at all. `Notebook.restart()` only swaps in
+a fresh namespace, and the client does not stop there: `nb_notebook {op: "restart"}` and the restart
+half of `nb_run {op: "all"}` checkpoint the cells, kill the interpreter, and load the checkpoint back
+into a new one. The namespace is the smaller half of what a restart has to clear — `sys.modules`
+survives a namespace reset, so a module imported from the project directory would otherwise keep its
+old code no matter how many times the notebook was "restarted", and `install`'s `restart_required`
+would name a fix no op could deliver. Cells and their ids survive, because `load` reconciles by id.
+
 Deleting and moving mark *above* the affected span rather than at it (`_disturb`), because a cell's
 own `touched_at` affects the cells below it and not itself — marking at the span would leave the
 cell that inherited the position looking fresh when it is exactly as unreproducible as the ones
@@ -165,6 +173,34 @@ disk while overriding it. Pinning is the likeliest way to strand one, so a listi
 venv only while nothing overrode it would hide exactly the environments worth reclaiming. For the
 same reason `drop-venv` resolves through `venvDir` rather than through the interpreter that is in
 force: a pin changes what runs, not what this extension owns.
+
+### 3.9 The project directory is on `sys.path`, and shadows the stdlib
+
+`bootstrap_path` puts the kernel's working directory at `sys.path[0]` before the serve loop starts.
+Without it the project's own modules are the one thing a notebook sitting in that project cannot
+import: the kernel is spawned as `python <pkg>/py/protocol.py`, and for a script path CPython puts
+the *script's* directory on `sys.path[0]` — `''` is prepended only for `-c`, `-m` and interactive
+mode. So `open("data.csv")` worked while `import helper` did not, for a `helper.py` right there in
+the cwd, which makes "write the long code to a file and call it from a small cell" fail for no
+reason the agent can see.
+
+Index 0 is Jupyter's choice, and it comes with Jupyter's cost: a project file named `io.py` or
+`json.py` shadows the stdlib module of that name. The alternative — appending, so the stdlib always
+wins — would make the notebook disagree with every other way of running Python in that directory,
+and a shadowing bug that only appears under this kernel is worse than one that appears everywhere.
+It is the user's own directory behaving the way Python says directories on the path behave.
+
+The entry is the cwd at spawn time, not a live view: a cell that calls `os.chdir` moves the process
+but not the path, exactly as in Jupyter.
+
+Restarting the interpreter clears `sys.modules`, which is what makes an edited project file get
+re-read — but it does not defeat `__pycache__`. CPython validates a `.pyc` against the source's
+`(mtime, size)`, and the mtime it stores is truncated to whole seconds, so a file rewritten within
+the same second as its cache entry *and* to exactly the same byte length loads the stale bytecode.
+That is universal CPython behaviour — `python helper.py` twice in one second does the same — and it
+is left alone for the same reason the path order is Jupyter's: a notebook that disagreed with every
+other way of running the code in that directory would be the worse bug. It is narrow in practice,
+since an edit that changes nothing about a file's length is rare.
 
 ## 4. Not planned
 

@@ -8,7 +8,8 @@
 - nb_cell reports `stale` cells: ones that ran before something above them changed. Their variables are still in the namespace but the notebook no longer reproduces them — re-run with nb_run before trusting those values.
 - Editing a cell with nb_cell discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.
 - On ImportError, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.
-- `nb_run {op: "all"}` restarts the namespace and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces.
+- The kernel runs in the project directory and that directory is on sys.path, so a module you write there is importable from a cell by its own name — write the long or reusable code to a file and keep the cells small. After editing such a file, `nb_notebook {op: "restart"}` before importing it again: the old code is in sys.modules until the interpreter is replaced.
+- `nb_run {op: "all"}` restarts the interpreter and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces — including re-importing any project file that changed on disk.
 - After editing a cell in the middle, `nb_run {op: "below", id: <that cell>}` is usually what you want: it re-runs the edited cell and everything that could depend on it, without redoing the expensive setup above.
 - Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.
 - Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv, so conflicting versions cannot collide. Switching is not free — it discards the current namespace — so do not switch to organise cells.

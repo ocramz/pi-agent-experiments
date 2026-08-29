@@ -484,7 +484,49 @@ export class Kernel {
 	}
 
 	/**
-	 * The live child, or a message saying why there cannot be one.
+	 * Write this notebook's checkpoint. The response, so a caller can tell a
+	 * write that did not happen from one that did.
+	 *
+	 * `remember: false` because this is not the notebook's own `save` target —
+	 * a later bare save should still go wherever the user last pointed it.
+	 */
+	async saveCheckpoint(): Promise<KernelResponse> {
+		return await this.call({
+			tool: "save",
+			path: this.checkpoint,
+			overwrite: true,
+			remember: false,
+			notebook: this.notebook,
+		});
+	}
+
+	/**
+	 * Restart for real: replace the interpreter process, then load the
+	 * checkpoint back over it.
+	 *
+	 * The cell list lives in that process too, so it is checkpointed first
+	 * and loaded back after: the trade `useNotebook` already makes, and what
+	 * the checkpoint is for. `load` reconciles by id, so the cell ids a
+	 * caller is holding survive. Nothing here sets `lostState` : `kill()`
+	 * drops the handle, so `ensure()` does not read the respawn as an
+	 * unplanned death and report a loss that was asked for.
+	 */
+	async restartProcess(): Promise<KernelResponse> {
+		// No child yet means there is nothing to replace, and checkpointing
+		// here would write a session's empty notebook over the file the last
+		// one left. On a namespace that does not exist the two are the same.
+		if (!this.proc) return await this.call({ tool: "restart" });
+		const saved = await this.saveCheckpoint();
+		this.kill();
+		// Only follow through if the checkpoint really landed: an unwritable
+		// `.pi/` would otherwise turn a restart into a silent loss of every
+		// cell in the notebook.
+		if (!saved.ok || !existsSync(this.checkpoint)) return await this.call({ tool: "restart" });
+		return await this.call({ tool: "load", path: this.checkpoint });
+	}
+
+	/**
+	 * ensure the python process is running, and return it. If it is not, spawn it.
 	 */
 	private async ensure(): Promise<ChildProcess | string> {
 		if (this.proc && this.proc.exitCode === null) return this.proc;

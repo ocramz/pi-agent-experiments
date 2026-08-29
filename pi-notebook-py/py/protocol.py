@@ -17,13 +17,14 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict
 
 from nbkernel import CellNotFound, Notebook, NotebookError, Output
 
-__all__ = ["handle", "install", "serve"]
+__all__ = ["bootstrap_path", "handle", "install", "serve"]
 
 # PEP 668 marks Debian/Ubuntu interpreters as externally managed; inside a
 # venv the flag is neither needed nor always accepted.
@@ -196,5 +197,27 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, nb: Notebook | None = None) -> Non
         print(json.dumps(handle(nb, json.loads(line))), file=stdout, flush=True)
 
 
+def bootstrap_path(cwd: str | None = None) -> None:
+    """Make the working directory importable, as ipykernel does.
+
+    The kernel is spawned as `python <pkg>/py/protocol.py`, and for a script
+    path CPython puts the *script's* directory on sys.path[0] — `''` is only
+    prepended for -c, -m and interactive mode. So without this a project's
+    own modules are the one thing a notebook sitting in that project cannot
+    import, which makes "write a helper, use it from a cell" fail.
+
+    Index 0, matching Jupyter, and with Jupyter's consequence: a project file
+    named `io.py` shadows the stdlib one. That is the user's own directory
+    behaving the way Python says directories on the path behave.
+
+    Called from `__main__` rather than from serve(): the tests drive serve()
+    in-process, where mutating sys.path would leak into the test runner.
+    """
+    entry = os.getcwd() if cwd is None else cwd
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
 if __name__ == "__main__":  # `--serve` is accepted for compatibility
+    bootstrap_path()
     serve()

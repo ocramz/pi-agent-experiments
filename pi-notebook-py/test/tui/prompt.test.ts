@@ -71,8 +71,8 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// point: an unattributed guideline cannot reach the model quietly.
 	assert.equal(
 		bullets.length,
-		11,
-		`expected 11 extension guidelines (5 on nb_cell, 2 on nb_run, 4 on nb_notebook), got ${bullets.length}.\n` +
+		12,
+		`expected 12 extension guidelines (6 on nb_cell, 2 on nb_run, 4 on nb_notebook), got ${bullets.length}.\n` +
 			"A guideline that names none of the nb_* tools is invisible to this filter — and to the model.\n" +
 			bullets.join("\n"),
 	);
