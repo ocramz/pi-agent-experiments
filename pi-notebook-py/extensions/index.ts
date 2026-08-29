@@ -248,9 +248,6 @@ export default function (pi: ExtensionAPI) {
 					description: "Cell type. Markdown cells are never executed. Defaults to code.",
 				}),
 			),
-			name: Type.Optional(
-				Type.String({ description: "Optional display name. Metadata, not a lookup key." }),
-			),
 			run: Type.Optional(
 				Type.Boolean({ description: "Execute immediately (default true). False writes without running." }),
 			),
@@ -263,7 +260,6 @@ export default function (pi: ExtensionAPI) {
 								tool: "set_cell",
 								id: params.id,
 								src: params.src,
-								name: params.name,
 								kind: params.kind,
 								run: params.run ?? true,
 							}
@@ -272,7 +268,6 @@ export default function (pi: ExtensionAPI) {
 								src: params.src,
 								after: params.after,
 								kind: params.kind ?? "code",
-								name: params.name,
 								run: params.run ?? true,
 							},
 				),
@@ -515,7 +510,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /nb: the human shares the namespace ─────────────────────────
 	pi.registerCommand("nb", {
 		description:
-			"Poke the notebook kernel: /nb lists cells, /nb add [name] <src>, /nb run <id>, " +
+			"Poke the notebook kernel: /nb lists cells, /nb add <src>, /nb run <id>, " +
 			"/nb run-all, /nb read <id>, /nb save <path>, /nb open <path>, /nb notebooks, " +
 			"/nb new <name>, /nb use <name>, /nb drop-venv <name>, /nb <expr> evaluates.",
 		handler: async (args, ctx) => {
@@ -614,11 +609,11 @@ export default function (pi: ExtensionAPI) {
 				return show(await call({ tool: "load", path: open[1] }));
 			}
 
-			const add = input.match(/^add\s+(?:(\w+)\s+)?([\s\S]+)/);
-			if (add) {
-				const [, name, src] = add;
-				return show(await call({ tool: "add_cell", src, name: name || undefined }));
-			}
+			// Everything after `add` is source. There is no optional name slot to
+			// be greedy about, so `/nb add import math` adds `import math` rather
+			// than a cell named `import` whose body is `math`.
+			const add = input.match(/^add\s+([\s\S]+)/);
+			if (add) return show(await call({ tool: "add_cell", src: add[1] }));
 			// Anything else is an expression to evaluate without creating a cell.
 			const resp = await call({ tool: "eval", src: input });
 			notify(

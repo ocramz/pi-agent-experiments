@@ -195,12 +195,12 @@ test("an explicit kill is not reported as lost state", async (t) => {
 test("save and open round-trip through the wire", async (t) => {
 	const { k, dir } = kernelIn(t);
 	const path = join(dir, "nb.py");
-	await k.call({ tool: "add_cell", src: "a = 1", name: "setup" });
+	await k.call({ tool: "add_cell", src: "a = 1" });
 	await k.call({ tool: "add_cell", src: "a + 1" });
 	const saved = (await k.call({ tool: "save", path })) as RunResponse;
 	assert.equal(saved.ok, true);
 	assert.equal(saved.saved?.cells, 2);
-	assert.match(readFileSync(path, "utf8"), /^# %% setup id="c1"$/m);
+	assert.match(readFileSync(path, "utf8"), /^# %% id="c1"$/m);
 
 	const other = new Kernel(undefined, dir, { env: envIn(dir) });
 	t.after(() => other.kill());

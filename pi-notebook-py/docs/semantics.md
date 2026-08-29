@@ -78,7 +78,6 @@ leaving it in both. `failing` is read off the last output. A cell is in at most 
 | Operation | Effect |
 |---|---|
 | edit a cell's source or kind | that cell becomes unrun; everything below it is stale |
-| rename a cell | nothing — a name cannot change what the cell computes |
 | set identical source | nothing |
 | run a cell | everything below it is stale |
 | insert a cell | everything below the insertion point is stale, before it has even run |

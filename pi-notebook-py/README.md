@@ -1,7 +1,10 @@
 # pi-notebook-py
 
-A Jupyter-shaped Python notebook for the [pi coding agent](https://pi.dev): an ordered list of
-cells over one persistent namespace, with a file on disk and plots the model can actually see.
+A Jupyter-shaped Python notebook for the [pi coding agent](https://pi.dev).
+
+A notebook is an ordered list of cells over a persistent namespace. Notebooks can be saved to disk as regular Python files.
+The extension keeps separate venvs (a default one, and optionally one per notebook).
+Cells may return image data, which may be fed to vision-capable models.
 
 ```
 > Load the CSV, plot the distribution, and save the notebook.
@@ -17,26 +20,9 @@ cells over one persistent namespace, with a file on disk and plots the model can
             saved 4 cell(s) to ./analysis.py
 ```
 
-## Compared to pi-incremental-py
+## Staleness annotations
 
-[pi-incremental-py](../pi-incremental-py/) derives a
-dependency graph from each cell's module-level definitions and references, and recomputes the
-minimum of the heap when a cell changes. That is genuinely more powerful, and it costs something:
-one global may have only one providing cell, cross-cell mutation is invisible to it, and its
-[authoring model](../pi-incremental-py/docs/authoring-model.md) is largely a list of what a cell
-must not contain.
-
-This package is the other end of that trade. There is no graph, no cache, and no rule about which
-cell defines what — cells run top to bottom into a mutable dict, and ordinary Python works because
-nothing is inferred from it. Pick this one when the notebook is exploratory, mutates state, or is
-meant to end up as a file a human reads; pick the other when the same expensive computation is
-going to be re-run many times as one input at a time changes.
-
-The honest cost is that stale state is possible. Which is why the kernel's real job is reporting it.
-
-## Staleness
-
-Every response names the cells the last change left behind:
+Every response shows which cells may have stale results:
 
 ```
 * [7] c2 1.2ms  15
@@ -45,8 +31,6 @@ notebook back in step
 unrun: c5
 failing: c6
 ```
-
-The three are disjoint and mean different things:
 
 | | |
 |---|---|
@@ -75,14 +59,14 @@ And two slash commands, so the human shares the same namespace:
 
 ```
 /nb                       list the cells
-/nb add [name] <src>      add and run one
+/nb add <src>             add and run one
 /nb run <id>  /nb run-all
 /nb read <id>
 /nb save <path>  /nb open <path>
 /nb notebooks             every notebook in this project, and its environment
 /nb new <name>  /nb use <name>
-/nb drop-venv <name>      delete one notebook's venv, never its source
-/nb <expr>                evaluate without creating a cell
+/nb drop-venv <name>      delete one notebook's venv
+/nb <expr>                evaluate an expression without creating a cell
 /nb-python <path>         pin this notebook's interpreter (restarts the kernel)
 /nb-python clear          undo the pin; back to the notebook's own venv
 ```
@@ -110,7 +94,7 @@ carries the notebook's name in a jupytext frontmatter fence:
 # notebook: sales
 # ---
 
-# %% setup id="c1"
+# %% id="c1"
 import pandas as pd
 ```
 
@@ -137,7 +121,7 @@ to do, not the model's — see §3.8 of [docs/semantics.md](docs/semantics.md).
 `# %%` blocks in an ordinary `.py`:
 
 ```python
-# %% setup id="c1"
+# %% id="c1"
 import pandas as pd
 
 # %% [markdown] id="c2"

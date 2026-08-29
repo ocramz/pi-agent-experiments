@@ -120,7 +120,6 @@ def handle(nb: Notebook, req: dict) -> dict:
                     _need(req, "src"),
                     after=req.get("after"),
                     kind=req.get("kind", "code"),
-                    name=req.get("name"),
                 )
                 outputs = nb.run_cell(cell.id) if req.get("run", True) else []
                 return _response(nb, outputs, id=cell.id)
@@ -128,7 +127,6 @@ def handle(nb: Notebook, req: dict) -> dict:
                 cell = nb.set(
                     _need(req, "id"),
                     src=req.get("src"),
-                    name=req.get("name"),
                     kind=req.get("kind"),
                 )
                 outputs = nb.run_cell(cell.id) if req.get("run", True) else []

@@ -196,12 +196,6 @@ class TestStaleness(unittest.TestCase):
         self.assertEqual(nb.stale(), [])
         self.assertEqual(nb.unrun(), ["c1", "c2"])
 
-    def test_renaming_invalidates_nothing(self):
-        nb = ran(notebook("a = 1", "b = 2"))
-        nb.set("c1", name="setup")
-        self.assertEqual(nb.stale(), [])
-        self.assertEqual(nb.unrun(), [])
-
     def test_setting_identical_source_invalidates_nothing(self):
         nb = ran(notebook("a = 1", "b = 2"))
         nb.set("c1", "a = 1")

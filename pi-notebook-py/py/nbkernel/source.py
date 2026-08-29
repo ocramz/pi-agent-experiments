@@ -31,7 +31,8 @@ __all__ = [
 ]
 
 # jupytext's header: `# %%` then an optional title, an optional [celltype]
-# in brackets, and any number of key="value" pairs, in that order.
+# in brackets, and any number of key="value" pairs, in that order. A cell has
+# no title of its own, so we read past that slot and never write it.
 _HEADER = re.compile(r"^#\s*%%(?P<rest>.*)$")
 _CELLTYPE = re.compile(r"\[(\w+)\]")
 _METADATA = re.compile(r'(\w+)="([^"]*)"')
@@ -102,25 +103,24 @@ class ParsedCell:
 
     src: str
     kind: str = "code"
-    name: str | None = None
     id: str | None = None
 
 
-def _parse_header(rest: str) -> tuple[str, str | None, str | None]:
-    """`(kind, name, id)` out of everything after the `# %%` marker.
+def _parse_header(rest: str) -> tuple[str, str | None]:
+    """`(kind, id)` out of everything after the `# %%` marker.
 
-    The name is whatever text is left once the bracketed cell type and the
-    key="value" pairs have been lifted out, which is how jupytext gets a
-    title and metadata onto one line without quoting the title.
+    Whatever text is left once the bracketed cell type and the key="value"
+    pairs have been lifted out is jupytext's title slot. A cell here has no
+    title, so that text is read past and dropped — the same treatment an
+    unrecognised bracketed cell type gets, and for the same reason: it says
+    nothing about what the cell computes.
     """
     cid = dict(_METADATA.findall(rest)).get("id") or None
     kind = "code"
     if (found := _CELLTYPE.search(rest)) is not None:
         if found.group(1) in KINDS:
             kind = found.group(1)
-        rest = rest[: found.start()] + rest[found.end() :]
-    name = _METADATA.sub("", rest).strip() or None
-    return kind, name, cid
+    return kind, cid
 
 
 def _decode_markdown(lines: list[str]) -> str:
@@ -199,10 +199,10 @@ def parse_percent(text: str) -> list[ParsedCell]:
             if src.strip():
                 cells.append(ParsedCell(src=src))
             continue
-        kind, name, cid = _parse_header(head)
+        kind, cid = _parse_header(head)
         if kind == "markdown":
             src = _decode_markdown(src.splitlines()).strip("\n")
-        cells.append(ParsedCell(src=src, kind=kind, name=name, id=cid))
+        cells.append(ParsedCell(src=src, kind=kind, id=cid))
     return cells
 
 
@@ -221,8 +221,6 @@ def emit_percent(cells: list[ParsedCell], notebook: str | None = None) -> str:
         chunks.append(f"{_FENCE}\n# notebook: {notebook}\n{_FENCE}")
     for cell in cells:
         head = ["# %%"]
-        if cell.name:
-            head.append(cell.name)
         if cell.kind != "code":
             head.append(f"[{cell.kind}]")
         if cell.id:

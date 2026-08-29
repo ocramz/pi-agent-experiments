@@ -66,7 +66,6 @@ class Cell:
     id: str
     src: str
     kind: str = "code"
-    name: str | None = None  # display metadata only; never a lookup key
     touched_at: int = 0
     ran_at: int | None = None
     execution_count: int | None = None

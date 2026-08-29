@@ -109,13 +109,10 @@ class Notebook:
         src: str,
         after: str | None = None,
         kind: str = "code",
-        name: str | None = None,
     ) -> Cell:
         if kind not in KINDS:
             raise NotebookError(f"kind must be one of {KINDS}, not {kind!r}")
-        cell = Cell(
-            id=self._new_id(), src=src, kind=kind, name=name, touched_at=self._bump()
-        )
+        cell = Cell(id=self._new_id(), src=src, kind=kind, touched_at=self._bump())
         self.cells.insert(self._position(after), cell)
         return cell
 
@@ -123,7 +120,6 @@ class Notebook:
         self,
         cid: str,
         src: str | None = None,
-        name: str | None = None,
         kind: str | None = None,
     ) -> Cell:
         """Edit a cell in place.
@@ -132,7 +128,6 @@ class Notebook:
         drops its last output. Keeping that output would mean displaying
         the result of code that is no longer in the cell, which is exactly
         the confusion this kernel exists to report rather than create.
-        A rename touches nothing: it cannot change what the cell computes.
         """
         cell = self.cell(cid)
         if kind is not None and kind not in KINDS:
@@ -144,8 +139,6 @@ class Notebook:
             cell.src = src
         if kind is not None:
             cell.kind = kind
-        if name is not None:
-            cell.name = name or None
         if changed:
             cell.touched_at = self._bump()
             cell.ran_at = None
@@ -287,7 +280,6 @@ class Notebook:
                     "id": cell.id,
                     "index": i,
                     "kind": cell.kind,
-                    "name": cell.name,
                     "execution_count": cell.execution_count,
                     "lines": len(cell.src.splitlines()),
                     "preview": _preview(cell.src),
@@ -309,16 +301,12 @@ class Notebook:
     def read(self, cid: str | None = None) -> list[dict]:
         """Full source, for one cell or all of them."""
         cells = self.cells if cid is None else [self.cell(cid)]
-        return [
-            {"id": c.id, "kind": c.kind, "name": c.name, "src": c.src} for c in cells
-        ]
+        return [{"id": c.id, "kind": c.kind, "src": c.src} for c in cells]
 
     # ---- persistence
 
     def _parsed(self) -> list[ParsedCell]:
-        return [
-            ParsedCell(src=c.src, kind=c.kind, name=c.name, id=c.id) for c in self.cells
-        ]
+        return [ParsedCell(src=c.src, kind=c.kind, id=c.id) for c in self.cells]
 
     def save(
         self,
@@ -383,7 +371,7 @@ class Notebook:
                     and kept.kind == item.kind
                     and old_index == index
                 )
-                kept.src, kept.kind, kept.name = item.src, item.kind, item.name
+                kept.src, kept.kind = item.src, item.kind
                 if not intact:
                     kept.ran_at = None
                     kept.execution_count = None
@@ -397,7 +385,6 @@ class Notebook:
                 id=item.id if adopt else self._new_id(),
                 src=item.src,
                 kind=item.kind,
-                name=item.name,
                 touched_at=self._bump(),
             )
             cells.append(cell)

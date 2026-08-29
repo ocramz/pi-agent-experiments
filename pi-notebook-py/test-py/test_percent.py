@@ -42,20 +42,10 @@ _line = (
 # format round-trips over — `parse_percent` strips those by construction.
 _src = st.lists(_line, min_size=0, max_size=4).map(lambda ls: "\n".join(ls).strip("\n"))
 
-# A name shares its line with the bracketed cell type and the key="value"
-# metadata, so it cannot contain the characters that delimit those.
-_name = st.one_of(
-    st.none(),
-    st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789-_ ", min_size=1, max_size=12)
-    .map(str.strip)
-    .filter(bool),
-)
-
 _cell = st.builds(
     ParsedCell,
     src=_src,
     kind=st.sampled_from(["code", "markdown"]),
-    name=_name,
     id=st.one_of(st.none(), st.integers(1, 99).map(lambda i: f"c{i}")),
 )
 
@@ -89,10 +79,24 @@ class TestParsing(unittest.TestCase):
             "# %%\nmath.pi\n"
         )
         self.assertEqual([c.kind for c in cells], ["code", "markdown", "code"])
-        self.assertEqual(cells[0].name, "setup")
         self.assertEqual(cells[0].id, "c1")
+        self.assertEqual(cells[0].src, "import math")
         self.assertEqual(cells[1].src, "Some prose")
-        self.assertIsNone(cells[2].name)
+
+    def test_a_jupytext_title_is_read_past_and_dropped(self):
+        """The title slot exists in the format; a cell has nothing to put in it.
+
+        What matters is that a hand-written title costs nothing: the id, the
+        kind and the source all survive it, and it does not leak into `src`.
+        """
+        cells = parse_percent(
+            '# %% Load the data id="c1"\na = 1\n\n'
+            "# %% Notes [markdown]\n# prose\n\n"
+            "# %% plain title\nb = 2\n"
+        )
+        self.assertEqual([c.id for c in cells], ["c1", None, None])
+        self.assertEqual([c.kind for c in cells], ["code", "markdown", "code"])
+        self.assertEqual([c.src for c in cells], ["a = 1", "prose", "b = 2"])
 
     def test_yaml_frontmatter_is_not_a_cell(self):
         cells = parse_percent(
@@ -118,10 +122,10 @@ class TestParsing(unittest.TestCase):
 
 
 class TestEmitting(unittest.TestCase):
-    def test_the_header_order_is_name_type_metadata(self):
-        cell = ParsedCell(src="x", kind="markdown", name="notes", id="c7")
+    def test_the_header_order_is_type_then_metadata(self):
+        cell = ParsedCell(src="x", kind="markdown", id="c7")
         text = emit_percent([cell])
-        self.assertEqual(text.splitlines()[0], '# %% notes [markdown] id="c7"')
+        self.assertEqual(text.splitlines()[0], '# %% [markdown] id="c7"')
 
     def test_code_cells_carry_no_bracketed_type(self):
         text = emit_percent([ParsedCell(src="x", id="c1")])
@@ -149,7 +153,7 @@ class TestFrontmatter(unittest.TestCase):
         self.assertEqual(read_frontmatter(text), {"notebook": "sales"})
 
     def test_the_fence_is_not_a_cell(self):
-        cells = [ParsedCell(src="a = 1", kind="code", name="setup", id="c1")]
+        cells = [ParsedCell(src="a = 1", kind="code", id="c1")]
         text = emit_percent(cells, notebook="sales")
         self.assertEqual(parse_percent(text), cells)
 
@@ -183,7 +187,7 @@ class TestNotebookPersistence(unittest.TestCase):
 
     def saved(self) -> tuple[Notebook, str]:
         nb = Notebook()
-        nb.add("a = 1", name="setup")
+        nb.add("a = 1")
         nb.add("b = a + 1")
         nb.add("b")
         nb.run_all()
@@ -196,7 +200,6 @@ class TestNotebookPersistence(unittest.TestCase):
         other = Notebook()
         other.load(path)
         self.assertEqual([c.src for c in other.cells], ["a = 1", "b = a + 1", "b"])
-        self.assertEqual(other.cells[0].name, "setup")
         # No outputs in the format, so everything comes back unrun.
         self.assertEqual(other.unrun(), ["c1", "c2", "c3"])
         self.assertEqual(other.stale(), [])

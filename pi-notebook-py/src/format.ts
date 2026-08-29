@@ -61,7 +61,6 @@ export interface CellSummary {
 	id: string;
 	index: number;
 	kind: string;
-	name: string | null;
 	execution_count: number | null;
 	lines: number;
 	preview: string;
@@ -82,7 +81,7 @@ export interface InspectResponse {
 export interface ReadResponse {
 	ok: boolean;
 	error?: string;
-	cells?: { id: string; kind: string; name: string | null; src: string }[];
+	cells?: { id: string; kind: string; src: string }[];
 }
 
 const MARK: Record<string, string> = { ok: "*", error: "!" };
@@ -165,9 +164,8 @@ export function formatInspect(resp: InspectResponse, notebook?: string): string 
 	];
 	for (const c of cells) {
 		const count = c.execution_count != null ? `[${c.execution_count}]` : "[ ]";
-		const label = c.name ? `${c.id} (${c.name})` : c.id;
 		const kind = c.kind === "code" ? "" : ` ${c.kind}`;
-		lines.push(`${count} ${label}${kind} ${c.state}  ${c.preview}`);
+		lines.push(`${count} ${c.id}${kind} ${c.state}  ${c.preview}`);
 	}
 	lines.push(...formatHints(resp));
 	return lines.join("\n");
@@ -207,9 +205,8 @@ export function formatRead(resp: ReadResponse): string {
 	if (!cells.length) return "(no cells)";
 	return cells
 		.map((c) => {
-			const label = c.name ? `${c.id} (${c.name})` : c.id;
 			const kind = c.kind === "code" ? "" : ` [${c.kind}]`;
-			return `--- ${label}${kind}\n${c.src}`;
+			return `--- ${c.id}${kind}\n${c.src}`;
 		})
 		.join("\n");
 }

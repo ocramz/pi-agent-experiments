@@ -145,7 +145,6 @@ test("inspect lists cells with their state and a preview", () => {
 				id: "c1",
 				index: 0,
 				kind: "code",
-				name: "setup",
 				execution_count: 1,
 				lines: 1,
 				preview: "import math",
@@ -155,7 +154,6 @@ test("inspect lists cells with their state and a preview", () => {
 				id: "c2",
 				index: 1,
 				kind: "markdown",
-				name: null,
 				execution_count: null,
 				lines: 2,
 				preview: "Notes",
@@ -165,7 +163,7 @@ test("inspect lists cells with their state and a preview", () => {
 		stale: [],
 	});
 	assert.match(text, /^2 cells \(file: nb\.py\):$/m);
-	assert.match(text, /^\[1\] c1 \(setup\) ok {2}import math$/m);
+	assert.match(text, /^\[1\] c1 ok {2}import math$/m);
 	assert.match(text, /^\[ \] c2 markdown unrun {2}Notes$/m);
 });
 
@@ -176,9 +174,9 @@ test("an empty notebook says so rather than printing a header", () => {
 test("read prints full source under a labelled separator", () => {
 	const text = formatRead({
 		ok: true,
-		cells: [{ id: "c1", kind: "code", name: "load", src: "a = 1\nb = 2" }],
+		cells: [{ id: "c1", kind: "code", src: "a = 1\nb = 2" }],
 	});
-	assert.equal(text, "--- c1 (load)\na = 1\nb = 2");
+	assert.equal(text, "--- c1\na = 1\nb = 2");
 });
 
 test("eval prints stdout before the value", () => {
