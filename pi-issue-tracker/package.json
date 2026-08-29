@@ -1,6 +1,6 @@
 {
   "name": "@ocramz/pi-issue-tracker",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "An issue-tracker extension for pi that turns goals into linked, tracked user stories stored in a project-local SQLite database.",
   "keywords": [
     "pi-package",
