@@ -5,7 +5,7 @@ suites structurally cannot reach.
 
 ## Why it needs a pty
 
-`make check`'s other tiers cover `extensions/index.ts`'s hooks and its `story` tool by driving a
+`make check`'s other tiers cover `extensions/`'s hooks and the `story` tool by driving a
 real model. They cannot reach the commands. Slash commands are dispatched by pi's TUI alone:
 print mode never parses them, RPC mode can `get_commands` but has no case to execute one, and
 `/plan-stories` refuses outright unless `ctx.mode` is `"tui"`. The board is a TUI component

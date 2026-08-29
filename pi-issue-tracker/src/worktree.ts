@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { GitResult, GitRunner } from "./context.ts";
+import type { GitResult, GitRunner, TrackerContext } from "./context.ts";
+import { getActiveEpicBranches, updateEpicBranch } from "./database.ts";
 import type { EpicBranch } from "./types.ts";
 
 /**
@@ -206,4 +207,44 @@ export function findMissingWorktrees(
 	});
 
 	return { missing, orphaned };
+}
+
+/**
+ * What reconciling the database against git turned up.
+ *
+ * `cancelled` rows have already been written; `orphaned` directories have not
+ * been touched. That asymmetry is the point — see `reconcileWorktrees`.
+ */
+export interface ReconcileReport {
+	cancelled: EpicBranch[];
+	orphaned: WorktreeEntry[];
+}
+
+/**
+ * Reconcile what the database believes about worktrees against what git says.
+ *
+ * A crashed session or a manual `rm -rf` leaves an active row pointing at a
+ * directory that is gone; a failed removal leaves a directory no epic claims.
+ * The first is bookkeeping and is fixed silently — the epic's branch and its
+ * backup refs are untouched, so nothing is lost by marking the row cancelled.
+ *
+ * The second is only *reported*. Deleting a directory is not a decision to make
+ * on the user's behalf during startup, and a blocking dialog there would stall
+ * every session behind a question most of them do not need to answer. So this
+ * returns what it found and the caller decides how to say it.
+ */
+export async function reconcileWorktrees(ctx: TrackerContext): Promise<ReconcileReport> {
+	const entries = await listWorktrees(ctx.git, ctx.paths.repoRoot);
+	const { missing, orphaned } = findMissingWorktrees(
+		getActiveEpicBranches(ctx.db),
+		entries,
+		ctx.paths.worktreeRoot,
+	);
+
+	const cancelled: EpicBranch[] = [];
+	for (const epic of missing) {
+		updateEpicBranch(ctx.db, epic.epic_id, { state: "cancelled", path: null }, ctx.now());
+		cancelled.push(epic);
+	}
+	return { cancelled, orphaned };
 }

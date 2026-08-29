@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
-import { decideReview, SELF_REVIEW } from "../src/review.ts";
+import { after, describe, it } from "node:test";
+import { createStory } from "../src/database.ts";
+import { startEpic } from "../src/epic.ts";
+import { decideReview, gatherFindings, SELF_REVIEW } from "../src/review.ts";
 import type { ReviewFinding } from "../src/rules.ts";
 import type { Story } from "../src/types.ts";
-import { createStubReviewer, stubVerdict } from "./helpers/repo.ts";
+import { createTempRepo, createStubReviewer, stubVerdict, type TempRepo } from "./helpers/repo.ts";
 
 /**
  * The review decision, with and without a second model.
@@ -251,5 +253,85 @@ describe("decideReview — independent reviewer", () => {
 		};
 		await decideReview({ gate: "plan", story: story(), findings: [], reviewer: wrapped, signal: controller.signal, now: at });
 		assert.equal(seen, controller.signal);
+	});
+});
+
+/**
+ * The mechanical half of a review: what the gate can check without a model.
+ *
+ * The plan gate reads the board; the work gate reads the working tree, so only
+ * the second needs a started epic. Both were unreachable from a test while
+ * `gatherFindings` lived in `extensions/index.ts`.
+ */
+describe("gatherFindings", () => {
+	const repos: TempRepo[] = [];
+	after(() => {
+		for (const created of repos) created.cleanup();
+	});
+	async function repo(): Promise<TempRepo> {
+		const created = await createTempRepo();
+		repos.push(created);
+		return created;
+	}
+	const make = (r: TempRepo, title: string, extra: Record<string, unknown> = {}) =>
+		createStory(r.db, {
+			title,
+			sub_goal: "do the thing",
+			proposed_changes: "change the code",
+			status: "ready",
+			priority: 0,
+			parent_id: null,
+			next_id: null,
+			depends_on: [],
+			...extra,
+		} as Parameters<typeof createStory>[1]);
+
+	it("runs the plan checks without needing an epic or a working tree", async () => {
+		const r = await repo();
+		const epic = make(r, "Epic");
+		make(r, "Child", { parent_id: epic.id });
+
+		const { findings, evidence } = await gatherFindings(r.session, epic, "plan");
+		assert.ok(findings.some((f) => f.severity === "blocker"), "an epic should not pass the plan gate");
+		assert.equal(evidence, undefined, "the plan gate has no working tree to describe");
+	});
+
+	/**
+	 * The work gate has nothing mechanical to check outside an epic, but saying
+	 * "no findings" would read as approval. It reports why instead.
+	 */
+	it("explains itself rather than approving when the story is under no started epic", async () => {
+		const r = await repo();
+		const story = make(r, "Loose");
+		const { findings, evidence } = await gatherFindings(r.session, story, "work");
+		assert.equal(findings.length, 1);
+		assert.equal(findings[0].severity, "note");
+		assert.match(findings[0].message, /not under a started epic/);
+		assert.match(findings[0].message, /\/start-epic/);
+		assert.equal(evidence, undefined);
+	});
+
+	it("describes what changed in the working tree for a story inside an epic", async () => {
+		const r = await repo();
+		const epicStory = make(r, "Add auth");
+		const child = make(r, "Hash passwords", { parent_id: epicStory.id });
+		const started = await startEpic(r.session, { story: epicStory });
+		assert.ok(started.ok, started.note);
+
+		r.write("auth.ts", "export const hash = () => {};\n");
+		const { evidence } = await gatherFindings(r.session, child, "work");
+		assert.match(evidence ?? "", /Files changed \(1\):/);
+		assert.match(evidence ?? "", /auth\.ts/);
+	});
+
+	it("reports a clean tree as zero changed files rather than failing", async () => {
+		const r = await repo();
+		const epicStory = make(r, "Add auth");
+		const child = make(r, "Nothing to do", { parent_id: epicStory.id });
+		const started = await startEpic(r.session, { story: epicStory });
+		assert.ok(started.ok, started.note);
+
+		const { evidence } = await gatherFindings(r.session, child, "work");
+		assert.match(evidence ?? "", /Files changed \(0\):/);
 	});
 });

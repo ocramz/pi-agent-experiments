@@ -646,6 +646,59 @@ export async function cancelEpic(
 // ─── Ref hygiene ────────────────────────────────────────────────────
 
 /**
+ * How many per-turn checkpoints an epic keeps.
+ *
+ * `/undo-turn` only ever reads the newest, so this is purely about how far back
+ * a user can reach by hand with `git stash apply`. Twenty is roughly a session's
+ * worth and costs a kilobyte of refs.
+ */
+export const CHECKPOINT_RETENTION = 20;
+
+/**
+ * Snapshot the working tree without touching it.
+ *
+ * `stash create` builds a commit object without moving the index or the tree, so
+ * a checkpoint costs nothing and interrupts nothing. It would be a dangling
+ * commit, so a ref is written to keep it from being collected — and one ref per
+ * turn adds up over a day-long epic, so the tail is pruned on the same pass
+ * rather than by a sweeper.
+ *
+ * Returns the checkpoint's sha, or null for a clean tree with nothing to save.
+ */
+export async function writeCheckpoint(
+	ctx: TrackerContext,
+	epic: EpicBranch,
+	retention: number = CHECKPOINT_RETENTION,
+): Promise<string | null> {
+	const cwd = epicCwd(ctx, epic);
+	const created = await ctx.git(["stash", "create"], { cwd });
+	const sha = created.stdout.trim();
+	if (created.code !== 0 || !sha) return null;
+
+	// Names are millisecond timestamps, so they are fixed width and sort
+	// newest-first by name alone — which is what `restoreLastCheckpoint` relies on.
+	await ctx.git(["update-ref", `${checkpointRefPrefix(epic.epic_id)}/${ctx.now()}`, sha], { cwd });
+	await pruneCheckpoints(ctx, epic, retention);
+	return sha;
+}
+
+/** Put the newest checkpoint back over the working tree. */
+export async function restoreLastCheckpoint(ctx: TrackerContext, epic: EpicBranch): Promise<Outcome> {
+	const cwd = epicCwd(ctx, epic);
+	const refs = await ctx.git(
+		["for-each-ref", "--sort=-refname", "--format=%(objectname)", checkpointRefPrefix(epic.epic_id)],
+		{ cwd },
+	);
+	const newest = refs.stdout.trim().split("\n").filter(Boolean)[0];
+	if (!newest) return { ok: false, note: "No checkpoint recorded yet." };
+
+	const applied = await ctx.git(["stash", "apply", newest], { cwd });
+	return applied.code === 0
+		? { ok: true, note: `Restored the working tree from checkpoint ${newest.slice(0, 8)}.` }
+		: { ok: false, note: `Could not apply the checkpoint: ${applied.stderr.trim()}` };
+}
+
+/**
  * Keep the newest `keep` checkpoints for an epic and delete the rest.
  *
  * `turn_end` writes one ref per turn that ended with a dirty tree, so an epic

@@ -6,14 +6,28 @@ Implementation notes for the extension. User-facing docs are in the [top-level R
 
 ```
 pi-issue-tracker/
-  extensions/index.ts  → Extension factory (tool, commands, lifecycle, context injection, TUI)
+  extensions/index.ts         → Every registration, in full: tools, commands, events,
+                                their prompt text and schemas. Each handler is one call.
+  extensions/runtime.ts       → The session singleton, the pi-backed runners, session_start
+  extensions/board.ts         → The /stories painter
+  extensions/planner.ts       → The /plan-stories model loop
+  extensions/epic-commands.ts → The six epic commands: dialogs and session relocation
+
   src/context.ts       → TrackerContext: paths, db, injected git/shell runners, clock
+  src/session.ts       → TrackerSession: one session's mutable state on top of that
   src/config.ts        → Path resolution and the .pi/epic.json manifest
   src/rules.ts         → Pure decisions: gates, naming, commit messages, undo strategy, context pruning
   src/git.ts           → Git plumbing over an injected runner
   src/worktree.ts      → Worktree plumbing and database/git reconciliation
-  src/epic.ts          → Epic lifecycle: start, commit, update, merge, cancel, undo
+  src/epic.ts          → Epic lifecycle: start, commit, update, merge, cancel, undo, checkpoints
   src/database.ts      → SQLite schema and CRUD helpers
+  src/transitions.ts   → The single write path for `status`, and the git effects on it
+  src/actions.ts       → The thirteen actions behind the `story` tool
+  src/injection.ts     → The story context injected ahead of every agent turn
+  src/plan.ts          → /plan-stories: prompts, reply parsing, plan persistence
+  src/board.ts         → The story board's model: rows, tones, detail lines, keys
+  src/format.ts        → Every string a story is rendered into
+  src/usage.ts         → Token accounting for the model calls this extension makes itself
   src/related.ts       → Pluggable relevance strategy (related stories, learnings, handoffs)
   src/review.ts        → Review decisions: self-review vs an independent reviewer model
   src/json.ts          → Getting JSON back out of model prose
@@ -29,10 +43,26 @@ repo. What stays package-local is what encodes *this* extension's semantics — 
 fixtures, the inspector, the live suite. See "Adding an extension" in the
 [top-level README](../../README.md).
 
-**`src/` must not import from `@earendil-works/*`.** `extensions/index.ts` is the only
-pi-aware file: it builds a `TrackerContext` and delegates. That boundary is what lets
+**`src/` must not import from `@earendil-works/*`.** `extensions/` is the only pi-aware
+directory: it builds a `TrackerSession` and delegates. That boundary is what lets
 everything below it run under plain `node --test` against a temp repository, with no pi
 runtime and no network.
+
+The split inside `extensions/` follows from the same boundary. `index.ts` holds every
+registration and every word of prompt text, because what pi is told about a tool is what
+a reader wants beside its name; its handlers are one call each. The four siblings hold
+what genuinely cannot leave: `pi.exec`, `ctx.modelRegistry`, `ctx.ui.custom`,
+`ctx.ui.select`, `SessionManager.forkFrom`. Only `./extensions/index.ts` is named in
+`pi.extensions`; the siblings are ordinary imports.
+
+**`TrackerContext` is the injected dependencies; `TrackerSession` is one session's
+mutable state on top of them** — the epic id, the serialized git queue and its pending
+notes, the reviewer choice, the reviewer's running token total, and a `sendToAgent`
+closure. `TrackerSession extends TrackerContext`, so everything that took a context still
+does; only session-scoped functions ask for the superset. The singleton holding one is a
+module-level `let` in `extensions/runtime.ts` and must stay module-level: `finishMerge`
+runs inside a `withSession` callback belonging to the *old* extension instance, and reads
+it only because module scope is shared across instances in one process.
 
 ## Data model
 

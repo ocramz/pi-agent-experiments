@@ -1,4 +1,5 @@
-import type { EpicBranch, EpicMode, Story, StoryCommit } from "./types.ts";
+import type { EpicBranch, EpicMode, Story, StoryCommit, StoryResolution } from "./types.ts";
+import { STORY_RESOLUTIONS } from "./types.ts";
 
 /**
  * Decisions, with no I/O.
@@ -441,6 +442,177 @@ export function checkStageSize(input: StageGuardInput): CheckResult {
 		const mb = (input.totalBytes / (1024 * 1024)).toFixed(1);
 		return { ok: false, reason: `${mb} MB of changes exceeds the limit of ${maxBytes / (1024 * 1024)} MB` };
 	}
+	return { ok: true };
+}
+
+/**
+ * Split `/start-epic 3 --worktree` into its parts.
+ *
+ * Flags used to be detected with `args.includes("--worktree")` while the id came
+ * from `split(/\s+/)[0]`, so the flag-first spelling would have parsed
+ * `--worktree` as the story id the moment the mode was implemented.
+ */
+export function parseCommandArgs(args: string): { tokens: string[]; flags: Set<string> } {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	return {
+		tokens: parts.filter((part) => !part.startsWith("--")),
+		flags: new Set(parts.filter((part) => part.startsWith("--"))),
+	};
+}
+
+// ─── Story lifecycle gates ──────────────────────────────────────────
+/**
+ * The two gates guarding a story's own lifecycle, in the same shape as
+ * `checkCanStartEpic`/`checkCanMerge` above.
+ *
+ * They carry more than a `reason` because the tool reports a machine-readable
+ * `details.error` alongside the prose, and the live tier reads both. `code` is
+ * that key; `details` is whatever else that failure names.
+ *
+ * Written out here rather than inline in the tool because the two shared a
+ * dependency check verbatim and re-encoded the same "is this an epic" question
+ * three different ways between them.
+ */
+export interface GateFailure {
+	code: string;
+	message: string;
+	details?: Record<string, unknown>;
+}
+
+export type GateResult = { ok: true } | ({ ok: false } & GateFailure);
+
+/**
+ * Which of a story's dependencies have not closed.
+ *
+ * Takes a lookup rather than a database handle, so this file stays free of I/O.
+ */
+export function unmetDependencies(story: Story, lookup: (id: number) => Story | null): number[] {
+	return story.depends_on.filter((id) => lookup(id)?.status !== "done");
+}
+
+export interface StartStoryInput {
+	story: Story;
+	/** Open children, empty when the story is not an epic. */
+	openChildren: Story[];
+	isEpic: boolean;
+	unmet: number[];
+}
+
+/** Whether `mark_in_progress` may proceed. */
+export function checkCanStart(input: StartStoryInput): GateResult {
+	const { story } = input;
+
+	if (input.isEpic) {
+		const named = input.openChildren.map((s) => `#${s.id}`).join(", ") || "(none open)";
+		return {
+			ok: false,
+			code: "is an epic",
+			message: `Story #${story.id} is an epic, not a unit of work. Start one of its children instead: ${named}`,
+		};
+	}
+
+	if (input.unmet.length > 0) {
+		return {
+			ok: false,
+			code: "unmet dependencies",
+			message: `Cannot start: dependencies not done — ${input.unmet.map((id) => `#${id}`).join(", ")}`,
+			details: { unmet: input.unmet },
+		};
+	}
+
+	// Plan review gate. Same shape as the resolution gate on `mark_done`: an
+	// optional step is a skipped step, so it is required explicitly.
+	const planReview = story.review.plan;
+	if (planReview?.verdict !== "approved") {
+		return {
+			ok: false,
+			code: "plan not approved",
+			message: planReview
+				? `Cannot start #${story.id}: its plan review requested changes (by ${planReview.by}).\n${planReview.findings}\n\nAddress them, then run review_plan again.`
+				: `Cannot start #${story.id}: its plan has not been reviewed.\nRun story{action:"review_plan", story_id:${story.id}} first — call it with no verdict to see the findings.`,
+			details: { review: planReview ?? null },
+		};
+	}
+
+	return { ok: true };
+}
+
+export interface CloseStoryInput {
+	story: Story;
+	openChildren: Story[];
+	isEpic: boolean;
+	unmet: number[];
+	resolution: StoryResolution | undefined;
+	handoffNotes: string | undefined;
+}
+
+/** Whether `mark_done` may proceed. */
+export function checkCanClose(input: CloseStoryInput): GateResult {
+	const { story } = input;
+
+	// Resolution gate — same shape as the dependency gate below. Optional fields
+	// get skipped by models, and an unrecorded outcome is the whole gap this
+	// closes, so require it explicitly.
+	if (!input.resolution) {
+		return {
+			ok: false,
+			code: "resolution required",
+			message:
+				`Cannot mark done: resolution required.\n` +
+				`Pass resolution (${STORY_RESOLUTIONS.join("|")}) and optionally resolution_note.\n` +
+				`Set learnings ONLY if something contradicted the proposed_changes for this story — ` +
+				`an assumption that proved false, an API that behaved differently, a hidden dependency. ` +
+				`If the work matched the plan, omit learnings.`,
+		};
+	}
+
+	// Handoff gate, deliberately the same shape as the resolution gate above.
+	// Optional fields get skipped by models, and a closed story whose context
+	// died with the conversation is the gap this closes.
+	if (!input.handoffNotes?.trim()) {
+		return {
+			ok: false,
+			code: "handoff_notes required",
+			message:
+				`Cannot mark done: handoff_notes required.\n` +
+				`Write what the next person needs to pick up from here — where the work lives, what was not ` +
+				`obvious, what you deliberately left undone. Unlike learnings, every story should have one, and ` +
+				`it is written for a reader who has not seen this conversation.`,
+		};
+	}
+
+	// Work review gate. Epics are exempt: they carry no commit of their own and
+	// close automatically, so there is no diff to review.
+	const workReview = story.review.work;
+	if (!input.isEpic && workReview?.verdict !== "approved") {
+		return {
+			ok: false,
+			code: "work not approved",
+			message: workReview
+				? `Cannot close #${story.id}: its work review requested changes (by ${workReview.by}).\n${workReview.findings}\n\nAddress them, then run review_work again.`
+				: `Cannot close #${story.id}: its work has not been reviewed.\nRun story{action:"review_work", story_id:${story.id}} first — call it with no verdict to see the findings.`,
+			details: { review: workReview ?? null },
+		};
+	}
+
+	if (input.unmet.length > 0) {
+		return {
+			ok: false,
+			code: "unmet dependencies",
+			message: `Cannot mark done: dependencies not done — ${input.unmet.map((id) => `#${id}`).join(", ")}`,
+			details: { unmet: input.unmet },
+		};
+	}
+
+	if (input.openChildren.length > 0) {
+		return {
+			ok: false,
+			code: "open children",
+			message: `Cannot mark done: epic #${story.id} still has open children — ${input.openChildren.map((s) => `#${s.id}`).join(", ")}. They close it automatically when they are all done.`,
+			details: { open: input.openChildren.map((s) => s.id) },
+		};
+	}
+
 	return { ok: true };
 }
 

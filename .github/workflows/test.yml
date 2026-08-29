@@ -51,7 +51,8 @@ jobs:
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
         # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -97,7 +98,8 @@ jobs:
       # Adding a Python extension: one entry here, alongside the two in the
       # matrices above. Only packages with a py/ directory belong in it.
       matrix:
-        pkg: [pi-notebook-py]
+        # pkg: [pi-notebook-py]
+        pkg: [pi-issue-tracker] 
     steps:
       - uses: actions/checkout@v4
       # An exact version, unlike the actions/* above: astral-sh publishes no
@@ -119,7 +121,8 @@ jobs:
       fail-fast: false
       matrix:
         # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -164,7 +167,8 @@ jobs:
       # matrix:
       #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
       matrix:
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# The only tier that reaches extensions/index.ts at all.
+# The only tier that reaches extensions/ at all.
 #
-# Everything in that file hangs off a pi runtime — registerTool, the turn_end
-# checkpoint, the tool_call branch guard — so none of it can be exercised without
-# starting pi and letting it talk to a model. That makes this suite slow,
-# non-deterministic and not free, which is why it runs last. It is still the only
-# evidence that the extension does anything at all inside the image.
+# Registration hangs off a pi runtime — registerTool, the turn_end checkpoint,
+# the tool_call branch guard — so none of it can be exercised without starting pi
+# and letting it talk to a model. That makes this suite slow, non-deterministic
+# and not free, which is why it runs last. It is still the only evidence that the
+# extension does anything at all inside the image.
+#
+# What each registration *does* now lives in src/ and is covered for free by
+# `npm test`, so what this tier proves is the wiring: that pi loads the file, that
+# the tool and its hooks are reachable, and that a real model can drive them.
 #
 # Assertions deliberately target durable state — rows in stories.db, refs, the
 # contents of .git/info/exclude — rather than assistant prose, which varies run
