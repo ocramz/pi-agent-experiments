@@ -192,6 +192,72 @@ test("an explicit kill is not reported as lost state", async (t) => {
 	assert.equal(k.lostState, false);
 });
 
+test("a module written to the working directory is importable from a cell", async (t) => {
+	const { k, dir } = kernelIn(t);
+	writeFileSync(join(dir, "helper.py"), "def f():\n    return 1\n");
+	const resp = await k.call({ tool: "eval", src: "import helper; helper.f()" });
+	assert.equal(resp.ok, true);
+	assert.equal(resp.value, "1");
+});
+
+test("restartProcess re-reads a module the notebook already imported", async (t) => {
+	const { k, dir } = kernelIn(t);
+	const helper = join(dir, "helper.py");
+	writeFileSync(helper, "def f():\n    return 1\n");
+	await k.call({ tool: "add_cell", src: "import helper" });
+	await k.call({ tool: "add_cell", src: "helper.f()" });
+
+	// The edit an agent makes between two runs. Resetting the namespace would
+	// not touch sys.modules, so `helper` would still answer 1.
+	//
+	// The replacement is deliberately a different length. A source file
+	// rewritten in the same second as its `__pycache__` entry and to exactly
+	// the same size passes CPython's (mtime, size) check and loads stale
+	// bytecode — everywhere, not just here (see semantics.md 3.9). Writing a
+	// same-length body would test that, not this.
+	writeFileSync(helper, "def f():\n    return 22\n");
+	assert.equal((await k.restartProcess()).ok, true);
+
+	const rerun = (await k.call({ tool: "run_all", restart: false })) as RunResponse;
+	assert.equal(rerun.results?.[1].value, "22");
+});
+
+test("a restart keeps the cells and their ids, and is not a lost state", async (t) => {
+	const { k } = kernelIn(t);
+	await k.call({ tool: "add_cell", src: "a = 1" });
+	await k.call({ tool: "add_cell", src: "a + 1" });
+
+	const resp = (await k.restartProcess()) as RunResponse;
+	assert.equal(resp.ok, true);
+	// The process was replaced deliberately, so the caller is not told it
+	// lost anything it did not ask to lose.
+	assert.equal(k.lostState, false);
+	assert.deepEqual(resp.unrun, ["c1", "c2"]);
+
+	const listed = (await k.call({ tool: "inspect" })) as InspectResponse;
+	assert.deepEqual(
+		listed.cells?.map((c) => c.id),
+		["c1", "c2"],
+	);
+	// And the namespace really is gone.
+	assert.equal((await k.call({ tool: "eval", src: "'a' in dir()" })).value, "False");
+});
+
+test("restarting a kernel that never spawned leaves its checkpoint alone", async (t) => {
+	const { k, dir } = kernelIn(t);
+	await k.call({ tool: "add_cell", src: "a = 1" });
+	await k.saveCheckpoint();
+	const written = readFileSync(k.checkpoint, "utf8");
+
+	// A new session on the same notebook has an empty in-process notebook and
+	// a full file. Checkpointing before the kill would write the empty one
+	// over the full one, which is the opposite of what a restart is for.
+	const fresh = new Kernel(undefined, dir, { env: envIn(dir) });
+	t.after(() => fresh.kill());
+	assert.equal((await fresh.restartProcess()).ok, true);
+	assert.equal(readFileSync(fresh.checkpoint, "utf8"), written);
+});
+
 test("save and open round-trip through the wire", async (t) => {
 	const { k, dir } = kernelIn(t);
 	const path = join(dir, "nb.py");

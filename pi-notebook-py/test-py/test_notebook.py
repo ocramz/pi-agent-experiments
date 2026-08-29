@@ -7,14 +7,17 @@ No third-party packages required.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
+import protocol  # noqa: E402
 from nbkernel import CellNotFound, Notebook, NotebookError, brief  # noqa: E402
-from protocol import handle  # noqa: E402
+from protocol import bootstrap_path, handle, install  # noqa: E402
 
 
 def notebook(*sources: str) -> Notebook:
@@ -383,6 +386,109 @@ class TestProtocol(unittest.TestCase):
         response = self.call(tool="load", path="/nonexistent/nb.py")
         self.assertFalse(response["ok"])
         self.assertNotIn("internal", response)
+
+
+class TestInstall(unittest.TestCase):
+    """Which specifiers `restart_required` recognises, without a package index.
+
+    `install` shells out to real pip, so these stub `_pip` and seed
+    `sys.modules` by hand: what is under test is the mapping from a
+    requirement to the module it would be imported as, and pip has no part
+    in that. The module name is a nonsense one so a case cannot collide with
+    something the test runner has genuinely imported.
+    """
+
+    def setUp(self):
+        saved = protocol._pip
+        self.addCleanup(setattr, protocol, "_pip", saved)
+        self.pip(0)
+
+    def pip(self, returncode, stderr=""):
+        """Stand pip down to a fixed result."""
+        done = subprocess.CompletedProcess([], returncode, stdout="", stderr=stderr)
+        protocol._pip = lambda *args: done
+
+    def imported(self, name):
+        """A module under `name`, for the duration of one case."""
+        sys.modules[name] = types.ModuleType(name)
+        self.addCleanup(sys.modules.pop, name, None)
+
+    def restart_required(self, *packages):
+        response = install(Notebook(), *packages)
+        self.assertTrue(response["ok"], response.get("error"))
+        return response["restart_required"]
+
+    def test_a_bare_name_is_matched(self):
+        self.imported("crumhorn")
+        self.assertEqual(self.restart_required("crumhorn"), ["crumhorn"])
+
+    def test_every_version_operator_is_stripped(self):
+        # Not just `==`. An operator left in the key was never in
+        # sys.modules, so the response said nothing needed a restart while
+        # the old code was still live — the one thing it exists to prevent.
+        self.imported("crumhorn")
+        for spec in ("crumhorn==2",
+                     "crumhorn>=2",
+                     "crumhorn~=2.0", "crumhorn!=1.5", "crumhorn >2"):
+            with self.subTest(spec=spec):
+                self.assertEqual(self.restart_required(spec), ["crumhorn"])
+
+    def test_extras_and_markers_are_stripped(self):
+        self.imported("crumhorn")
+        self.assertEqual(
+            self.restart_required('crumhorn[all]>=2 ; python_version<"3.13"'),
+            ["crumhorn"],
+        )
+
+    def test_a_dash_becomes_an_underscore(self):
+        self.imported("crum_horn")
+        self.assertEqual(self.restart_required("crum-horn"), ["crum_horn"])
+
+    def test_a_package_that_was_never_imported_is_absent(self):
+        self.assertEqual(self.restart_required("crumhorn>=2"), [])
+
+    def test_the_specifiers_come_back_as_they_were_given(self):
+        response = install(Notebook(), "crumhorn>=2", "shawm")
+        self.assertEqual(response["installed"], ["crumhorn>=2", "shawm"])
+
+    def test_a_failing_pip_reports_its_stderr_and_no_cell_state(self):
+        self.pip(1, stderr="  no matching distribution\n")
+        response = install(Notebook(), "crumhorn")
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"], "no matching distribution")
+        self.assertNotIn("restart_required", response)
+
+
+class TestBootstrapPath(unittest.TestCase):
+    """`__main__` only calls this, so the cases drive it directly.
+
+    Each restores sys.path: the kernel mutates the interpreter it is about
+    to serve from, whereas here it is the test runner's own.
+    """
+
+    def setUp(self):
+        saved = list(sys.path)
+        self.addCleanup(lambda: sys.path.__setitem__(slice(None), saved))
+
+    def test_puts_the_directory_first(self):
+        # First, not appended: a project's own module has to win, which is
+        # the whole point and also where the shadowing cost comes from.
+        bootstrap_path("/somewhere/project")
+        self.assertEqual(sys.path[0], "/somewhere/project")
+
+    def test_defaults_to_the_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            here = os.getcwd()
+            os.chdir(directory)
+            self.addCleanup(os.chdir, here)
+            bootstrap_path()
+            # macOS hands out /var -> /private/var, so compare resolved.
+            self.assertEqual(os.path.realpath(sys.path[0]), os.path.realpath(directory))
+
+    def test_is_idempotent(self):
+        bootstrap_path("/somewhere/project")
+        bootstrap_path("/somewhere/project")
+        self.assertEqual(sys.path.count("/somewhere/project"), 1)
 
 
 if __name__ == "__main__":

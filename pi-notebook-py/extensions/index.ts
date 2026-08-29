@@ -49,6 +49,15 @@ const LOST_STATE_NOTE =
 	"\n\nNOTE: the kernel process was restarted; all Python state was lost. " +
 	'Every cell is unrun — nb_run {op: "all"} to rebuild.';
 
+/**
+ * A restart replaces the interpreter, not just the namespace — which is the
+ * whole reason to reach for it after editing a file the notebook imports,
+ * and is not something the cell listing above it can show.
+ */
+const RESTART_NOTE =
+	"\n\nNOTE: the interpreter process was replaced, so sys.modules is empty too: " +
+	"a project file that was imported before this will be read fresh on the next import.";
+
 /** A switch is a deliberate loss, and reads as a fault unless it says so. */
 const SWITCH_NOTE =
 	"\n\nNOTE: this is a different notebook, so the namespace is empty and every " +
@@ -116,13 +125,7 @@ export default function (pi: ExtensionAPI) {
 	 * not count as a mutation, and it must not autosave itself.
 	 */
 	async function checkpoint(): Promise<void> {
-		await kernel.call({
-			tool: "save",
-			path: kernel.checkpoint,
-			overwrite: true,
-			remember: false,
-			notebook: kernel.notebook,
-		});
+		await kernel.saveCheckpoint();
 	}
 
 	async function call(req: Record<string, unknown>): Promise<KernelResponse> {
@@ -164,10 +167,15 @@ export default function (pi: ExtensionAPI) {
 	type CellImages = { mime: string; b64: string }[];
 
 	/** The common tail of every tool that runs cells. */
-	function runReply(resp: KernelResponse, preamble = "") {
+	function runReply(resp: KernelResponse, preamble = "", postamble = "") {
 		const response = resp as RunResponse;
 		const note = (resp as Record<string, unknown>)._lostState ? LOST_STATE_NOTE : "";
-		return reply(preamble + formatRun(response) + note, "nb.run", response, imagesOf(response));
+		return reply(
+			preamble + formatRun(response) + note + postamble,
+			"nb.run",
+			response,
+			imagesOf(response),
+		);
 	}
 
 	/**
@@ -209,6 +217,22 @@ export default function (pi: ExtensionAPI) {
 		return `${head}\n${formatRun(loaded as RunResponse)}${SWITCH_NOTE}`;
 	}
 
+	/**
+	 * A restart, and the bookkeeping that goes with one.
+	 *
+	 * `Kernel.restartProcess` does the work — it replaces the interpreter
+	 * rather than just the namespace, which is what makes an edited project
+	 * file get re-read. What belongs out here is the generation counter: the
+	 * namespace every earlier result described is gone, so those results are
+	 * superseded, exactly as after a notebook switch.
+	 */
+	async function hardRestart(): Promise<KernelResponse> {
+		const resp = await kernel.restartProcess();
+		gen++;
+		mut++;
+		return resp;
+	}
+
 	// ── nb_cell: write a cell ───────────────────────────────────────
 	pi.registerTool({
 		name: "nb_cell",
@@ -230,7 +254,8 @@ export default function (pi: ExtensionAPI) {
 			"In nb_cell, a cell whose last line is an expression displays that value; use that to show a result. print() also works and its output is captured, but the trailing expression also prints a summary or a value's shape.",
 			"nb_cell reports `stale` cells: ones that ran before something above them changed. Their variables are still in the namespace but the notebook no longer reproduces them — re-run with nb_run before trusting those values.",
 			"Editing a cell with nb_cell discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.",
-			"On ImportError, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.",
+			"On ImportError in nb_cell, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.",
+			'The nb_cell kernel runs in the project directory and that directory is on sys.path, so a module you write there can be imported from a notebook cell. After editing such a file, run `nb_notebook {op: "restart"}` before importing.',
 		],
 		parameters: Type.Object({
 			id: Type.Optional(
@@ -281,12 +306,12 @@ export default function (pi: ExtensionAPI) {
 		label: "Notebook Run",
 		description:
 			"Execute cells that already exist. Ops: cell (just that one), all (every cell from the " +
-			"top, into a fresh namespace by default — the Restart & Run All button), above (every " +
+			"top, into a fresh interpreter by default — the Restart & Run All button), above (every " +
 			"cell before the given one), below (the given cell and everything after it). A run stops " +
 			"at the first cell that raises.",
 		promptSnippet: "run one notebook cell, everything, or everything above or below a cell.",
 		promptGuidelines: [
-			'`nb_run {op: "all"}` restarts the namespace and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces.',
+			'`nb_run {op: "all"}` restarts the interpreter and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces — including re-importing any project file that changed on disk.',
 			'After editing a cell in the middle, `nb_run {op: "below", id: <that cell>}` is usually what you want: it re-runs the edited cell and everything that could depend on it, without redoing the expensive setup above.',
 		],
 		parameters: Type.Object({
@@ -309,7 +334,15 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params) {
 			if (params.op === "all") {
-				return runReply(await call({ tool: "run_all", restart: params.restart ?? true }));
+				// The restart is done out here rather than passed down, so that
+				// "into a fresh namespace" means a fresh interpreter: a run that
+				// replays over a stale imported module proves nothing about
+				// whether the notebook reproduces.
+				if (params.restart ?? true) {
+					const restarted = await hardRestart();
+					if (!restarted.ok) return runReply(restarted);
+				}
+				return runReply(await call({ tool: "run_all", restart: false }));
 			}
 			if (!params.id) return reply(`Error: id required for op ${params.op}`, "nb.error");
 			const tool = { cell: "run_cell", above: "run_above", below: "run_below" }[params.op];
@@ -323,8 +356,9 @@ export default function (pi: ExtensionAPI) {
 		label: "Notebook",
 		description:
 			"Inspect and manage the notebook itself. Ops: list (every cell with its state — cheap, use " +
-			"it to orient), read (full source of one cell or all), delete, move, restart (throw the " +
-			"namespace away), save (export to a percent-format .py), open (read one back), " +
+			"it to orient), read (full source of one cell or all), delete, move, restart (replace the " +
+			"interpreter — the namespace and every imported module go, the cells stay), " +
+			"save (export to a percent-format .py), open (read one back), " +
 			"notebooks (every notebook in this project), new (start a fresh one under a name), use " +
 			"(switch to an existing one). " +
 			"Each notebook has its own interpreter and its own installed packages, and is checkpointed " +
@@ -334,9 +368,9 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "list, read, delete, move, restart, save, open, or switch between notebooks.",
 		promptGuidelines: [
 			'Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.',
-			'Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv, so conflicting versions cannot collide. Switching is not free — it discards the current namespace — so do not switch to organise cells.',
-			'`nb_notebook {op: "save"}` exports a percent-format .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.',
-			'Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need the namespace to match the notebook.',
+			'Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv. NB: Switching venv discards the current namespace.',
+			'`nb_notebook {op: "save"}` exports a .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.',
+			'Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need to refresh the namespace.',
 		],
 		parameters: Type.Object({
 			op: Type.Union(
@@ -391,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 					if (!params.id) return reply("Error: id required for move", "nb.error");
 					return runReply(await call({ tool: "move_cell", id: params.id, after: params.after }));
 				case "restart":
-					return runReply(await call({ tool: "restart" }));
+					return runReply(await hardRestart(), "", RESTART_NOTE);
 				case "save":
 					if (!params.path) return reply("Error: path required for save", "nb.error");
 					return runReply(
@@ -446,9 +480,16 @@ export default function (pi: ExtensionAPI) {
 			"Install Python packages INTO the notebook kernel's interpreter. Use this instead of pip " +
 			"or uv in bash, which install somewhere the kernel is not looking. Each notebook has its " +
 			"own environment, so this affects only the notebook the session is on. A package that was " +
-			"already imported keeps its old code until the namespace is restarted; the result says so " +
-			"when that happens.",
+			"already imported keeps its old code until the interpreter is restarted; the result says so " +
+			'when that happens, and `nb_notebook {op: "restart"}` is what clears it.',
 		promptSnippet: "pip-install packages into the notebook kernel's own interpreter.",
+		promptGuidelines: [
+			"Give nb_install all packages in one call, so pip can resolve the whole set together.",
+			'When nb_install raises a version conflict, creating a fresh environment with `nb_notebook {op: "new", name}` can be a quick fix.',
+			// The remedy named here is the one `formatRun` prints at the moment it
+			// happens, so the guideline and the tool result cannot disagree.
+			'An nb_install disturbs no cell: nothing becomes `stale` and the namespace is untouched, so there is nothing to re-run afterwards — unless the result names a package that was already imported, which keeps its old code until `nb_run {op: "all"}`.',
+		],
 		parameters: Type.Object({
 			packages: Type.Array(Type.String(), {
 				description: 'Package specifiers, e.g. ["pandas", "matplotlib==3.9.2"].',
@@ -531,7 +572,15 @@ export default function (pi: ExtensionAPI) {
 				notify(formatNotebooks(listNotebooks(cwd), kernel.notebook));
 				return;
 			}
-			if (input === "run-all") return show(await call({ tool: "run_all" }));
+			// The same restart nb_run does, for the same reason: a run-all that
+			// replayed over a stale imported module would be the one command
+			// that is supposed to prove the notebook reproduces, quietly not
+			// proving it. The human's surface gets the guarantee too.
+			if (input === "run-all") {
+				const restarted = await hardRestart();
+				if (!restarted.ok) return show(restarted);
+				return show(await call({ tool: "run_all", restart: false }));
+			}
 
 			const switching = input.match(/^(new|use)\s+(\S+)$/);
 			if (switching) {

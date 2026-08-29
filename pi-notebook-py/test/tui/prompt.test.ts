@@ -71,8 +71,8 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// point: an unattributed guideline cannot reach the model quietly.
 	assert.equal(
 		bullets.length,
-		11,
-		`expected 11 extension guidelines (5 on nb_cell, 2 on nb_run, 4 on nb_notebook), got ${bullets.length}.\n` +
+		15,
+		`expected 15 extension guidelines (6 on nb_cell, 2 on nb_run, 4 on nb_notebook, 3 on nb_install), got ${bullets.length}.\n` +
 			"A guideline that names none of the nb_* tools is invisible to this filter — and to the model.\n" +
 			bullets.join("\n"),
 	);
@@ -96,6 +96,9 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 		["save stores no outputs", '`nb_notebook {op: "save"}`', /no outputs/],
 		["a new notebook is how you get a separate environment", '`nb_notebook {op: "new", name}`', /own venv/],
 		["deleting a cell does not retract its globals", /nb_notebook/, /does NOT remove/],
+		["one nb_install call for the whole set", /nb_install/, /one call/],
+		["a conflict is answered with a new notebook", /nb_install/, '`nb_notebook {op: "new", name}`'],
+		["an install disturbs no cell", /nb_install/, /disturbs no cell/, /namespace is untouched/],
 	];
 
 	for (const [rule, ...needles] of anchors) {

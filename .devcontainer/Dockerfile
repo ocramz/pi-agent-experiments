@@ -13,19 +13,29 @@ FROM ${PY_IMAGE} AS py
 
 FROM ${BASE}
 
-# The nested engine. slirp4netns gives each inner test container its own network
+# Dependencies for running podman-in-podman. 
+# slirp4netns gives each inner test container its own network
 # namespace with egress — the live suite calls a model API, so a no-network
 # default is not an option. fuse-overlayfs and uidmap are fallback paths; see the
 # Makefile comment on --device /dev/fuse.
-# The last two are for the interactive tier, and neither is incidental.
+# util-linux and procps are for the interactive tier.
 # util-linux provides `script(1)`, the pty test/tui/ runs pi inside — without it
 # every case lands pi in print mode, where slash commands are never parsed.
 # procps provides `ps`, which cli-testing-library's cleanup shells out to through
 # tree-kill; without it a failed case cannot reap its pi process.
+# fd-find: pi's startup awaits `ensureTool("fd")` before it will
+# accept a command, and with no fd on PATH that is a GitHub release download on
+# every run — this image is disposable, so nothing caches it — which the first
+# session in each test file then races. The base already carries ripgrep, which
+# is why fd was the only one ever downloaded and the only one installed here.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      podman slirp4netns fuse-overlayfs uidmap ca-certificates util-linux procps \
+      podman slirp4netns fuse-overlayfs uidmap ca-certificates util-linux procps fd-find \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Debian names the binary `fdfind`. pi looks for that name too, so this is not
+# what makes the above work — it is so anything else reaching for `fd` finds it.
+RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
 # Six of pi-incremental-py's unit cases spawn a real interpreter and all six of
 # its /py TUI cases drive a live kernel, so without this `make test` and

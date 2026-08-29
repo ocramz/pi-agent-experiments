@@ -39,11 +39,15 @@ import stripAnsi from "strip-ansi";
 
 const PI_BIN = process.env.PI_BIN ?? "pi";
 
-// Shared across the whole run, and across runs on the same machine. pi
-// downloads `fd` into this directory the first time it starts; a per-test
-// directory would pay for that download in every single case. Setting it also
-// suppresses pi's first-time-setup wizard, which would otherwise sit waiting for
-// a theme choice that nobody is there to make.
+// Shared across the whole run. pi downloads `fd` into this directory the first
+// time it starts; a per-test directory would pay for that download in every
+// single case. Setting it also suppresses pi's first-time-setup wizard, which
+// would otherwise sit waiting for a theme choice that nobody is there to make.
+//
+// Not shared across runs, though: `make test-tui` is a `podman run --rm`, and
+// this directory goes with the container. The download is therefore paid once
+// per *run*, by whichever session starts first in each test file — which is the
+// race `STARTED` below closes. The dev image carries fd so it never runs at all.
 export const AGENT_DIR = process.env.PI_TUI_AGENT_DIR ?? join(tmpdir(), "pi-tui-agent");
 
 /**
@@ -88,8 +92,30 @@ export function sessionFilesFor(cwd: string): string[] {
 // hide a hang. Live cases raise it per call.
 configure({ asyncUtilTimeout: 30_000 });
 
-/** pi's footer hint. Present once the TUI has painted and is taking input. */
+/** pi's footer hint. Present once the TUI has painted. */
 const READY = "ctrl+o more";
+
+/**
+ * The loaded-resources panel. Present once pi will actually *run* what is typed.
+ *
+ * pi's `init()` paints the footer, then awaits `ensureTool("fd")` and
+ * `ensureTool("rg")` — a GitHub release download for whichever is not already on
+ * PATH — and only then swaps `handleStartupSubmit` for the real submit handler.
+ * Until that swap every submit is answered with `STARTUP_BUSY` and the text is
+ * pushed back into the editor. So the footer means "the TUI painted", not "pi is
+ * taking commands", and a harness that waits only for it is racing a download.
+ *
+ * This is the first thing pi prints on the far side of that swap:
+ * `showLoadedResources` runs at the end of `bindCurrentSessionExtensions`, which
+ * is after `setupEditorSubmitHandler`. Seeing it proves both that the handler is
+ * live and that the extension under test has registered its commands. It always
+ * appears here — `startPi` takes at least one `-e`, and pi lists loaded
+ * extensions unless `quietStartup` is set, which defaults to false.
+ */
+const STARTED = "[Extensions]";
+
+/** pi's answer to a submit that arrived before the real handler was installed. */
+const STARTUP_BUSY = "Startup is still in progress";
 
 export interface PiSession {
 	dir: string;
@@ -223,6 +249,15 @@ export async function startPi(
 			await settle(400);
 			await pi.userEvent.keyboard("[Enter]");
 			await settle(300);
+			// `startPi` waits for STARTED so this cannot happen. If it ever does,
+			// say so here: the swallowed command leaves no trace of its own, and the
+			// failure would otherwise surface 30s later as an assertion about output
+			// that was never going to arrive.
+			assert.ok(
+				!screen().includes(normalise(STARTUP_BUSY)),
+				`pi swallowed ${JSON.stringify(text)}: it was submitted before startup finished, which the ` +
+					`${JSON.stringify(STARTED)} wait in startPi is supposed to prevent.\n\nlast output:\n${screen().slice(-2000)}`,
+			);
 		},
 		async press(keys, options = {}) {
 			pi.clear();
@@ -275,6 +310,11 @@ export async function startPi(
 	});
 
 	await expect(READY, { timeout: 60_000 });
+	// Long, because this is where a cold `ensureTool` is waited out: 10s for the
+	// GitHub API and up to 120s per download. Still nowhere near unbounded — a pi
+	// that never finishes starting fails here with what it last printed, rather
+	// than in whichever assertion the swallowed first command was about.
+	await expect(STARTED, { timeout: 180_000 });
 	await settle(500);
 	pi.clear();
 	return s;

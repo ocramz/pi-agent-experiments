@@ -51,7 +51,7 @@ kernel exists to report.
 | Tool | What it does |
 |---|---|
 | `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing; `kind: "markdown"` makes a prose cell, which is never executed. |
-| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh namespace (Restart & Run All) — `restart: false` replays over the current one instead. |
+| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh interpreter (Restart & Run All) — `restart: false` replays over the current one instead. |
 | `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open` (`run: true` to run every cell after loading), and the notebook-level `notebooks`, `new`, `use`. |
 | `nb_install` | pip, into the interpreter the kernel is actually running. |
 
@@ -155,6 +155,15 @@ a notebook that never plots pays nothing, and the kernel stays stdlib-only. The 
 spawned with `MPLBACKEND=Agg`, unless the environment already sets one, so a headless import cannot
 reach for a display. Four images per cell and about 1 MB each; over that, one downscale attempt and
 then a note saying what was dropped.
+
+## The project directory is importable
+
+The kernel runs in the project directory and puts it on `sys.path`, as Jupyter does, so long or
+reusable code can go in a `.py` file next to the notebook and be imported from a small cell. Editing
+that file afterwards needs `nb_notebook {op: "restart"}`: `import` is a `sys.modules` hit, so a
+restart here replaces the interpreter rather than just resetting the namespace — the cells survive,
+by way of the checkpoint. Same caveat as Jupyter for the path order: a project file named `io.py`
+shadows the stdlib one. See [docs/semantics.md](docs/semantics.md) §3.9.
 
 ## Install
 

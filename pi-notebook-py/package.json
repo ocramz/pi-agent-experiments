@@ -1,6 +1,6 @@
 {
 	"name": "@ocramz/pi-notebook-py",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "A Jupyter-shaped Python notebook for the pi agent: an ordered list of cells over one persistent namespace, with staleness hints, percent-format persistence and plots the model can see.",
 	"keywords": [
 		"pi-package",

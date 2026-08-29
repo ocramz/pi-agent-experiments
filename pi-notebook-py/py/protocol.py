@@ -17,13 +17,15 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict
 
 from nbkernel import CellNotFound, Notebook, NotebookError, Output
 
-__all__ = ["handle", "install", "serve"]
+__all__ = ["bootstrap_path", "handle", "install", "serve"]
 
 # PEP 668 marks Debian/Ubuntu interpreters as externally managed; inside a
 # venv the flag is neither needed nor always accepted.
@@ -45,6 +47,23 @@ def _pip(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+# A requirement's project name is the leading run before any extras, version
+# specifier or environment marker: `pandas[all]>=2 ; python_version<"3.13"`
+# → `pandas`. A direct reference (`pandas @ https://…`) puts the name first too.
+_PROJECT_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _import_name(spec: str) -> str:
+    """The module `spec` will most likely be imported as.
+
+    Best effort by construction: a distribution whose import name differs from
+    its project name (scikit-learn → sklearn) is not knowable from the
+    specifier, so `restart_required` under-reports rather than lying.
+    """
+    found = _PROJECT_NAME.match(spec.strip())
+    return (found.group(0) if found else spec).replace("-", "_")
+
+
 def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
     """Install into the kernel's own interpreter."""
     proc = _pip("install", *PIP_FLAGS, *(["-U"] if upgrade else []), *packages)
@@ -57,10 +76,7 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
 
     # Already-imported modules keep their old code: `import x` is a
     # sys.modules hit, and reload() is unsound for C extensions.
-    loaded = sorted(
-        {p.split("==")[0].split("[")[0].replace("-", "_") for p in packages}
-        & set(sys.modules)
-    )
+    loaded = sorted({_import_name(p) for p in packages} & set(sys.modules))
     return _response(nb, [], installed=list(packages), restart_required=loaded)
 
 
@@ -196,5 +212,27 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, nb: Notebook | None = None) -> Non
         print(json.dumps(handle(nb, json.loads(line))), file=stdout, flush=True)
 
 
+def bootstrap_path(cwd: str | None = None) -> None:
+    """Make the working directory importable, as ipykernel does.
+
+    The kernel is spawned as `python <pkg>/py/protocol.py`, and for a script
+    path CPython puts the *script's* directory on sys.path[0] — `''` is only
+    prepended for -c, -m and interactive mode. So without this a project's
+    own modules are the one thing a notebook sitting in that project cannot
+    import, which makes "write a helper, use it from a cell" fail.
+
+    Index 0, matching Jupyter, and with Jupyter's consequence: a project file
+    named `io.py` shadows the stdlib one. That is the user's own directory
+    behaving the way Python says directories on the path behave.
+
+    Called from `__main__` rather than from serve(): the tests drive serve()
+    in-process, where mutating sys.path would leak into the test runner.
+    """
+    entry = os.getcwd() if cwd is None else cwd
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
 if __name__ == "__main__":  # `--serve` is accepted for compatibility
+    bootstrap_path()
     serve()
