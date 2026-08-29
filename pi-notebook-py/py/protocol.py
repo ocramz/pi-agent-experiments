@@ -18,6 +18,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict
@@ -46,6 +47,23 @@ def _pip(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+# A requirement's project name is the leading run before any extras, version
+# specifier or environment marker: `pandas[all]>=2 ; python_version<"3.13"`
+# → `pandas`. A direct reference (`pandas @ https://…`) puts the name first too.
+_PROJECT_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _import_name(spec: str) -> str:
+    """The module `spec` will most likely be imported as.
+
+    Best effort by construction: a distribution whose import name differs from
+    its project name (scikit-learn → sklearn) is not knowable from the
+    specifier, so `restart_required` under-reports rather than lying.
+    """
+    found = _PROJECT_NAME.match(spec.strip())
+    return (found.group(0) if found else spec).replace("-", "_")
+
+
 def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
     """Install into the kernel's own interpreter."""
     proc = _pip("install", *PIP_FLAGS, *(["-U"] if upgrade else []), *packages)
@@ -58,10 +76,7 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
 
     # Already-imported modules keep their old code: `import x` is a
     # sys.modules hit, and reload() is unsound for C extensions.
-    loaded = sorted(
-        {p.split("==")[0].split("[")[0].replace("-", "_") for p in packages}
-        & set(sys.modules)
-    )
+    loaded = sorted({_import_name(p) for p in packages} & set(sys.modules))
     return _response(nb, [], installed=list(packages), restart_required=loaded)
 
 

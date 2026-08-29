@@ -483,6 +483,13 @@ export default function (pi: ExtensionAPI) {
 			"already imported keeps its old code until the interpreter is restarted; the result says so " +
 			'when that happens, and `nb_notebook {op: "restart"}` is what clears it.',
 		promptSnippet: "pip-install packages into the notebook kernel's own interpreter.",
+		promptGuidelines: [
+			"Give nb_install all packages in one call, so pip can resolve the whole set together.",
+			'When nb_install raises a version conflict, creating a fresh environment with `nb_notebook {op: "new", name}` can be a quick fix.',
+			// The remedy named here is the one `formatRun` prints at the moment it
+			// happens, so the guideline and the tool result cannot disagree.
+			'An nb_install disturbs no cell: nothing becomes `stale` and the namespace is untouched, so there is nothing to re-run afterwards — unless the result names a package that was already imported, which keeps its old code until `nb_run {op: "all"}`.',
+		],
 		parameters: Type.Object({
 			packages: Type.Array(Type.String(), {
 				description: 'Package specifiers, e.g. ["pandas", "matplotlib==3.9.2"].',
