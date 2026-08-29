@@ -14,7 +14,7 @@ Cells may return image data, which may be fed to vision-capable models.
   nb_cell   df.describe()
             * [3] c3 12.4ms  DataFrame(8, 4)
   nb_cell   df.total.hist()
-            * [4] c4 240.1ms  Axes(1,)
+            * [4] c4 240.1ms  <Axes: >
               [attached: image/png]          <- the model sees the histogram
   nb_notebook save ./analysis.py
             saved 4 cell(s) to ./analysis.py
@@ -26,17 +26,17 @@ Every response shows which cells may have stale results:
 
 ```
 * [7] c2 1.2ms  15
+failing: c6
 stale (a cell above them changed since they ran): c3, c4 — nb_run {op: "all"} to bring the
 notebook back in step
 unrun: c5
-failing: c6
 ```
 
 | | |
 |---|---|
-| **unrun** | never executed since it was created, edited, or restarted |
-| **stale** | has run, but a cell above it has changed, run, or moved since |
 | **failing** | its last run raised |
+| **stale** | has run, but a cell above it has changed, run, or moved since |
+| **unrun** | never executed since it was created, edited, or restarted |
 
 The kernel never re-runs anything on its own — deciding is the agent's job. Two properties make the
 report trustworthy, and both are pinned as tests: after `nb_run {op: "all"}` nothing is stale, and
@@ -50,9 +50,9 @@ kernel exists to report.
 
 | Tool | What it does |
 |---|---|
-| `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing. |
-| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh namespace (Restart & Run All) |
-| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open`, and the notebook-level `notebooks`, `new`, `use`. |
+| `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing; `kind: "markdown"` makes a prose cell, which is never executed. |
+| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh namespace (Restart & Run All) — `restart: false` replays over the current one instead. |
+| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open` (`run: true` to run every cell after loading), and the notebook-level `notebooks`, `new`, `use`. |
 | `nb_install` | pip, into the interpreter the kernel is actually running. |
 
 And two slash commands, so the human shares the same namespace:
@@ -152,8 +152,9 @@ the inline backend consumes them on display; failing that, it tries the display 
 
 matplotlib is never imported by the kernel — `py/nbkernel/display.py` only reads `sys.modules`, so
 a notebook that never plots pays nothing, and the kernel stays stdlib-only. The subprocess is
-spawned with `MPLBACKEND=Agg` so a headless import cannot reach for a display. Four images per cell
-and about 1 MB each; over that, one downscale attempt and then a note saying what was dropped.
+spawned with `MPLBACKEND=Agg`, unless the environment already sets one, so a headless import cannot
+reach for a display. Four images per cell and about 1 MB each; over that, one downscale attempt and
+then a note saying what was dropped.
 
 ## Install
 
@@ -186,6 +187,9 @@ Everything else is optional, under `notebookPy` in `.pi/settings.json`:
 }
 ```
 
+`default` names the notebook a session opens on — the one called `default`, when the key is absent.
+`PI_NOTEBOOK` overrides it, which is how a container or a CI job picks one without editing the
+project's settings.
 `PI_NOTEBOOK_VENV_ROOT` overrides `venvRoot`, and `PI_NOTEBOOK_HOME` moves the venvs and the pins
 together. If a `venvRoot` ends up inside the repository, the pattern is appended to
 `.git/info/exclude` — repo-local, untracked, in nobody's diff — so the guarantee above survives the

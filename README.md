@@ -7,7 +7,7 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 |---|---|
 | [pi-issue-tracker/](pi-issue-tracker/) | Turns goals into linked, tracked user stories in a project-local SQLite database |
 | [pi-incremental-py/](pi-incremental-py/) | An incremental computing kernel for Python, plus the pi extension that drives it |
-| [pi-notebook-py/](pi-notebook-py/) | The same idea with Jupyter's semantics: an ordered list of cells over one namespace, with staleness hints, percent-format files and plots the model can see |
+| [pi-notebook-py/](pi-notebook-py/) | A Jupyter-like Python kernel : an ordered list of cells over one namespace, with staleness hints, and image output for multimodal agents |
 | [pi-web-search/](pi-web-search/) | Web search as agent tools, one per backend, normalised into a shared result shape (first backend: Tavily) |
 | [shared/](shared/) | Version pins, the tsconfig base, and the shell + pty test harnesses |
 
