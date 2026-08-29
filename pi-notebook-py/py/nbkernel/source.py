@@ -116,10 +116,10 @@ def _parse_header(rest: str) -> tuple[str, str | None]:
     nothing about what the cell computes.
     """
     cid = dict(_METADATA.findall(rest)).get("id") or None
-    kind = "code"
-    if (found := _CELLTYPE.search(rest)) is not None:
-        if found.group(1) in KINDS:
-            kind = found.group(1)
+    if (found := _CELLTYPE.search(rest)) is not None and found.group(1) in KINDS:
+        kind = found.group(1)
+    else:
+        kind = "code"
     return kind, cid
 
 
@@ -148,14 +148,13 @@ def read_frontmatter(text: str) -> dict[str, str]:
     unconditionally and treat "no answer" as "this file does not say".
     """
     lines = text.splitlines()
-    if not lines or lines[0].strip() != _FENCE:
-        return {}
     out: dict[str, str] = {}
-    for line in lines[1:]:
-        if line.strip() == _FENCE:
-            break
-        if (found := _FRONTMATTER.match(line.strip())) is not None:
-            out[found.group(1)] = found.group(2)
+    if lines and lines[0].strip() == _FENCE:
+        for line in lines[1:]:
+            if line.strip() == _FENCE:
+                break
+            if (found := _FRONTMATTER.match(line.strip())) is not None:
+                out[found.group(1)] = found.group(2)
     return out
 
 
