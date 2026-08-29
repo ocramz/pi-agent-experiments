@@ -15,6 +15,7 @@ import type {
 import { openDb } from "../../src/database.ts";
 import { createLocalGitRunner, createLocalShellRunner } from "../../src/git.ts";
 import { keywordStrategy } from "../../src/related.ts";
+import { createSession, type TrackerSession } from "../../src/session.ts";
 
 /**
  * A throwaway git repository plus a wired TrackerContext.
@@ -44,6 +45,16 @@ export interface TempRepo {
 	shell: ShellRunner;
 	db: DatabaseSync;
 	ctx: TrackerContext;
+	/**
+	 * The same context plus this session's mutable state — epic id, git queue,
+	 * pending notes, reviewer choice, token total. Anything session-scoped takes
+	 * this; everything older takes `ctx` and is unaffected by its existence.
+	 *
+	 * `sendToAgent` records instead of sending, so a test can assert that a merge
+	 * conflict was handed to the agent without a pi runtime to hand it to.
+	 */
+	session: TrackerSession;
+	sentToAgent: string[];
 	clock: TestClock;
 	/** Commit everything currently in the tree. Returns the new sha. */
 	commit(message: string): Promise<string>;
@@ -106,21 +117,26 @@ export async function createTempRepo(
 		},
 	};
 
+	const ctx: TrackerContext = {
+		paths,
+		db,
+		git,
+		shell,
+		related: keywordStrategy,
+		now: clock.now,
+		notify: () => {},
+	};
+	const sentToAgent: string[] = [];
+
 	return {
 		dir,
 		git,
 		shell,
 		db,
 		clock,
-		ctx: {
-			paths,
-			db,
-			git,
-			shell,
-			related: keywordStrategy,
-			now: clock.now,
-			notify: () => {},
-		},
+		ctx,
+		sentToAgent,
+		session: createSession(ctx, { sendToAgent: (text) => void sentToAgent.push(text) }),
 		write(relativePath, contents) {
 			writeFileSync(join(dir, relativePath), contents);
 		},

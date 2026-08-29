@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { resolvePaths } from "../src/config.ts";
@@ -23,6 +23,7 @@ import {
 	copyManifestFiles,
 	findMissingWorktrees,
 	listWorktrees,
+	reconcileWorktrees,
 	type WorktreeEntry,
 } from "../src/worktree.ts";
 import { createTempRepo, type TempRepo } from "./helpers/repo.ts";
@@ -569,5 +570,50 @@ describe("findMissingWorktrees", () => {
 			epicRow({ epic_id: 3, mode: "branch", path: null }),
 		];
 		assert.deepEqual(findMissingWorktrees(rows, [], root), { missing: [], orphaned: [] });
+	});
+});
+
+/**
+ * Reconciling the database against git at session start.
+ *
+ * The asymmetry is the design: a stale row is fixed silently because nothing is
+ * lost by it, and an orphaned directory is only reported because deleting one is
+ * not a decision to make on the user's behalf during startup.
+ */
+describe("reconcileWorktrees", () => {
+	it("finds nothing to do in a repository with no epics", async () => {
+		const r = await repo();
+		assert.deepEqual(await reconcileWorktrees(r.ctx), { cancelled: [], orphaned: [] });
+	});
+
+	it("leaves a live worktree epic alone", async () => {
+		const r = await repo();
+		const story = makeStory(r, { title: "Add auth" });
+		const started = await startEpic(r.ctx, { story, mode: "worktree" });
+		assert.ok(started.ok && started.epic, started.note);
+
+		const report = await reconcileWorktrees(r.ctx);
+		assert.deepEqual(report.cancelled, []);
+		assert.deepEqual(report.orphaned, []);
+		assert.equal(getEpicBranch(r.db, started.epic.epic_id)!.state, "active");
+	});
+
+	/** A crashed session or a manual `rm -rf`. The branch and its refs survive. */
+	it("cancels a row whose directory is gone, and clears its path", async () => {
+		const r = await repo();
+		const story = makeStory(r, { title: "Add auth" });
+		const started = await startEpic(r.ctx, { story, mode: "worktree" });
+		assert.ok(started.ok && started.epic, started.note);
+
+		rmSync(started.epic.path!, { recursive: true, force: true });
+		await r.git(["worktree", "prune"]);
+
+		const report = await reconcileWorktrees(r.ctx);
+		assert.deepEqual(report.cancelled.map((e) => e.epic_id), [started.epic.epic_id]);
+		const row = getEpicBranch(r.db, started.epic.epic_id)!;
+		assert.equal(row.state, "cancelled");
+		assert.equal(row.path, null);
+		// Nothing is lost: the work is still on the branch.
+		assert.ok(await revParse(r.git, row.branch, r.dir), "the epic branch was destroyed");
 	});
 });

@@ -11,13 +11,16 @@ import {
 	findEpicForStory,
 	mergeIntoBase,
 	recordStoryStartCommit,
+	restoreLastCheckpoint,
 	runSetup,
 	startEpic,
 	undoMerge,
 	undoStory,
 	updateFromBase,
+	writeCheckpoint,
 } from "../src/epic.ts";
-import { currentBranch, revParse } from "../src/git.ts";
+import { currentBranch, listBackupRefs, revParse } from "../src/git.ts";
+import { checkpointRefPrefix } from "../src/rules.ts";
 import type { Story } from "../src/types.ts";
 import { createTempRepo, type TempRepo } from "./helpers/repo.ts";
 
@@ -524,5 +527,81 @@ describe("collectWorkEvidence", () => {
 		const evidence = await collectWorkEvidence(r.ctx, epic, { verify: "echo boom && false" });
 		assert.equal(evidence.verify?.ok, false);
 		assert.match(evidence.verify?.output ?? "", /boom/);
+	});
+});
+
+/**
+ * Per-turn checkpoints.
+ *
+ * The only inline git left in `extensions/index.ts` until it moved here, and the
+ * cheapest safety net the extension has: `/undo-turn` reads exactly one of these.
+ */
+describe("checkpoints", () => {
+	it("saves the working tree without disturbing it", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		r.write("README.md", "work in progress\n");
+
+		const sha = await writeCheckpoint(r.ctx, epic);
+		assert.ok(sha, "nothing was checkpointed");
+		// `stash create` must not move the tree or the index.
+		assert.equal(readFileSync(join(r.dir, "README.md"), "utf-8"), "work in progress\n");
+	});
+
+	it("saves nothing for a clean tree", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		assert.equal(await writeCheckpoint(r.ctx, epic), null);
+	});
+
+	/**
+	 * A real limit of the mechanism, not a bug in it: `git stash create` snapshots
+	 * tracked modifications only. A turn that produced nothing but brand-new files
+	 * is not recoverable with `/undo-turn`, and nothing pretends otherwise — the
+	 * checkpoint simply is not written.
+	 */
+	it("does not capture untracked files, because `stash create` does not", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		r.write("brand-new.txt", "never added\n");
+		assert.equal(await writeCheckpoint(r.ctx, epic), null);
+	});
+
+	it("restores the newest checkpoint over the current tree", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+
+		r.write("README.md", "first version\n");
+		await writeCheckpoint(r.ctx, epic);
+		r.clock.advance(1000);
+		r.write("README.md", "second version\n");
+		await writeCheckpoint(r.ctx, epic);
+
+		await r.git(["checkout", "--", "."]);
+		const restored = await restoreLastCheckpoint(r.ctx, epic);
+		assert.ok(restored.ok, restored.note);
+		assert.match(restored.note, /Restored the working tree from checkpoint [0-9a-f]{8}\./);
+		assert.equal(readFileSync(join(r.dir, "README.md"), "utf-8"), "second version\n");
+	});
+
+	it("says so plainly when there is no checkpoint to restore", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		const restored = await restoreLastCheckpoint(r.ctx, epic);
+		assert.equal(restored.ok, false);
+		assert.equal(restored.note, "No checkpoint recorded yet.");
+	});
+
+	/** One ref per turn adds up over a day-long epic, and only the newest is read. */
+	it("prunes the tail on every write, keeping the retention count", async () => {
+		const r = await repo();
+		const { epic } = await startedEpic(r);
+		for (let i = 0; i < 5; i++) {
+			r.clock.advance(1000);
+			r.write("README.md", `version ${i}\n`);
+			await writeCheckpoint(r.ctx, epic, 3);
+		}
+		const refs = await listBackupRefs(r.git, checkpointRefPrefix(epic.epic_id), r.dir);
+		assert.equal(refs.length, 3);
 	});
 });

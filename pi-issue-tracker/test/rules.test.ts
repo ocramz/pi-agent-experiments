@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
 	backupRefName,
+	checkCanClose,
 	checkCanMerge,
+	checkCanStart,
 	checkCanStartEpic,
 	checkStageSize,
 	checkpointRefPrefix,
@@ -17,6 +19,7 @@ import {
 	reviewWork,
 	slugify,
 	storyCommitMessage,
+	unmetDependencies,
 	worktreeDirName,
 	type ActiveEpicSummary,
 	type ReviewFinding,
@@ -542,5 +545,144 @@ describe("formatFindings", () => {
 			{ severity: "note", message: "short" },
 		]);
 		assert.equal(text, "BLOCKER: cycle\nnote: short");
+	});
+});
+
+describe("unmetDependencies", () => {
+	const done = { id: 1, status: "done" } as Story;
+	const open = { id: 2, status: "in_progress" } as Story;
+	const lookup = (id: number) => ({ 1: done, 2: open })[id as 1 | 2] ?? null;
+
+	it("names only the dependencies that have not closed", () => {
+		const s = { depends_on: [1, 2] } as Story;
+		assert.deepEqual(unmetDependencies(s, lookup), [2]);
+	});
+
+	/** A dependency on a story that no longer exists cannot be satisfied. */
+	it("treats a missing dependency as unmet rather than silently satisfied", () => {
+		const s = { depends_on: [1, 99] } as Story;
+		assert.deepEqual(unmetDependencies(s, lookup), [99]);
+	});
+
+	it("is empty when a story depends on nothing", () => {
+		assert.deepEqual(unmetDependencies({ depends_on: [] } as unknown as Story, lookup), []);
+	});
+});
+
+describe("checkCanStart", () => {
+	const approved = { verdict: "approved" as const, by: "self", at: 1, findings: "" };
+	const base = (overrides: Partial<Story> = {}): Story =>
+		({ id: 7, review: { plan: approved }, depends_on: [], ...overrides }) as Story;
+
+	it("allows a leaf story with an approved plan and no unmet dependencies", () => {
+		assert.deepEqual(checkCanStart({ story: base(), isEpic: false, openChildren: [], unmet: [] }), { ok: true });
+	});
+
+	/** Epics are containers. Starting one would put work on the wrong row. */
+	it("refuses an epic and points at the children to start instead", () => {
+		const result = checkCanStart({
+			story: base(),
+			isEpic: true,
+			openChildren: [{ id: 8 } as Story, { id: 9 } as Story],
+			unmet: [],
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.ok === false && result.code, "is an epic");
+		assert.match(result.ok === false ? result.message : "", /Start one of its children instead: #8, #9/);
+	});
+
+	it("says '(none open)' for an epic whose children have all closed", () => {
+		const result = checkCanStart({ story: base(), isEpic: true, openChildren: [], unmet: [] });
+		assert.match(result.ok === false ? result.message : "", /children instead: \(none open\)/);
+	});
+
+	it("refuses on unmet dependencies and reports which", () => {
+		const result = checkCanStart({ story: base(), isEpic: false, openChildren: [], unmet: [3, 4] });
+		assert.equal(result.ok === false && result.code, "unmet dependencies");
+		assert.match(result.ok === false ? result.message : "", /dependencies not done — #3, #4/);
+		assert.deepEqual(result.ok === false ? result.details : null, { unmet: [3, 4] });
+	});
+
+	/** The gate is enforced, so the refusal has to say how to open it. */
+	it("refuses an unreviewed plan and names the call that reviews it", () => {
+		const story = base({ review: {} as Story["review"] });
+		const result = checkCanStart({ story, isEpic: false, openChildren: [], unmet: [] });
+		assert.equal(result.ok === false && result.code, "plan not approved");
+		assert.match(result.ok === false ? result.message : "", /story\{action:"review_plan", story_id:7\}/);
+		assert.deepEqual(result.ok === false ? result.details : null, { review: null });
+	});
+
+	it("refuses a plan review that requested changes, and quotes the findings", () => {
+		const review = { verdict: "changes_requested" as const, by: "gpt/x", at: 1, findings: "split it up" };
+		const result = checkCanStart({ story: base({ review: { plan: review } }), isEpic: false, openChildren: [], unmet: [] });
+		assert.equal(result.ok === false && result.code, "plan not approved");
+		assert.match(result.ok === false ? result.message : "", /requested changes \(by gpt\/x\)/);
+		assert.match(result.ok === false ? result.message : "", /split it up/);
+	});
+});
+
+describe("checkCanClose", () => {
+	const approved = { verdict: "approved" as const, by: "self", at: 1, findings: "" };
+	const ok = {
+		story: { id: 7, review: { work: approved }, depends_on: [] } as unknown as Story,
+		isEpic: false,
+		openChildren: [],
+		unmet: [],
+		resolution: "completed" as const,
+		handoffNotes: "the auth code is in auth.ts",
+	};
+
+	it("allows a reviewed story with a resolution and a handoff note", () => {
+		assert.deepEqual(checkCanClose(ok), { ok: true });
+	});
+
+	/** An optional field is a skipped field, so both of these are required outright. */
+	it("refuses without a resolution and lists the vocabulary", () => {
+		const result = checkCanClose({ ...ok, resolution: undefined });
+		assert.equal(result.ok === false && result.code, "resolution required");
+		assert.match(result.ok === false ? result.message : "", /completed\|superseded\|obsolete\|wontfix\|duplicate/);
+	});
+
+	it("refuses without a handoff note", () => {
+		const result = checkCanClose({ ...ok, handoffNotes: undefined });
+		assert.equal(result.ok === false && result.code, "handoff_notes required");
+	});
+
+	it("refuses a handoff note that is only whitespace", () => {
+		assert.equal(checkCanClose({ ...ok, handoffNotes: "   \n " }).ok, false);
+	});
+
+	it("checks the resolution before the handoff note, so one missing field is reported at a time", () => {
+		const result = checkCanClose({ ...ok, resolution: undefined, handoffNotes: undefined });
+		assert.equal(result.ok === false && result.code, "resolution required");
+	});
+
+	it("refuses unreviewed work and names the call that reviews it", () => {
+		const result = checkCanClose({ ...ok, story: { ...ok.story, review: {} } as Story });
+		assert.equal(result.ok === false && result.code, "work not approved");
+		assert.match(result.ok === false ? result.message : "", /story\{action:"review_work", story_id:7\}/);
+	});
+
+	/** An epic carries no commit of its own, so there is no diff to review. */
+	it("exempts an epic from the work review", () => {
+		const epic = { ...ok, story: { ...ok.story, review: {} } as Story, isEpic: true };
+		assert.deepEqual(checkCanClose(epic), { ok: true });
+	});
+
+	it("refuses on unmet dependencies", () => {
+		const result = checkCanClose({ ...ok, unmet: [3] });
+		assert.equal(result.ok === false && result.code, "unmet dependencies");
+		assert.match(result.ok === false ? result.message : "", /Cannot mark done: dependencies not done — #3/);
+	});
+
+	it("refuses an epic that still has open children, and says they will close it themselves", () => {
+		const result = checkCanClose({
+			...ok,
+			isEpic: true,
+			openChildren: [{ id: 8 } as Story],
+		});
+		assert.equal(result.ok === false && result.code, "open children");
+		assert.match(result.ok === false ? result.message : "", /They close it automatically/);
+		assert.deepEqual(result.ok === false ? result.details : null, { open: [8] });
 	});
 });

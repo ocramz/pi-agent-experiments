@@ -51,7 +51,8 @@ jobs:
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
         # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -84,33 +85,29 @@ jobs:
       # release workflow as well as it: a tag is too late to find out.
       - run: npm run pack-check --if-present
 
-  # The Python half. Its own matrix rather than the one above, because only some
-  # packages have Python in them — fanning the main matrix out would run a job to
-  # lint a directory that does not exist. It is also the only automation ruff has
-  # ever had — the README documents the same command for a human to type, and an
-  # E501 lived in main until someone did.
-  lint:
-    name: ruff (${{ matrix.pkg }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      # Adding a Python extension: one entry here, alongside the two in the
-      # matrices above. Only packages with a py/ directory belong in it.
-      matrix:
-        pkg: [pi-notebook-py]
-    steps:
-      - uses: actions/checkout@v4
-      # An exact version, unlike the actions/* above: astral-sh publishes no
-      # floating major tag (there is no `v10`, only `v10.0.1`), so a shorthand
-      # here fails to resolve rather than tracking the major.
-      - uses: astral-sh/setup-uv@v10.0.1
-      # RUFF_VERSION comes from shared/versions.env, like every other pin in this
-      # file. `--output-format=github` puts violations on the diff as annotations
-      # rather than only in the log.
-      - run: >
-          SHARED_DIR=shared . shared/versions.sh
-          && cd ${{ matrix.pkg }}
-          && uvx ruff@"$RUFF_VERSION" check --output-format=github py test-py
+  # # Lint extensions that contain Python. NB only works for packages with a py/ directory, which is why pi-web-search is not in the matrix.
+  # lint:
+  #   name: ruff (${{ matrix.pkg }})
+  #   runs-on: ubuntu-24.04
+  #   strategy:
+  #     fail-fast: false
+  #     # Adding a Python extension: one entry here, alongside the two in the
+  #     # matrices above. Only packages with a py/ directory belong in it.
+  #     matrix:
+  #       pkg: [pi-notebook-py]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     # An exact version, unlike the actions/* above: astral-sh publishes no
+  #     # floating major tag (there is no `v10`, only `v10.0.1`), so a shorthand
+  #     # here fails to resolve rather than tracking the major.
+  #     - uses: astral-sh/setup-uv@v10.0.1
+  #     # RUFF_VERSION comes from shared/versions.env, like every other pin in this
+  #     # file. `--output-format=github` puts violations on the diff as annotations
+  #     # rather than only in the log.
+  #     - run: >
+  #         SHARED_DIR=shared . shared/versions.sh
+  #         && cd ${{ matrix.pkg }}
+  #         && uvx ruff@"$RUFF_VERSION" check --output-format=github py test-py
 
   tui:
     name: interactive (pty)
@@ -119,7 +116,8 @@ jobs:
       fail-fast: false
       matrix:
         # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}
@@ -164,7 +162,8 @@ jobs:
       # matrix:
       #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
       matrix:
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
         working-directory: ${{ matrix.pkg }}

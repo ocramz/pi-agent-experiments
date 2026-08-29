@@ -1,6 +1,6 @@
 # Pi Issue Tracker
 
-An extension for **pi** that turns a high-level goal into a linked, tracked set of user stories stored in a project-local SQLite database.
+An extension for the [Pi coding agent](https://pi.dev) that turns a high-level goal into a linked, tracked set of user stories stored in a project-local SQLite database.
 
 ## Features
 
@@ -181,10 +181,15 @@ git switch -c feat/scratch          # main and master are refused as bases
 
 ## Architecture
 
-- **`src/` must not import from `@earendil-works/*`.** [extensions/index.ts](pi-issue-tracker/extensions/index.ts)
-  is the only pi-aware file: it builds a `TrackerContext` (paths, db, injected git/shell runners,
-  clock, notify) and delegates. That boundary is what lets everything below run under plain
-  `node --test` against a temp repository, with no pi runtime and no network.
+- **`src/` must not import from `@earendil-works/*`.** [extensions/](pi-issue-tracker/extensions/)
+  is the only pi-aware directory: it builds a `TrackerSession` — a `TrackerContext` (paths, db,
+  injected git/shell runners, clock, notify) plus this session's mutable state — and delegates.
+  That boundary is what lets everything below run under plain `node --test` against a temp
+  repository, with no pi runtime and no network.
+- **[extensions/index.ts](pi-issue-tracker/extensions/index.ts) declares and does not decide.**
+  Every tool, command and event is registered there in full, prompt text and schema included, with
+  each handler one call away. `runtime.ts`, `board.ts`, `planner.ts` and `epic-commands.ts` hold
+  what cannot leave pi; `src/` holds the rest.
 - **Git runners never throw.** `pi.exec` resolves with a non-zero `code` on failure, and both
   `GitRunner` implementations match that contract deliberately — `code !== 0` is the only error
   signal.

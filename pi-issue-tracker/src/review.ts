@@ -1,6 +1,9 @@
 import type { ReviewerRunner, ReviewUsage } from "./context.ts";
+import { getAllStories, getChildren } from "./database.ts";
+import { collectWorkEvidence, findEpicForStory } from "./epic.ts";
 import { parseJsonObject } from "./json.ts";
-import { formatFindings, hasBlocker, type ReviewFinding } from "./rules.ts";
+import { formatFindings, hasBlocker, reviewPlan, reviewWork, type ReviewFinding } from "./rules.ts";
+import { serializeGit, type TrackerSession } from "./session.ts";
 import { REVIEW_VERDICTS, type ReviewRecord, type ReviewVerdict, type Story } from "./types.ts";
 
 /**
@@ -194,4 +197,67 @@ function reviewerPrompt(gate: ReviewGate, story: Story, mechanical: string, evid
 	if (evidence?.trim()) parts.push(`\n${evidence.trim()}`);
 	parts.push(`\nReview the ${gate === "plan" ? "plan" : "work"} and reply with the JSON object.`);
 	return parts.join("\n");
+}
+
+/** How many changed files a work review is shown before the list is cut. */
+const EVIDENCE_FILES_SHOWN = 50;
+
+/**
+ * The mechanical findings for a gate, plus whatever evidence the reviewer
+ * should see alongside them.
+ *
+ * The plan gate reads the board; the work gate reads the working tree, which is
+ * why only the second needs an epic and a serialized git call.
+ */
+export async function gatherFindings(
+	session: TrackerSession,
+	story: Story,
+	gate: ReviewGate,
+): Promise<{ findings: ReviewFinding[]; evidence?: string }> {
+	const db = session.db;
+
+	if (gate === "plan") {
+		return {
+			findings: reviewPlan({
+				story,
+				children: getChildren(db, story.id),
+				all: getAllStories(db),
+				similar: session.related.findRelated(db, story, 3),
+			}),
+		};
+	}
+
+	const epic = findEpicForStory(session, story.id);
+	if (!epic) {
+		// No epic means no working tree to inspect and no commit to make. The plan
+		// gate still applies; there is simply nothing mechanical to check here.
+		return {
+			findings: [
+				{
+					severity: "note",
+					message: "this story is not under a started epic, so there is no working tree to review. Ask the user to run /start-epic.",
+				},
+			],
+		};
+	}
+
+	const evidence = await serializeGit(session, () => collectWorkEvidence(session, epic));
+	const findings = reviewWork({
+		story,
+		changedFiles: evidence.changedFiles,
+		totalBytes: evidence.totalBytes,
+		verify: evidence.verify,
+	});
+
+	const lines = [
+		`Files changed (${evidence.changedFiles.length}):`,
+		...evidence.changedFiles.slice(0, EVIDENCE_FILES_SHOWN).map((f) => `  ${f}`),
+	];
+	if (evidence.changedFiles.length > EVIDENCE_FILES_SHOWN) {
+		lines.push(`  … ${evidence.changedFiles.length - EVIDENCE_FILES_SHOWN} more`);
+	}
+	if (evidence.verify) {
+		lines.push(`\nverify (\`${evidence.verify.command}\`): ${evidence.verify.ok ? "passed" : "FAILED"}`);
+	}
+	return { findings, evidence: lines.join("\n") };
 }
