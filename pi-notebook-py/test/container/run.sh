@@ -7,7 +7,7 @@
 #
 # No REQUIRE_API_KEY: nothing here drives a model. test/tui/live.test.ts already
 # covers a real model reaching nb_cell and nb_install. What only a container
-# reaches is the *userland* — no .notebook/, no site-packages, an unprivileged
+# reaches is the *userland* — a cold HOME, no site-packages, an unprivileged
 # uid with HOME forced to /tmp — so that is what these suites are about.
 #
 # The image is PY_TEST_IMAGE, shared with pi-incremental-py: the pinned pi
@@ -24,8 +24,12 @@ if [ -z "${PY_TEST_IMAGE:-}" ]; then
 fi
 export PY_TEST_IMAGE
 
+# test_venv_isolation_in_image.sh is last: it builds two venvs from cold, which
+# is the slowest thing in the tier, and it is meaningless unless the kernel
+# itself already passed the gate.
 CALLER_DIR="$PWD" exec ../../../shared/test/container/run-suites.sh \
 	test_kernel_in_image.sh \
 	test_protocol_in_image.sh \
 	test_unit_in_image.sh \
-	test_plot_in_image.sh
+	test_plot_in_image.sh \
+	test_venv_isolation_in_image.sh

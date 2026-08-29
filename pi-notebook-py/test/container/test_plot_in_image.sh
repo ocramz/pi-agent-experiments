@@ -32,7 +32,7 @@ out="$(RUN_FLAGS="-v $STAGED:/pkg:ro -e PLOT_TIMEOUT=$PLOT_TIMEOUT" in_image '
 	mkdir -p /tmp/pkg && cp -r /pkg/src /pkg/py /tmp/pkg/ || { echo "COPY_FAILED"; exit 1; }
 	mkdir -p /tmp/proj
 	echo "USER_ID=$(id -u)"
-	echo "PRISTINE=$(ls -a /tmp/proj | grep -c notebook)"
+	echo "PRISTINE=$(ls -a /tmp/proj | grep -c pi)"
 
 	cat > /tmp/plot.mjs <<"MJS"
 // NB: this heredoc sits inside a single-quoted bash string, so it must not
@@ -87,32 +87,40 @@ console.log("FIGS_AFTER=" + leftover.value);
 
 const next = await kernel.call({ tool: "add_cell", src: "1 + 1" });
 console.log("NEXT_IMAGES=" + (next.results[0].images ?? []).length);
+
+// Where the install actually landed. Asked of the running kernel rather than
+// of a path this script built up, so it is the interpreter that answers.
+const prefix = await kernel.call({ tool: "eval", src: "import sys; sys.prefix" });
+// A display value is a repr, so the path arrives quoted. charCode 39 rather
+// than the character: this heredoc lives inside a single-quoted bash string.
+console.log("SYS_PREFIX=" + String(prefix.value).replaceAll(String.fromCharCode(39), ""));
+console.log("INTERPRETER=" + kernel.interpreter);
 kernel.kill();
 MJS
 
 	timeout "$PLOT_TIMEOUT" node /tmp/plot.mjs
 	case $? in 124 | 137 | 143) echo "TIMED_OUT=yes" ;; esac
 
-	echo "VENV=$([ -x /tmp/proj/.notebook/venv/bin/python ] && echo yes || echo no)"
-	echo "IGNORED=$(cat /tmp/proj/.notebook/.gitignore 2>/dev/null | tr "\n" " ")"
-	echo "IN_VENV=$(/tmp/proj/.notebook/venv/bin/python -c "import matplotlib, sys; print(sys.prefix)" 2>&1 | tail -1)"
+	echo "VENVS_IN_PROJECT=$(find /tmp/proj -name pyvenv.cfg | wc -l | tr -d " ")"
 ')"
 
 assert_not_contains "the package is readable by the image user" "COPY_FAILED"   "$out"
 assert_contains     "runs as the unprivileged image user"       "USER_ID=65532" "$out"
-assert_contains     "the project starts with no .notebook"      "PRISTINE=0"    "$out"
+assert_contains     "the project starts with no .pi"            "PRISTINE=0"    "$out"
 assert_not_contains "the install finished inside its budget"    "TIMED_OUT=yes" "$out"
 
-assert_contains "the kernel forces a headless backend"    "BACKEND='Agg'" "$out"
-assert_contains "a project venv was created from scratch" "VENV=yes"      "$out"
-assert_contains "the venv is kept out of git"             "IGNORED=venv/ python-pin" "$out"
+assert_contains "the kernel forces a headless backend"     "BACKEND='Agg'" "$out"
+assert_contains "a venv was created from scratch"          "INTERPRETER=/tmp/.pi/notebook-py/venvs/" "$out"
+# Placement is test_venv_isolation_in_image.sh's subject; this is the cheap
+# restatement, so a regression shows up here too rather than only there.
+assert_contains "and not inside the project"               "VENVS_IN_PROJECT=0" "$out"
 
 # The control: the import must genuinely fail first, or "it worked after the
 # install" proves nothing about the install.
 assert_contains "the import fails before the install" "BEFORE_STATUS=error" "$out"
 assert_contains "the install succeeded"               "INSTALL_OK=true"     "$out"
 assert_contains "and the import then works"           "IMPORT_STATUS=ok"    "$out"
-assert_contains "into the kernel's own venv"          "IN_VENV=/tmp/proj/.notebook/venv" "$out"
+assert_contains "into the notebook's own venv"        "SYS_PREFIX=/tmp/.pi/notebook-py/venvs/" "$out"
 
 assert_contains "a plotting cell returns one image"   "IMAGES=1"           "$out"
 assert_contains "as a PNG"                            "MIME=image/png"     "$out"

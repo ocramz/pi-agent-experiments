@@ -7,17 +7,36 @@
  * dict, exactly as in Jupyter; what the kernel adds is a report, on every
  * response, of which cells an edit left behind.
  *
+ * A session is always *on* a named notebook. The name picks the venv the
+ * kernel runs in, so two notebooks in one project can hold conflicting
+ * versions and an install into one cannot reach the other; and it names
+ * the checkpoint under `.pi/notebooks/`, which is ordinary source and is
+ * meant to be committed. The venvs are not in the working tree at all —
+ * see `src/config.ts` for why that is a guarantee rather than a habit.
+ *
  * No logic lives here. An extension only exists inside a running pi
  * session, so this file's only coverage is a real model driving it —
  * everything worth testing is in src/ and py/.
  */
 
+import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Kernel, pinPython, STATE_DIR, type KernelResponse } from "../src/kernel.ts";
+import {
+	Kernel,
+	dropVenv,
+	listNotebooks,
+	nameError,
+	notebookFile,
+	pinPython,
+	plannedInterpreter,
+	unpinPython,
+	type KernelResponse,
+} from "../src/kernel.ts";
 import {
 	formatEval,
 	formatInspect,
+	formatNotebooks,
 	formatRead,
 	formatRun,
 	imagesOf,
@@ -29,6 +48,12 @@ import {
 const LOST_STATE_NOTE =
 	"\n\nNOTE: the kernel process was restarted; all Python state was lost. " +
 	'Every cell is unrun — nb_run {op: "all"} to rebuild.';
+
+/** A switch is a deliberate loss, and reads as a fault unless it says so. */
+const SWITCH_NOTE =
+	"\n\nNOTE: this is a different notebook, so the namespace is empty and every " +
+	'cell is unrun — nb_run {op: "all"} to rebuild. It also has its own ' +
+	"interpreter: packages installed in another notebook are not here.";
 
 /** Requests that change kernel state. `inspect`, `read` and `eval` do not. */
 const MUTATING = new Set([
@@ -45,8 +70,32 @@ const MUTATING = new Set([
 	"install",
 ]);
 
+/**
+ * The notebook a percent file says it belongs to, or null if it does not say.
+ *
+ * Read here rather than in the kernel because the answer decides which
+ * *interpreter* to spawn, and that has to be settled before there is a
+ * Python process to ask. Only the frontmatter fence is scanned, so this
+ * stays a few hundred bytes even for a large notebook.
+ */
+function declaredNotebook(path: string): string | null {
+	try {
+		const head = readFileSync(path, "utf8").slice(0, 4096).split("\n");
+		if (head[0]?.trim() !== "# ---") return null;
+		for (const line of head.slice(1)) {
+			if (line.trim() === "# ---") break;
+			const found = line.trim().match(/^#\s*notebook\s*:\s*(.+?)\s*$/);
+			if (found) return found[1];
+		}
+	} catch {
+		/* unreadable is just "does not say" */
+	}
+	return null;
+}
+
 export default function (pi: ExtensionAPI) {
-	const kernel = new Kernel(undefined, process.cwd());
+	const cwd = process.cwd();
+	const kernel = new Kernel(undefined, cwd);
 
 	// Where the kernel is in its own history. Stamped onto every result so a
 	// later context filter can tell a current output from one that has been
@@ -55,15 +104,42 @@ export default function (pi: ExtensionAPI) {
 	let gen = 0;
 	let mut = 0;
 
+	/**
+	 * Write the notebook's own file after every change.
+	 *
+	 * This is what makes `.pi/notebooks/<name>.py` trustworthy enough to
+	 * commit and to switch away from: without it, `use a` → work → `use b`
+	 * would drop the work on the floor, since the namespace and the cell list
+	 * both live in a process that is about to be killed.
+	 *
+	 * It calls the kernel directly rather than through `call` below — it must
+	 * not count as a mutation, and it must not autosave itself.
+	 */
+	async function checkpoint(): Promise<void> {
+		await kernel.call({
+			tool: "save",
+			path: kernel.checkpoint,
+			overwrite: true,
+			remember: false,
+			notebook: kernel.notebook,
+		});
+	}
+
 	async function call(req: Record<string, unknown>): Promise<KernelResponse> {
 		const resp = await kernel.call(req);
-		if (MUTATING.has(req.tool as string)) mut++;
+		const mutating = MUTATING.has(req.tool as string);
+		if (mutating) mut++;
+		let lost = false;
 		if (kernel.lostState) {
 			kernel.lostState = false;
 			gen++;
-			return { ...resp, _lostState: true };
+			lost = true;
 		}
-		return resp;
+		// Never checkpoint a kernel that has just been replaced: its cell list
+		// is empty because the process died, not because the user emptied it,
+		// and writing that out would destroy the file it was meant to protect.
+		if (mutating && resp.ok && !lost) await checkpoint();
+		return lost ? { ...resp, _lostState: true } : resp;
 	}
 
 	/**
@@ -88,10 +164,49 @@ export default function (pi: ExtensionAPI) {
 	type CellImages = { mime: string; b64: string }[];
 
 	/** The common tail of every tool that runs cells. */
-	function runReply(resp: KernelResponse) {
+	function runReply(resp: KernelResponse, preamble = "") {
 		const response = resp as RunResponse;
 		const note = (resp as Record<string, unknown>)._lostState ? LOST_STATE_NOTE : "";
-		return reply(formatRun(response) + note, "nb.run", response, imagesOf(response));
+		return reply(preamble + formatRun(response) + note, "nb.run", response, imagesOf(response));
+	}
+
+	/**
+	 * Move the session to another notebook, killing the kernel so the next
+	 * call comes up under that notebook's interpreter, and loading its
+	 * checkpoint if it has one.
+	 */
+	async function switchTo(name: string, create: boolean, loadCheckpoint = true): Promise<string> {
+		const bad = nameError(name);
+		if (bad) return `Error: ${bad}`;
+
+		const file = notebookFile(cwd, name);
+		const known = existsSync(file) || listNotebooks(cwd).some((n) => n.name === name);
+		if (create && known) {
+			return `Error: notebook "${name}" already exists — switch to it with op "use"`;
+		}
+		if (!create && !known && name !== kernel.notebook) {
+			const have = listNotebooks(cwd).map((n) => n.name);
+			return (
+				`Error: no notebook "${name}"` +
+				(have.length ? ` — this project has: ${have.join(", ")}` : "") +
+				'. Create it with op "new".'
+			);
+		}
+
+		if (name === kernel.notebook) return `already on notebook "${name}"`;
+		const failed = kernel.useNotebook(name);
+		if (failed) return `Error: ${failed}`;
+		gen++;
+		mut++;
+
+		const planned = plannedInterpreter(cwd, name);
+		const head = `notebook "${name}" (${planned.source === "venv" ? planned.venv : planned.python})`;
+		// `open` passes false: it is about to load a specific file, and loading
+		// the checkpoint first would only be reconciled away by that.
+		if (!loadCheckpoint) return `${head}${SWITCH_NOTE}`;
+		if (!existsSync(file)) return `${head}\nnew and empty.${SWITCH_NOTE}`;
+		const loaded = await call({ tool: "load", path: file });
+		return `${head}\n${formatRun(loaded as RunResponse)}${SWITCH_NOTE}`;
 	}
 
 	// ── nb_cell: write a cell ───────────────────────────────────────
@@ -214,13 +329,18 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Inspect and manage the notebook itself. Ops: list (every cell with its state — cheap, use " +
 			"it to orient), read (full source of one cell or all), delete, move, restart (throw the " +
-			"namespace away), save (write the notebook to a percent-format .py), open (read one back). " +
+			"namespace away), save (export to a percent-format .py), open (read one back), " +
+			"notebooks (every notebook in this project), new (start a fresh one under a name), use " +
+			"(switch to an existing one). " +
+			"Each notebook has its own interpreter and its own installed packages, and is checkpointed " +
+			"to .pi/notebooks/<name>.py, which is ordinary source and is meant to be committed. " +
 			"The file format is jupytext `# %%` blocks, so it opens in Jupyter and VS Code and diffs " +
 			"like source — but it stores no outputs, so an opened notebook has code and no results.",
-		promptSnippet: "list, read, delete, move, restart, save or open the notebook.",
+		promptSnippet: "list, read, delete, move, restart, save, open, or switch between notebooks.",
 		promptGuidelines: [
 			'Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.',
-			'`nb_notebook {op: "save"}` writes a percent-format .py that stores source but no outputs. Say so when handing the file to the user, and re-run after opening one.',
+			'Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv, so conflicting versions cannot collide. Switching is not free — it discards the current namespace — so do not switch to organise cells.',
+			'`nb_notebook {op: "save"}` exports a percent-format .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.',
 			'Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need the namespace to match the notebook.',
 		],
 		parameters: Type.Object({
@@ -233,6 +353,9 @@ export default function (pi: ExtensionAPI) {
 					Type.Literal("restart"),
 					Type.Literal("save"),
 					Type.Literal("open"),
+					Type.Literal("notebooks"),
+					Type.Literal("new"),
+					Type.Literal("use"),
 				],
 				{ description: "Notebook operation." },
 			),
@@ -241,6 +364,11 @@ export default function (pi: ExtensionAPI) {
 				Type.String({ description: 'Where to move the cell: a cell id, "start", or "end".' }),
 			),
 			path: Type.Optional(Type.String({ description: "File path (save, open)." })),
+			name: Type.Optional(
+				Type.String({
+					description: "Notebook name (new, use). Letters, digits, dot, dash and underscore.",
+				}),
+			),
 			overwrite: Type.Optional(
 				Type.Boolean({
 					description:
@@ -255,7 +383,7 @@ export default function (pi: ExtensionAPI) {
 			switch (params.op) {
 				case "list": {
 					const response = (await call({ tool: "inspect" })) as InspectResponse;
-					return reply(formatInspect(response), "nb.list", response);
+					return reply(formatInspect(response, kernel.notebook), "nb.list", response);
 				}
 				case "read": {
 					const response = (await call({ tool: "read", id: params.id })) as ReadResponse;
@@ -272,13 +400,45 @@ export default function (pi: ExtensionAPI) {
 				case "save":
 					if (!params.path) return reply("Error: path required for save", "nb.error");
 					return runReply(
-						await call({ tool: "save", path: params.path, overwrite: params.overwrite ?? false }),
+						await call({
+							tool: "save",
+							path: params.path,
+							overwrite: params.overwrite ?? false,
+							notebook: kernel.notebook,
+						}),
 					);
-				case "open":
+				case "open": {
 					if (!params.path) return reply("Error: path required for open", "nb.error");
+					const declared = declaredNotebook(params.path);
+					let preamble = "";
+					if (declared && !nameError(declared) && declared !== kernel.notebook) {
+						// The file names the environment it was written under, so put it
+						// back there rather than running it against whatever is loaded.
+						const switched = await switchTo(declared, false, false);
+						if (switched.startsWith("Error:")) return reply(switched, "nb.error");
+						preamble = `${switched}\n\n`;
+					} else if (!declared) {
+						preamble =
+							`this file names no notebook, so it is being opened in "${kernel.notebook}" — ` +
+							"its imports may not be installed here.\n";
+					}
 					return runReply(
 						await call({ tool: "load", path: params.path, run: params.run ?? false }),
+						preamble,
 					);
+				}
+				case "notebooks":
+					return reply(
+						formatNotebooks(listNotebooks(cwd), kernel.notebook),
+						"nb.notebooks",
+						listNotebooks(cwd),
+					);
+				case "new":
+				case "use": {
+					if (!params.name) return reply(`Error: name required for ${params.op}`, "nb.error");
+					const text = await switchTo(params.name, params.op === "new");
+					return reply(text, text.startsWith("Error:") ? "nb.error" : "nb.switch");
+				}
 			}
 		},
 	});
@@ -289,7 +449,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Notebook Install",
 		description:
 			"Install Python packages INTO the notebook kernel's interpreter. Use this instead of pip " +
-			"or uv in bash, which install somewhere the kernel is not looking. A package that was " +
+			"or uv in bash, which install somewhere the kernel is not looking. Each notebook has its " +
+			"own environment, so this affects only the notebook the session is on. A package that was " +
 			"already imported keeps its old code until the namespace is restarted; the result says so " +
 			"when that happens.",
 		promptSnippet: "pip-install packages into the notebook kernel's own interpreter.",
@@ -310,10 +471,10 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── /nb-python: pin the interpreter the kernel runs under ───────
+	// ── /nb-python: pin the interpreter this notebook runs under ────
 	pi.registerCommand("nb-python", {
 		description:
-			"Pin which python the notebook kernel uses: /nb-python /path/to/venv (or .../bin/python). " +
+			"Pin which python the current notebook uses: /nb-python /path/to/venv (or .../bin/python). " +
 			"Restarts the kernel — python state is lost.",
 		handler: async (args, ctx) => {
 			const target = args.trim();
@@ -322,15 +483,32 @@ export default function (pi: ExtensionAPI) {
 				else console.log(msg);
 			};
 			if (!target) {
-				notify(`Usage: /nb-python /path/to/venv-or-python (pinned in ${STATE_DIR}/python-pin)`);
+				const planned = plannedInterpreter(cwd, kernel.notebook);
+				notify(
+					`notebook "${kernel.notebook}" runs ${planned.python} (${planned.source}).\n` +
+						"Usage: /nb-python /path/to/venv-or-python — pins this notebook only, on this " +
+						"machine only. /nb-python clear goes back to the notebook's own venv.",
+				);
 				return;
 			}
-			pinPython(process.cwd(), target);
+			if (target === "clear") {
+				unpinPython(cwd, kernel.notebook);
+				kernel.kill();
+				mut++;
+				notify(
+					`notebook "${kernel.notebook}" unpinned; it goes back to its own venv ` +
+						"(kernel will restart, python state lost).",
+				);
+				return;
+			}
+			pinPython(cwd, kernel.notebook, target);
 			kernel.kill(); // next tool call respawns under the pinned interpreter
 			// State changed with nothing in the transcript to show for it. `gen`
 			// follows on the next call, when the respawn reports the loss.
 			mut++;
-			notify(`Notebook python pinned to ${target}; kernel will restart (python state lost).`);
+			notify(
+				`notebook "${kernel.notebook}" pinned to ${target}; kernel will restart (python state lost).`,
+			);
 		},
 	});
 
@@ -338,7 +516,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("nb", {
 		description:
 			"Poke the notebook kernel: /nb lists cells, /nb add [name] <src>, /nb run <id>, " +
-			"/nb run-all, /nb read <id>, /nb save <path>, /nb open <path>, /nb <expr> evaluates.",
+			"/nb run-all, /nb read <id>, /nb save <path>, /nb open <path>, /nb notebooks, " +
+			"/nb new <name>, /nb use <name>, /nb drop-venv <name>, /nb <expr> evaluates.",
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			const notify = (msg: string, level: "info" | "error" = "info") => {
@@ -350,10 +529,65 @@ export default function (pi: ExtensionAPI) {
 
 			if (!input || input === "list") {
 				const resp = await call({ tool: "inspect" });
-				notify(formatInspect(resp as InspectResponse), resp.ok ? "info" : "error");
+				notify(formatInspect(resp as InspectResponse, kernel.notebook), resp.ok ? "info" : "error");
+				return;
+			}
+			if (input === "notebooks") {
+				notify(formatNotebooks(listNotebooks(cwd), kernel.notebook));
 				return;
 			}
 			if (input === "run-all") return show(await call({ tool: "run_all" }));
+
+			const switching = input.match(/^(new|use)\s+(\S+)$/);
+			if (switching) {
+				const text = await switchTo(switching[2], switching[1] === "new");
+				notify(text, text.startsWith("Error:") ? "error" : "info");
+				return;
+			}
+
+			// Reclaiming disk is the human's call, not the agent's: "this
+			// notebook is finished" is a fact about intentions, and the model is
+			// no better placed to know it than the kernel is (semantics.md §3.8).
+			// So this is a command and there is no matching nb_notebook op.
+			const dropping = input.match(/^drop-venv\s+(\S+)$/);
+			if (dropping) {
+				const name = dropping[1];
+				const bad = nameError(name);
+				if (bad) return notify(`Error: ${bad}`, "error");
+				const removed = dropVenv(cwd, name);
+				// Whether this took the environment out from under the session,
+				// which is *not* the same as it being the current notebook: an
+				// override means the kernel never ran that venv, so removing it
+				// is pure disk and costs the namespace nothing. Killing on
+				// `current` alone would throw the session away for no reason and
+				// then promise a rebuild that `resolvePython` never performs.
+				const live =
+					removed !== null &&
+					name === kernel.notebook &&
+					plannedInterpreter(cwd, name).source === "venv";
+				if (live) {
+					kernel.kill(); // the next call rebuilds it
+					// `gen` follows on the next call, when the respawn reports the
+					// loss — same as /nb-python. Bumping it here would count the
+					// one loss twice, since nothing stamps this notify.
+					mut++;
+				}
+				const file = notebookFile(cwd, name);
+				notify(
+					(removed
+						? `removed the venv for "${name}": ${removed}`
+						: `notebook "${name}" has no venv to remove`) +
+						(existsSync(file) ? `\n${file} is untouched.` : `\n${file} was removed. This is a bug!`) +
+						// Dropping the environment out from under the running session
+						// is a state loss like any other, and has to say so.
+						(live
+							? "\n\nNOTE: that was this session's own environment. The namespace is " +
+								"gone and every cell is unrun; the venv is rebuilt, empty, on the next " +
+								'call, so anything installed must be installed again. nb_run {op: "all"} to rebuild.'
+							: ""),
+				);
+				return;
+			}
 
 			const run = input.match(/^run\s+(\S+)/);
 			if (run) return show(await call({ tool: "run_cell", id: run[1] }));
@@ -365,10 +599,20 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const save = input.match(/^save\s+(\S+)/);
-			if (save) return show(await call({ tool: "save", path: save[1] }));
+			if (save) {
+				return show(await call({ tool: "save", path: save[1], notebook: kernel.notebook }));
+			}
 
 			const open = input.match(/^open\s+(\S+)/);
-			if (open) return show(await call({ tool: "load", path: open[1] }));
+			if (open) {
+				const declared = declaredNotebook(open[1]);
+				if (declared && !nameError(declared) && declared !== kernel.notebook) {
+					// Same as the tool's `open`: the file about to be loaded is the
+					// point, so the notebook's own checkpoint is not read first.
+					notify(await switchTo(declared, false, false));
+				}
+				return show(await call({ tool: "load", path: open[1] }));
+			}
 
 			const add = input.match(/^add\s+(?:(\w+)\s+)?([\s\S]+)/);
 			if (add) {

@@ -27,6 +27,7 @@ __all__ = [
     "emit_percent",
     "forget_source",
     "parse_percent",
+    "read_frontmatter",
 ]
 
 # jupytext's header: `# %%` then an optional title, an optional [celltype]
@@ -36,9 +37,16 @@ _CELLTYPE = re.compile(r"\[(\w+)\]")
 _METADATA = re.compile(r'(\w+)="([^"]*)"')
 
 # jupytext writes a YAML frontmatter block as a run of comment lines fenced
-# by `# ---`. We never emit one, but a file written by jupytext itself has
-# one and it is not a cell.
+# by `# ---`. A file written by jupytext itself has one and it is not a cell;
+# we write one too, carrying the notebook's name, so that opening a
+# checkpoint can select the interpreter it was written under instead of
+# guessing at whatever the current directory happens to offer.
 _FENCE = "# ---"
+
+# `# key: value` inside the fence. Deliberately not a YAML parser: one flat
+# level of scalars is all this carries, and depending on PyYAML would cost
+# the kernel its stdlib-only property for the sake of a colon.
+_FRONTMATTER = re.compile(r"^#\s*([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$")
 
 KINDS = ("code", "markdown")
 
@@ -132,6 +140,25 @@ def _decode_markdown(lines: list[str]) -> str:
     return "\n".join(out)
 
 
+def read_frontmatter(text: str) -> dict[str, str]:
+    """The `key: value` pairs in a leading `# ---` fenced block, if any.
+
+    Returns an empty dict for a file without a fence, which is every file
+    written before this existed and every plain `.py` — so a caller can ask
+    unconditionally and treat "no answer" as "this file does not say".
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != _FENCE:
+        return {}
+    out: dict[str, str] = {}
+    for line in lines[1:]:
+        if line.strip() == _FENCE:
+            break
+        if (found := _FRONTMATTER.match(line.strip())) is not None:
+            out[found.group(1)] = found.group(2)
+    return out
+
+
 def parse_percent(text: str) -> list[ParsedCell]:
     """Cells out of a percent-format `.py`.
 
@@ -179,10 +206,19 @@ def parse_percent(text: str) -> list[ParsedCell]:
     return cells
 
 
-def emit_percent(cells: list[ParsedCell]) -> str:
+def emit_percent(cells: list[ParsedCell], notebook: str | None = None) -> str:
     """The inverse of `parse_percent`, for sources with no leading or
-    trailing blank lines (`parse_percent` strips those)."""
+    trailing blank lines (`parse_percent` strips those).
+
+    `notebook` writes a frontmatter fence naming it. That name is what lets
+    `open` put the file back into the environment it was written under; a
+    file saved without one is portable but says nothing about its
+    dependencies, and the reader is told so rather than left to find out at
+    the first ImportError.
+    """
     chunks: list[str] = []
+    if notebook:
+        chunks.append(f"{_FENCE}\n# notebook: {notebook}\n{_FENCE}")
     for cell in cells:
         head = ["# %%"]
         if cell.name:

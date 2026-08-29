@@ -13,10 +13,12 @@ import {
 	formatEval,
 	formatHints,
 	formatInspect,
+	formatNotebooks,
 	formatRead,
 	formatRun,
 	imagesOf,
 	type CellOutput,
+	type NotebookListing,
 	type RunResponse,
 } from "../src/format.ts";
 
@@ -186,4 +188,43 @@ test("eval prints stdout before the value", () => {
 test("a failed eval prefers the traceback to the one-line error", () => {
 	const text = formatEval({ ok: false, error: "NameError: x", traceback: "Traceback:\n  x" });
 	assert.equal(text, "Traceback:\n  x");
+});
+
+function listing(over: Partial<NotebookListing> = {}): NotebookListing {
+	return {
+		name: "sales",
+		file: "/proj/.pi/notebooks/sales.py",
+		hasFile: true,
+		venv: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales",
+		hasVenv: true,
+		python: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales/bin/python",
+		source: "venv",
+		...over,
+	};
+}
+
+test("the notebook listing names the environment each one runs in", () => {
+	const text = formatNotebooks([listing(), listing({ name: "scratch", hasVenv: false })], "sales");
+	assert.match(text, /^\* sales$/m); // the session's own is marked
+	assert.match(text, /^ {4}venv \/home\/u\/\.pi\/notebook-py\/venvs\/proj-ab12\/sales$/m);
+	assert.match(text, /^ {2}scratch$/m);
+	assert.match(text, /\(not built yet\)$/m);
+});
+
+test("a venv stranded by a pin is still listed, and named as reclaimable", () => {
+	// The whole point of the line: an override leaves the built venv on disk,
+	// and one that cannot be seen cannot be reclaimed. So both are reported —
+	// what runs, and what is merely taking up space.
+	const text = formatNotebooks([listing({ source: "pin", python: "/usr/bin/python3.13" })], "other");
+	assert.match(text, /^ {4}pin: \/usr\/bin\/python3\.13$/m);
+	assert.match(text, /^ {4}venv \S+\/sales \(built, unused\. Delete it with \/nb drop-venv\)$/m);
+});
+
+test("a pin with no venv behind it says nothing about one", () => {
+	const text = formatNotebooks(
+		[listing({ source: "pin", python: "/usr/bin/python3.13", hasVenv: false })],
+		"other",
+	);
+	assert.match(text, /^ {4}pin: \/usr\/bin\/python3\.13$/m);
+	assert.equal(/built, unused/.test(text), false);
 });

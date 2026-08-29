@@ -17,7 +17,11 @@ from hypothesis import strategies as st
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
 from nbkernel import Notebook, NotebookError, ParsedCell  # noqa: E402
-from nbkernel.source import emit_percent, parse_percent  # noqa: E402
+from nbkernel.source import (  # noqa: E402
+    emit_percent,
+    parse_percent,
+    read_frontmatter,
+)
 
 _HEADERISH = re.compile(r"^#\s*%%")
 
@@ -128,6 +132,45 @@ class TestEmitting(unittest.TestCase):
             [ParsedCell(src="a", id="c1"), ParsedCell(src="b", id="c2")]
         )
         self.assertEqual(text, '# %% id="c1"\na\n\n# %% id="c2"\nb\n')
+
+
+class TestFrontmatter(unittest.TestCase):
+    """The fence that carries the notebook's name.
+
+    It is what lets `open` put a checkpoint back into the environment it was
+    written under, so what matters is that it round-trips, that it is never
+    mistaken for a cell, and that a file which does not carry one says
+    nothing rather than something wrong.
+    """
+
+    def test_a_named_save_carries_its_name(self):
+        text = emit_percent([ParsedCell(src="a = 1", id="c1")], notebook="sales")
+        self.assertEqual(text.splitlines()[:3], ["# ---", "# notebook: sales", "# ---"])
+        self.assertEqual(read_frontmatter(text), {"notebook": "sales"})
+
+    def test_the_fence_is_not_a_cell(self):
+        cells = [ParsedCell(src="a = 1", kind="code", name="setup", id="c1")]
+        text = emit_percent(cells, notebook="sales")
+        self.assertEqual(parse_percent(text), cells)
+
+    def test_a_file_without_a_fence_says_nothing(self):
+        self.assertEqual(read_frontmatter(emit_percent([ParsedCell(src="a = 1")])), {})
+        self.assertEqual(read_frontmatter("a = 1\n"), {})
+        self.assertEqual(read_frontmatter(""), {})
+
+    def test_a_jupytext_fence_is_read_without_being_corrupted(self):
+        text = "# ---\n# jupyter:\n#   kernelspec: python3\n# ---\n\n# %%\na = 1\n"
+        # No `notebook` key, so the caller is told this file does not say —
+        # which is the right answer, not a guess at the environment.
+        self.assertNotIn("notebook", read_frontmatter(text))
+        self.assertEqual([c.src for c in parse_percent(text)], ["a = 1"])
+
+    def test_a_fence_below_the_first_line_is_not_frontmatter(self):
+        self.assertEqual(read_frontmatter("# %%\n# ---\n# notebook: x\n# ---\n"), {})
+
+    @given(st.lists(_cell, min_size=1, max_size=4))
+    def test_naming_a_notebook_does_not_disturb_the_round_trip(self, cells):
+        self.assertEqual(parse_percent(emit_percent(cells, notebook="nb")), cells)
 
 
 class TestNotebookPersistence(unittest.TestCase):

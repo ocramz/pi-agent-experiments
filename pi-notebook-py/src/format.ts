@@ -39,10 +39,22 @@ export interface RunResponse {
 	failing?: string[];
 	globals?: Record<string, string>;
 	id?: string;
+	cells?: number;
 	saved?: { path: string; cells: number; bytes: number };
 	loaded?: { path: string; cells: number };
 	installed?: string[];
 	restart_required?: string[];
+}
+
+/** One notebook, as `listNotebooks` in `kernel.ts` reports it. */
+export interface NotebookListing {
+	name: string;
+	file: string;
+	hasFile: boolean;
+	venv: string;
+	hasVenv: boolean;
+	python: string;
+	source: "env" | "pin" | "settings" | "venv";
 }
 
 export interface CellSummary {
@@ -141,12 +153,15 @@ export function formatHints(resp: {
 	return lines;
 }
 
-export function formatInspect(resp: InspectResponse): string {
+export function formatInspect(resp: InspectResponse, notebook?: string): string {
 	if (!resp.ok) return `Error: ${resp.error ?? "unknown"}`;
+	// The name is a prefix rather than a rewrite: a caller with nothing to
+	// say about which notebook this is gets exactly the header it always got.
+	const where = notebook ? `notebook "${notebook}": ` : "";
 	const cells = resp.cells ?? [];
-	if (!cells.length) return "(empty notebook)";
+	if (!cells.length) return notebook ? `(notebook "${notebook}" is empty)` : "(empty notebook)";
 	const lines = [
-		`${cells.length} cell${cells.length === 1 ? "" : "s"}${resp.path ? ` (file: ${resp.path})` : ""}:`,
+		`${where}${cells.length} cell${cells.length === 1 ? "" : "s"}${resp.path ? ` (file: ${resp.path})` : ""}:`,
 	];
 	for (const c of cells) {
 		const count = c.execution_count != null ? `[${c.execution_count}]` : "[ ]";
@@ -155,6 +170,34 @@ export function formatInspect(resp: InspectResponse): string {
 		lines.push(`${count} ${label}${kind} ${c.state}  ${c.preview}`);
 	}
 	lines.push(...formatHints(resp));
+	return lines.join("\n");
+}
+
+/**
+ * The notebooks this project has, and where each one's environment is.
+ *
+ * The venv path is printed rather than summarised because it is the thing
+ * someone reclaiming disk actually needs, and because it is the visible
+ * proof that nothing environment-shaped is inside the working tree.
+ */
+export function formatNotebooks(list: NotebookListing[], current: string): string {
+	if (!list.length) return `no notebooks yet; this session is on "${current}"`;
+	const lines = list.map((n) => {
+		const mark = n.name === current ? "*" : " ";
+		const file = n.hasFile ? n.file : "(no checkpoint yet)";
+		const env =
+			n.source === "venv"
+				? n.hasVenv
+					? `venv ${n.venv}`
+					: `venv ${n.venv} (not built yet)`
+				: `${n.source}: ${n.python}`;
+		// An override does not delete the venv that was built before it, and a
+		// stranded one only takes disk space. Say it is there, and that nothing runs it.
+		const stranded =
+			n.source !== "venv" && n.hasVenv ? `\n    venv ${n.venv} (built, unused. Delete it with /nb drop-venv)` : "";
+		return `${mark} ${n.name}\n    ${file}\n    ${env}${stranded}`;
+	});
+	lines.push("* is this session's notebook. Checkpoints are source; venvs are not in the repo.");
 	return lines.join("\n");
 }
 

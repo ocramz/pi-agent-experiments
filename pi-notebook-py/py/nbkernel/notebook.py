@@ -320,13 +320,23 @@ class Notebook:
             ParsedCell(src=c.src, kind=c.kind, name=c.name, id=c.id) for c in self.cells
         ]
 
-    def save(self, path: str, overwrite: bool = False) -> dict:
+    def save(
+        self,
+        path: str,
+        overwrite: bool = False,
+        remember: bool = True,
+        notebook: str | None = None,
+    ) -> dict:
         """Write the notebook as a percent-format `.py`.
 
         Refuses to clobber a file that is not already a notebook. Parsing
         is too weak a test — any Python file parses as a one-cell notebook
         — so the guard is the marker itself: no `# %%` in the file that is
         already there means it was written by something other than us.
+
+        `remember=False` writes without adopting the path. That is what the
+        automatic checkpoint uses: it is not the file the user asked for, so
+        it must not become the answer to "where was this saved".
         """
         target = Path(path)
         if target.exists() and not overwrite:
@@ -338,9 +348,11 @@ class Notebook:
                     f"{path} exists and is not a percent-format notebook "
                     "(no `# %%` marker) — pass overwrite to replace it"
                 )
-        text = emit_percent(self._parsed())
+        text = emit_percent(self._parsed(), notebook=notebook)
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf8")
-        self.path = path
+        if remember:
+            self.path = path
         return {"path": path, "cells": len(self.cells), "bytes": len(text)}
 
     def load(self, path: str) -> dict:

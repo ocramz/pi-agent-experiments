@@ -37,6 +37,7 @@ from .source import (
     compile_cell,
     emit_percent,
     parse_percent,
+    read_frontmatter,
 )
 from .values import brief, globals_brief
 
@@ -57,5 +58,6 @@ __all__ = [
     "fresh_namespace",
     "globals_brief",
     "parse_percent",
+    "read_frontmatter",
     "run_cell",
 ]

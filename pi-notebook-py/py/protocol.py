@@ -99,6 +99,10 @@ def _response(nb: Notebook, outputs: list[Output], **extra) -> dict:
     return {
         "ok": True,
         "results": [asdict(o) for o in outputs],
+        # How many cells there are, not which — the client autosaves a
+        # checkpoint after every mutation and needs to know it is not about
+        # to write an empty file over a good one.
+        "cells": len(nb.cells),
         "stale": nb.stale(),
         "unrun": nb.unrun(),
         "failing": nb.failing(),
@@ -155,7 +159,10 @@ def handle(nb: Notebook, req: dict) -> dict:
                 return {"ok": output["status"] != "error", **output}
             case "save":
                 saved = nb.save(
-                    _need(req, "path"), overwrite=req.get("overwrite", False)
+                    _need(req, "path"),
+                    overwrite=req.get("overwrite", False),
+                    remember=req.get("remember", True),
+                    notebook=req.get("notebook"),
                 )
                 return _response(nb, [], saved=saved)
             case "load":

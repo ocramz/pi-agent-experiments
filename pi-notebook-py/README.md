@@ -68,7 +68,7 @@ kernel exists to report.
 |---|---|
 | `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing. |
 | `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh namespace (Restart & Run All) |
-| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open`. |
+| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open`, and the notebook-level `notebooks`, `new`, `use`. |
 | `nb_install` | pip, into the interpreter the kernel is actually running. |
 
 And two slash commands, so the human shares the same namespace:
@@ -79,9 +79,57 @@ And two slash commands, so the human shares the same namespace:
 /nb run <id>  /nb run-all
 /nb read <id>
 /nb save <path>  /nb open <path>
+/nb notebooks             every notebook in this project, and its environment
+/nb new <name>  /nb use <name>
+/nb drop-venv <name>      delete one notebook's venv, never its source
 /nb <expr>                evaluate without creating a cell
-/nb-python <path>         pin the interpreter (restarts the kernel)
+/nb-python <path>         pin this notebook's interpreter (restarts the kernel)
+/nb-python clear          undo the pin; back to the notebook's own venv
 ```
+
+## Notebooks have their own environments
+
+A session is always *on* a named notebook — `default` until you say otherwise. The name does two
+things:
+
+```
+<project>/.pi/notebooks/sales.py     the checkpoint. Source. Commit it.
+~/.pi/notebook-py/venvs/<project>/sales/    its interpreter. Never in the repo.
+```
+
+`nb_install` installs into the notebook the session is on, and nowhere else, so two notebooks in
+one project can hold conflicting versions of the same package. Switching is `nb_notebook {op:
+"use", name}` — it discards the namespace, because the new notebook has a different interpreter and
+carrying globals across would be exactly the stale state this kernel exists to report.
+
+The checkpoint is rewritten after every change, so it is always current and always committable. It
+carries the notebook's name in a jupytext frontmatter fence:
+
+```python
+# ---
+# notebook: sales
+# ---
+
+# %% setup id="c1"
+import pandas as pd
+```
+
+which is what lets `open` put a file back into the environment it was written under instead of
+guessing. A file *without* a fence — anything jupytext wrote, or any plain `.py` — opens in the
+current notebook, and the reply says so rather than letting you find out at the first `ImportError`.
+
+### What to commit
+
+`.pi/notebooks/*.py` and nothing else. There is no ignore rule to add, because there is nothing to
+ignore: venvs are not in the working tree at all. That is deliberate rather than tidy — a venv
+carries an absolute `home =` in its `pyvenv.cfg`, absolute shebangs in its scripts, and
+platform-specific compiled extensions, so a committed one is *broken* on every other machine, not
+merely large. `git add -A` cannot sweep one in because there is none to sweep.
+
+To reclaim the disk: `/nb drop-venv <name>` deletes one notebook's venv and never its source.
+`/nb notebooks` prints where each one is, including a venv left stranded by a `/nb-python` pin.
+It is a slash command rather than an agent tool because deciding a notebook is finished is yours
+to do, not the model's — see §3.8 of [docs/semantics.md](docs/semantics.md).
 
 ## The file format
 
@@ -129,9 +177,69 @@ and about 1 MB each; over that, one downscale attempt and then a note saying wha
 pi package add @ocramz/pi-notebook-py
 ```
 
-Needs Python 3.12 or newer. The kernel finds an interpreter in this order: `PI_PYTHON`, then a pin
-written by `/nb-python` into `.notebook/python-pin`, then a venv it builds and owns at
-`.notebook/venv`. `.notebook/` gets a `.gitignore` covering both.
+Needs Python 3.12 or newer. Each notebook gets its own interpreter, found in this order:
+
+| | |
+|---|---|
+| `PI_PYTHON` | escape hatch; overrides everything, including per notebook |
+| `~/.pi/notebook-py/pins/<project>/<name>` | written by `/nb-python`. Machine-local, because an absolute path is |
+| `notebookPy.python.<name>` in `.pi/settings.json` | the pin a team can share. Relative, so `"./.venv"` means the same thing everywhere |
+| `~/.pi/notebook-py/venvs/<project>/<name>` | otherwise: a venv this extension builds and owns |
+
+`<project>` is the directory's basename plus a hash of its real path, so two checkouts of the same
+repo do not share an environment. `uv` is used to build the venv when it is on `PATH` — its cache
+hardlinks, which is what makes a venv per notebook cheap — and `python -m venv` otherwise.
+
+Everything else is optional, under `notebookPy` in `.pi/settings.json`:
+
+```json
+{
+  "notebookPy": {
+    "default": "sales",
+    "python": { "sales": "./.venv" },
+    "venvRoot": "/fast-disk/nb-venvs"
+  }
+}
+```
+
+`PI_NOTEBOOK_VENV_ROOT` overrides `venvRoot`, and `PI_NOTEBOOK_HOME` moves the venvs and the pins
+together. If a `venvRoot` ends up inside the repository, the pattern is appended to
+`.git/info/exclude` — repo-local, untracked, in nobody's diff — so the guarantee above survives the
+escape hatch.
+
+## Running in a container
+
+The venvs live under `$HOME`, so give `$HOME/.pi/notebook-py` a named volume. Without one, every
+fresh container rebuilds every notebook's environment from scratch:
+
+```bash
+podman run -it --rm \
+  -v "$PWD":/workspace -w /workspace \
+  -v pi-config:/root/.pi \
+  -v pi-notebook-venvs:/root/.pi/notebook-py \
+  <your-pi-image>
+```
+
+(`docker run` is the same. This repo's own [Makefile](../Makefile) mounts exactly these for `make
+dev`, if you want a worked example.) The nesting is deliberate: pi's credentials and sessions are
+kilobytes with a long life, and the venvs are gigabytes you may want to throw away without logging
+in again.
+
+**The container builds its own venvs, separate from the host's** — and it has to. If they were in
+the working tree they would be shared over the bind mount, and a venv works for exactly one side:
+the interpreter path, the shebangs and every compiled extension differ between a macOS host and a
+Linux image. Keying off `$HOME` means each side builds its own with no coordination and no
+configuration.
+
+**Cleanup.** Removing or replacing the container neither reclaims the venvs nor loses them — that
+is the whole point of the volume. To actually reclaim:
+
+```bash
+podman volume rm pi-notebook-venvs      # all of them
+```
+
+or, from inside a session, `/nb drop-venv <name>` for one notebook at a time. The checkpoints
+under `.pi/notebooks/` are in the repo and are never touched by either.
 
 ## Development
 

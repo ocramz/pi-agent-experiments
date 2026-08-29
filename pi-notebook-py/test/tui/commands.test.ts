@@ -12,15 +12,21 @@
 // test/container/test_protocol_in_image.sh for both over the wire.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { session } from "./session.ts";
 
-test("W1: /nb on an empty notebook says it is empty", async (t) => {
+/** Some interpreter that really is on this machine — /opt in the image, /usr on a host. */
+const SYSTEM_PYTHON = execFileSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).trim();
+
+test("W1: /nb on an empty notebook says it is empty, and which one", async (t) => {
 	const s = await session(t);
 	await s.command("/nb");
-	await s.expect("(empty notebook)");
+	// The name is on the listing because a session is always on some notebook,
+	// and "empty" means nothing until you know which one is empty.
+	await s.expect('(notebook "default" is empty)');
 	await s.close();
 });
 
@@ -130,7 +136,97 @@ test("W9: /nb open loads a hand-written percent file, unrun", async (t) => {
 test("W10: /nb-python with no argument explains itself instead of pinning", async (t) => {
 	const s = await session(t);
 	await s.command("/nb-python");
+	// It reports before it offers: which notebook, and what that notebook is
+	// currently running — the pin is per notebook now, so naming it matters.
+	await s.expect('notebook "default" runs');
 	await s.expect("Usage:");
-	await s.expect(".notebook/python-pin");
+	await s.expect("pins this notebook only");
+	await s.close();
+});
+
+test("W11: /nb new switches to a notebook of its own, and /nb use comes back", async (t) => {
+	const s = await session(t);
+	await s.command("/nb add base kept = 1");
+	await s.expect("globals: kept=1");
+
+	// A new notebook is a new namespace and a new interpreter, so the variable
+	// must not follow it across.
+	await s.command("/nb new sales");
+	await s.expect('notebook "sales"');
+	await s.command("/nb");
+	await s.expect('(notebook "sales" is empty)');
+
+	await s.command("/nb notebooks");
+	await s.expect("sales");
+	await s.expect("default");
+
+	// Back again: the checkpoint written after every change is what makes the
+	// cell survive a round trip through another notebook.
+	await s.command("/nb use default");
+	await s.expect("loaded 1 cell");
+	await s.command("/nb read c1");
+	await s.expect("kept = 1");
+	await s.close();
+});
+
+test("W12: a notebook name that is a path is refused, not escaped", async (t) => {
+	const s = await session(t);
+	await s.command("/nb new ../escape");
+	await s.expect("invalid notebook name");
+	// Still on the notebook it started on.
+	await s.command("/nb");
+	await s.expect('(notebook "default" is empty)');
+	await s.close();
+});
+
+test("W13: /nb drop-venv removes one notebook's venv, and says so twice over", async (t) => {
+	const s = await session(t);
+	// The venv is built lazily, on the first kernel call after the switch —
+	// so the /nb is what puts one on disk for this case to reclaim.
+	await s.command("/nb new sales");
+	await s.expect('notebook "sales"');
+	await s.command("/nb");
+	await s.expect('(notebook "sales" is empty)');
+	await s.command("/nb use default");
+	await s.expect('notebook "default"');
+
+	// Only the leading line: this response's tail is the "untouched — it is
+	// source" note, which the toast stacking clips (see the file header).
+	await s.command("/nb drop-venv sales");
+	await s.expect('removed the venv for "sales"');
+	// Idempotent, and it says which of the two things happened — the human is
+	// reclaiming disk and wants to know whether there was any to reclaim.
+	await s.command("/nb drop-venv sales");
+	await s.expect('notebook "sales" has no venv to remove');
+
+	// Same validation as `new`: the name is a path segment under the venv root.
+	await s.command("/nb drop-venv ../escape");
+	await s.expect("invalid notebook name");
+	await s.close();
+});
+
+test("W14: dropping a venv a pin had stranded costs the session nothing", async (t) => {
+	const s = await session(t);
+	// Build the venv, then pin past it. From here the kernel runs the pinned
+	// interpreter and the venv is dead disk — which is the state /nb notebooks
+	// now advertises, so reclaiming it has to be safe.
+	await s.command("/nb add base first = 1");
+	await s.expect("globals: first=1");
+	await s.command(`/nb-python ${SYSTEM_PYTHON}`);
+	await s.expect("kernel will restart");
+
+	await s.command("/nb add kept alive = 424242");
+	await s.expect("globals: alive=424242");
+	await s.command("/nb notebooks");
+	await s.expect("built, unused");
+
+	await s.command("/nb drop-venv default");
+	await s.expect('removed the venv for "default"');
+
+	// The point of the case. `current` alone would have killed the kernel here
+	// and promised a rebuild resolvePython never performs, since the pin still
+	// decides what runs. The namespace surviving is what proves it did not.
+	await s.command("/nb alive");
+	await s.expect("424242");
 	await s.close();
 });
