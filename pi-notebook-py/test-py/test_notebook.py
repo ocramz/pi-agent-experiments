@@ -427,8 +427,8 @@ class TestInstall(unittest.TestCase):
         # sys.modules, so the response said nothing needed a restart while
         # the old code was still live — the one thing it exists to prevent.
         self.imported("crumhorn")
-        for spec in ("crumhorn==2", 
-                     "crumhorn>=2", 
+        for spec in ("crumhorn==2",
+                     "crumhorn>=2",
                      "crumhorn~=2.0", "crumhorn!=1.5", "crumhorn >2"):
             with self.subTest(spec=spec):
                 self.assertEqual(self.restart_required(spec), ["crumhorn"])
