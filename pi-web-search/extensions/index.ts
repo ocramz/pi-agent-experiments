@@ -28,10 +28,11 @@ export default function (pi: ExtensionAPI) {
 			"the TAVILY_API_KEY environment variable.",
 		promptSnippet: "web_search_tavily: search the web; returns titles, URLs and excerpts.",
 		promptGuidelines: [
-			"Prefer specific queries with the key terms over full questions.",
-			"For recency-sensitive questions set topic to \"news\" or pass time_range; cite the URLs you used back to the user.",
-			"If the tool reports a missing TAVILY_API_KEY, tell the user to set it — do not retry.",
-			"One search is usually enough; refine the query rather than repeating the same one.",
+			"In web_search_tavily, Prefer specific queries with the key terms over full questions.",
+			"For recency-sensitive questions set web_search_tavily topic to \"news\" or pass time_range", 
+			"When returning web_search_tavily results, cite the URLs you used back to the user.",
+			"If the web_search_tavily tool reports a missing TAVILY_API_KEY, tell the user to set it — do not retry.",
+			"One web_search_tavily search is usually enough; refine the query rather than repeating the same one.",
 		],
 		parameters: Type.Object({
 			query: Type.String({ description: "The search query." }),
