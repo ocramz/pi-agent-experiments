@@ -17,7 +17,11 @@ from hypothesis import strategies as st
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
 from nbkernel import Notebook, NotebookError, ParsedCell  # noqa: E402
-from nbkernel.source import emit_percent, parse_percent  # noqa: E402
+from nbkernel.source import (  # noqa: E402
+    emit_percent,
+    parse_percent,
+    read_frontmatter,
+)
 
 _HEADERISH = re.compile(r"^#\s*%%")
 
@@ -38,20 +42,10 @@ _line = (
 # format round-trips over — `parse_percent` strips those by construction.
 _src = st.lists(_line, min_size=0, max_size=4).map(lambda ls: "\n".join(ls).strip("\n"))
 
-# A name shares its line with the bracketed cell type and the key="value"
-# metadata, so it cannot contain the characters that delimit those.
-_name = st.one_of(
-    st.none(),
-    st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789-_ ", min_size=1, max_size=12)
-    .map(str.strip)
-    .filter(bool),
-)
-
 _cell = st.builds(
     ParsedCell,
     src=_src,
     kind=st.sampled_from(["code", "markdown"]),
-    name=_name,
     id=st.one_of(st.none(), st.integers(1, 99).map(lambda i: f"c{i}")),
 )
 
@@ -85,10 +79,24 @@ class TestParsing(unittest.TestCase):
             "# %%\nmath.pi\n"
         )
         self.assertEqual([c.kind for c in cells], ["code", "markdown", "code"])
-        self.assertEqual(cells[0].name, "setup")
         self.assertEqual(cells[0].id, "c1")
+        self.assertEqual(cells[0].src, "import math")
         self.assertEqual(cells[1].src, "Some prose")
-        self.assertIsNone(cells[2].name)
+
+    def test_a_jupytext_title_is_read_past_and_dropped(self):
+        """The title slot exists in the format; a cell has nothing to put in it.
+
+        What matters is that a hand-written title costs nothing: the id, the
+        kind and the source all survive it, and it does not leak into `src`.
+        """
+        cells = parse_percent(
+            '# %% Load the data id="c1"\na = 1\n\n'
+            "# %% Notes [markdown]\n# prose\n\n"
+            "# %% plain title\nb = 2\n"
+        )
+        self.assertEqual([c.id for c in cells], ["c1", None, None])
+        self.assertEqual([c.kind for c in cells], ["code", "markdown", "code"])
+        self.assertEqual([c.src for c in cells], ["a = 1", "prose", "b = 2"])
 
     def test_yaml_frontmatter_is_not_a_cell(self):
         cells = parse_percent(
@@ -114,10 +122,10 @@ class TestParsing(unittest.TestCase):
 
 
 class TestEmitting(unittest.TestCase):
-    def test_the_header_order_is_name_type_metadata(self):
-        cell = ParsedCell(src="x", kind="markdown", name="notes", id="c7")
+    def test_the_header_order_is_type_then_metadata(self):
+        cell = ParsedCell(src="x", kind="markdown", id="c7")
         text = emit_percent([cell])
-        self.assertEqual(text.splitlines()[0], '# %% notes [markdown] id="c7"')
+        self.assertEqual(text.splitlines()[0], '# %% [markdown] id="c7"')
 
     def test_code_cells_carry_no_bracketed_type(self):
         text = emit_percent([ParsedCell(src="x", id="c1")])
@@ -130,6 +138,45 @@ class TestEmitting(unittest.TestCase):
         self.assertEqual(text, '# %% id="c1"\na\n\n# %% id="c2"\nb\n')
 
 
+class TestFrontmatter(unittest.TestCase):
+    """The fence that carries the notebook's name.
+
+    It is what lets `open` put a checkpoint back into the environment it was
+    written under, so what matters is that it round-trips, that it is never
+    mistaken for a cell, and that a file which does not carry one says
+    nothing rather than something wrong.
+    """
+
+    def test_a_named_save_carries_its_name(self):
+        text = emit_percent([ParsedCell(src="a = 1", id="c1")], notebook="sales")
+        self.assertEqual(text.splitlines()[:3], ["# ---", "# notebook: sales", "# ---"])
+        self.assertEqual(read_frontmatter(text), {"notebook": "sales"})
+
+    def test_the_fence_is_not_a_cell(self):
+        cells = [ParsedCell(src="a = 1", kind="code", id="c1")]
+        text = emit_percent(cells, notebook="sales")
+        self.assertEqual(parse_percent(text), cells)
+
+    def test_a_file_without_a_fence_says_nothing(self):
+        self.assertEqual(read_frontmatter(emit_percent([ParsedCell(src="a = 1")])), {})
+        self.assertEqual(read_frontmatter("a = 1\n"), {})
+        self.assertEqual(read_frontmatter(""), {})
+
+    def test_a_jupytext_fence_is_read_without_being_corrupted(self):
+        text = "# ---\n# jupyter:\n#   kernelspec: python3\n# ---\n\n# %%\na = 1\n"
+        # No `notebook` key, so the caller is told this file does not say —
+        # which is the right answer, not a guess at the environment.
+        self.assertNotIn("notebook", read_frontmatter(text))
+        self.assertEqual([c.src for c in parse_percent(text)], ["a = 1"])
+
+    def test_a_fence_below_the_first_line_is_not_frontmatter(self):
+        self.assertEqual(read_frontmatter("# %%\n# ---\n# notebook: x\n# ---\n"), {})
+
+    @given(st.lists(_cell, min_size=1, max_size=4))
+    def test_naming_a_notebook_does_not_disturb_the_round_trip(self, cells):
+        self.assertEqual(parse_percent(emit_percent(cells, notebook="nb")), cells)
+
+
 class TestNotebookPersistence(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -140,7 +187,7 @@ class TestNotebookPersistence(unittest.TestCase):
 
     def saved(self) -> tuple[Notebook, str]:
         nb = Notebook()
-        nb.add("a = 1", name="setup")
+        nb.add("a = 1")
         nb.add("b = a + 1")
         nb.add("b")
         nb.run_all()
@@ -153,7 +200,6 @@ class TestNotebookPersistence(unittest.TestCase):
         other = Notebook()
         other.load(path)
         self.assertEqual([c.src for c in other.cells], ["a = 1", "b = a + 1", "b"])
-        self.assertEqual(other.cells[0].name, "setup")
         # No outputs in the format, so everything comes back unrun.
         self.assertEqual(other.unrun(), ["c1", "c2", "c3"])
         self.assertEqual(other.stale(), [])

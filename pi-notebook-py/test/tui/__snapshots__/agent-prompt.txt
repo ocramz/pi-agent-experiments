@@ -1,15 +1,16 @@
 - nb_cell: create or edit a cell in a persistent Python notebook and run it.
 - nb_run: run one notebook cell, everything, or everything above or below a cell.
-- nb_notebook: list, read, delete, move, restart, save or open the notebook.
+- nb_notebook: list, read, delete, move, restart, save, open, or switch between notebooks.
 - nb_install: pip-install packages into the notebook kernel's own interpreter.
 
-- Give nb_cell one coherent step per cell — a load, a transform, a plot — rather than one enormous cell: small cells are what make re-running a single step cheap.
-- In nb_cell, a cell whose last line is an expression displays that value, and that is how to show a result. print() also works and its output is captured, but the trailing expression is what summarises a value's shape.
+- Aim to use nb_cell with one small, self-contained statement per cell (eg. a data load, a transform, a plot): small cells are what make re-running a single step cheap.
+- In nb_cell, a cell whose last line is an expression displays that value; use that to show a result. print() also works and its output is captured, but the trailing expression also prints a summary or a value's shape.
 - nb_cell reports `stale` cells: ones that ran before something above them changed. Their variables are still in the namespace but the notebook no longer reproduces them — re-run with nb_run before trusting those values.
 - Editing a cell with nb_cell discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.
 - On ImportError, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.
 - `nb_run {op: "all"}` restarts the namespace and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces.
 - After editing a cell in the middle, `nb_run {op: "below", id: <that cell>}` is usually what you want: it re-runs the edited cell and everything that could depend on it, without redoing the expensive setup above.
 - Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.
-- `nb_notebook {op: "save"}` writes a percent-format .py that stores source but no outputs. Say so when handing the file to the user, and re-run after opening one.
+- Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv, so conflicting versions cannot collide. Switching is not free — it discards the current namespace — so do not switch to organise cells.
+- `nb_notebook {op: "save"}` exports a percent-format .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.
 - Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need the namespace to match the notebook.

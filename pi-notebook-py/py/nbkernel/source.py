@@ -27,18 +27,27 @@ __all__ = [
     "emit_percent",
     "forget_source",
     "parse_percent",
+    "read_frontmatter",
 ]
 
 # jupytext's header: `# %%` then an optional title, an optional [celltype]
-# in brackets, and any number of key="value" pairs, in that order.
+# in brackets, and any number of key="value" pairs, in that order. A cell has
+# no title of its own, so we read past that slot and never write it.
 _HEADER = re.compile(r"^#\s*%%(?P<rest>.*)$")
 _CELLTYPE = re.compile(r"\[(\w+)\]")
 _METADATA = re.compile(r'(\w+)="([^"]*)"')
 
 # jupytext writes a YAML frontmatter block as a run of comment lines fenced
-# by `# ---`. We never emit one, but a file written by jupytext itself has
-# one and it is not a cell.
+# by `# ---`. A file written by jupytext itself has one and it is not a cell;
+# we write one too, carrying the notebook's name, so that opening a
+# checkpoint can select the interpreter it was written under instead of
+# guessing at whatever the current directory happens to offer.
 _FENCE = "# ---"
+
+# `# key: value` inside the fence. Deliberately not a YAML parser: one flat
+# level of scalars is all this carries, and depending on PyYAML would cost
+# the kernel its stdlib-only property for the sake of a colon.
+_FRONTMATTER = re.compile(r"^#\s*([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$")
 
 KINDS = ("code", "markdown")
 
@@ -94,25 +103,24 @@ class ParsedCell:
 
     src: str
     kind: str = "code"
-    name: str | None = None
     id: str | None = None
 
 
-def _parse_header(rest: str) -> tuple[str, str | None, str | None]:
-    """`(kind, name, id)` out of everything after the `# %%` marker.
+def _parse_header(rest: str) -> tuple[str, str | None]:
+    """`(kind, id)` out of everything after the `# %%` marker.
 
-    The name is whatever text is left once the bracketed cell type and the
-    key="value" pairs have been lifted out, which is how jupytext gets a
-    title and metadata onto one line without quoting the title.
+    Whatever text is left once the bracketed cell type and the key="value"
+    pairs have been lifted out is jupytext's title slot. A cell here has no
+    title, so that text is read past and dropped — the same treatment an
+    unrecognised bracketed cell type gets, and for the same reason: it says
+    nothing about what the cell computes.
     """
     cid = dict(_METADATA.findall(rest)).get("id") or None
-    kind = "code"
-    if (found := _CELLTYPE.search(rest)) is not None:
-        if found.group(1) in KINDS:
-            kind = found.group(1)
-        rest = rest[: found.start()] + rest[found.end() :]
-    name = _METADATA.sub("", rest).strip() or None
-    return kind, name, cid
+    if (found := _CELLTYPE.search(rest)) is not None and found.group(1) in KINDS:
+        kind = found.group(1)
+    else:
+        kind = "code"
+    return kind, cid
 
 
 def _decode_markdown(lines: list[str]) -> str:
@@ -130,6 +138,24 @@ def _decode_markdown(lines: list[str]) -> str:
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def read_frontmatter(text: str) -> dict[str, str]:
+    """The `key: value` pairs in a leading `# ---` fenced block, if any.
+
+    Returns an empty dict for a file without a fence, which is every file
+    written before this existed and every plain `.py` — so a caller can ask
+    unconditionally and treat "no answer" as "this file does not say".
+    """
+    lines = text.splitlines()
+    out: dict[str, str] = {}
+    if lines and lines[0].strip() == _FENCE:
+        for line in lines[1:]:
+            if line.strip() == _FENCE:
+                break
+            if (found := _FRONTMATTER.match(line.strip())) is not None:
+                out[found.group(1)] = found.group(2)
+    return out
 
 
 def parse_percent(text: str) -> list[ParsedCell]:
@@ -172,21 +198,28 @@ def parse_percent(text: str) -> list[ParsedCell]:
             if src.strip():
                 cells.append(ParsedCell(src=src))
             continue
-        kind, name, cid = _parse_header(head)
+        kind, cid = _parse_header(head)
         if kind == "markdown":
             src = _decode_markdown(src.splitlines()).strip("\n")
-        cells.append(ParsedCell(src=src, kind=kind, name=name, id=cid))
+        cells.append(ParsedCell(src=src, kind=kind, id=cid))
     return cells
 
 
-def emit_percent(cells: list[ParsedCell]) -> str:
+def emit_percent(cells: list[ParsedCell], notebook: str | None = None) -> str:
     """The inverse of `parse_percent`, for sources with no leading or
-    trailing blank lines (`parse_percent` strips those)."""
+    trailing blank lines (`parse_percent` strips those).
+
+    `notebook` writes a frontmatter fence naming it. That name is what lets
+    `open` put the file back into the environment it was written under; a
+    file saved without one is portable but says nothing about its
+    dependencies, and the reader is told so rather than left to find out at
+    the first ImportError.
+    """
     chunks: list[str] = []
+    if notebook:
+        chunks.append(f"{_FENCE}\n# notebook: {notebook}\n{_FENCE}")
     for cell in cells:
         head = ["# %%"]
-        if cell.name:
-            head.append(cell.name)
         if cell.kind != "code":
             head.append(f"[{cell.kind}]")
         if cell.id:

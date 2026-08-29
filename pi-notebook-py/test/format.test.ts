@@ -13,10 +13,12 @@ import {
 	formatEval,
 	formatHints,
 	formatInspect,
+	formatNotebooks,
 	formatRead,
 	formatRun,
 	imagesOf,
 	type CellOutput,
+	type NotebookListing,
 	type RunResponse,
 } from "../src/format.ts";
 
@@ -143,7 +145,6 @@ test("inspect lists cells with their state and a preview", () => {
 				id: "c1",
 				index: 0,
 				kind: "code",
-				name: "setup",
 				execution_count: 1,
 				lines: 1,
 				preview: "import math",
@@ -153,7 +154,6 @@ test("inspect lists cells with their state and a preview", () => {
 				id: "c2",
 				index: 1,
 				kind: "markdown",
-				name: null,
 				execution_count: null,
 				lines: 2,
 				preview: "Notes",
@@ -163,7 +163,7 @@ test("inspect lists cells with their state and a preview", () => {
 		stale: [],
 	});
 	assert.match(text, /^2 cells \(file: nb\.py\):$/m);
-	assert.match(text, /^\[1\] c1 \(setup\) ok {2}import math$/m);
+	assert.match(text, /^\[1\] c1 ok {2}import math$/m);
 	assert.match(text, /^\[ \] c2 markdown unrun {2}Notes$/m);
 });
 
@@ -174,9 +174,9 @@ test("an empty notebook says so rather than printing a header", () => {
 test("read prints full source under a labelled separator", () => {
 	const text = formatRead({
 		ok: true,
-		cells: [{ id: "c1", kind: "code", name: "load", src: "a = 1\nb = 2" }],
+		cells: [{ id: "c1", kind: "code", src: "a = 1\nb = 2" }],
 	});
-	assert.equal(text, "--- c1 (load)\na = 1\nb = 2");
+	assert.equal(text, "--- c1\na = 1\nb = 2");
 });
 
 test("eval prints stdout before the value", () => {
@@ -186,4 +186,43 @@ test("eval prints stdout before the value", () => {
 test("a failed eval prefers the traceback to the one-line error", () => {
 	const text = formatEval({ ok: false, error: "NameError: x", traceback: "Traceback:\n  x" });
 	assert.equal(text, "Traceback:\n  x");
+});
+
+function listing(over: Partial<NotebookListing> = {}): NotebookListing {
+	return {
+		name: "sales",
+		file: "/proj/.pi/notebooks/sales.py",
+		hasFile: true,
+		venv: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales",
+		hasVenv: true,
+		python: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales/bin/python",
+		source: "venv",
+		...over,
+	};
+}
+
+test("the notebook listing names the environment each one runs in", () => {
+	const text = formatNotebooks([listing(), listing({ name: "scratch", hasVenv: false })], "sales");
+	assert.match(text, /^\* sales$/m); // the session's own is marked
+	assert.match(text, /^ {4}venv \/home\/u\/\.pi\/notebook-py\/venvs\/proj-ab12\/sales$/m);
+	assert.match(text, /^ {2}scratch$/m);
+	assert.match(text, /\(not built yet\)$/m);
+});
+
+test("a venv stranded by a pin is still listed, and named as reclaimable", () => {
+	// The whole point of the line: an override leaves the built venv on disk,
+	// and one that cannot be seen cannot be reclaimed. So both are reported —
+	// what runs, and what is merely taking up space.
+	const text = formatNotebooks([listing({ source: "pin", python: "/usr/bin/python3.13" })], "other");
+	assert.match(text, /^ {4}pin: \/usr\/bin\/python3\.13$/m);
+	assert.match(text, /^ {4}venv \S+\/sales \(built, unused\. Delete it with \/nb drop-venv\)$/m);
+});
+
+test("a pin with no venv behind it says nothing about one", () => {
+	const text = formatNotebooks(
+		[listing({ source: "pin", python: "/usr/bin/python3.13", hasVenv: false })],
+		"other",
+	);
+	assert.match(text, /^ {4}pin: \/usr\/bin\/python3\.13$/m);
+	assert.equal(/built, unused/.test(text), false);
 });

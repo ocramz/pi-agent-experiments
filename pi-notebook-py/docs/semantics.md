@@ -78,7 +78,6 @@ leaving it in both. `failing` is read off the last output. A cell is in at most 
 | Operation | Effect |
 |---|---|
 | edit a cell's source or kind | that cell becomes unrun; everything below it is stale |
-| rename a cell | nothing — a name cannot change what the cell computes |
 | set identical source | nothing |
 | run a cell | everything below it is stale |
 | insert a cell | everything below the insertion point is stale, before it has even run |
@@ -129,6 +128,43 @@ thread, so there is nothing to deliver a signal to. A cell that hangs costs the 
 ### 3.5 A `# %%` line inside a cell splits it
 
 The format has no escape for its own delimiter. jupytext has the same limitation.
+
+### 3.6 Isolation between notebooks is dependency-scoped, and nothing more
+
+Each notebook runs in its own venv, so an `nb_install` in one cannot change what another imports,
+and two notebooks may hold conflicting versions. That is the whole of the claim. A cell still runs
+as the same user, in the same working directory, with the same network and the same filesystem as
+every other notebook — and a cell that shells out to the *system* pip reaches past the venv
+entirely. "Isolated" here means dependencies, not a sandbox, and nothing in the kernel is a
+security boundary.
+
+### 3.7 Two sessions on the same notebook still share everything
+
+The name is the key, so two pi sessions that are both on `sales` get the same venv and the same
+checkpoint file, and the second writer wins. There is no lock: the case that mattered was two
+sessions in one project stepping on each other by *default*, which naming fixes, and a lock for the
+case where two sessions were deliberately pointed at one notebook would be paid for on every
+mutation by everyone.
+
+### 3.8 Abandoned venvs are not collected
+
+They sit outside the working tree, so `git clean` does not reach them either. `/nb drop-venv <name>`
+removes one and `nb_notebook {op: "notebooks"}` prints where they all are; nothing removes one
+automatically, because "this notebook looks finished" is not a judgement the kernel is in a position
+to make.
+
+It is a slash command and not an agent op for the same reason. The agent is no better placed than
+the kernel to know a notebook is done with — abandonment is a fact about what the user intends
+next, not about anything the notebook contains — and no analysis task has "delete a venv" as a
+step. Reclaiming disk is the user's decision, so it is on the user's surface. What the agent is
+left with is the reversible half: `new` and `use` cost a namespace, and `notebooks` costs nothing.
+
+The listing reports a notebook's venv whether or not the notebook currently runs in it, because
+`PI_PYTHON`, a `/nb-python` pin and a `.pi/settings.json` entry all leave an already-built venv on
+disk while overriding it. Pinning is the likeliest way to strand one, so a listing that showed the
+venv only while nothing overrode it would hide exactly the environments worth reclaiming. For the
+same reason `drop-venv` resolves through `venvDir` rather than through the interpreter that is in
+force: a pin changes what runs, not what this extension owns.
 
 ## 4. Not planned
 

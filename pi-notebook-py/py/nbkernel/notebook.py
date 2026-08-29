@@ -109,13 +109,10 @@ class Notebook:
         src: str,
         after: str | None = None,
         kind: str = "code",
-        name: str | None = None,
     ) -> Cell:
         if kind not in KINDS:
             raise NotebookError(f"kind must be one of {KINDS}, not {kind!r}")
-        cell = Cell(
-            id=self._new_id(), src=src, kind=kind, name=name, touched_at=self._bump()
-        )
+        cell = Cell(id=self._new_id(), src=src, kind=kind, touched_at=self._bump())
         self.cells.insert(self._position(after), cell)
         return cell
 
@@ -123,7 +120,6 @@ class Notebook:
         self,
         cid: str,
         src: str | None = None,
-        name: str | None = None,
         kind: str | None = None,
     ) -> Cell:
         """Edit a cell in place.
@@ -132,7 +128,6 @@ class Notebook:
         drops its last output. Keeping that output would mean displaying
         the result of code that is no longer in the cell, which is exactly
         the confusion this kernel exists to report rather than create.
-        A rename touches nothing: it cannot change what the cell computes.
         """
         cell = self.cell(cid)
         if kind is not None and kind not in KINDS:
@@ -144,8 +139,6 @@ class Notebook:
             cell.src = src
         if kind is not None:
             cell.kind = kind
-        if name is not None:
-            cell.name = name or None
         if changed:
             cell.touched_at = self._bump()
             cell.ran_at = None
@@ -287,7 +280,6 @@ class Notebook:
                     "id": cell.id,
                     "index": i,
                     "kind": cell.kind,
-                    "name": cell.name,
                     "execution_count": cell.execution_count,
                     "lines": len(cell.src.splitlines()),
                     "preview": _preview(cell.src),
@@ -309,24 +301,30 @@ class Notebook:
     def read(self, cid: str | None = None) -> list[dict]:
         """Full source, for one cell or all of them."""
         cells = self.cells if cid is None else [self.cell(cid)]
-        return [
-            {"id": c.id, "kind": c.kind, "name": c.name, "src": c.src} for c in cells
-        ]
+        return [{"id": c.id, "kind": c.kind, "src": c.src} for c in cells]
 
     # ---- persistence
 
     def _parsed(self) -> list[ParsedCell]:
-        return [
-            ParsedCell(src=c.src, kind=c.kind, name=c.name, id=c.id) for c in self.cells
-        ]
+        return [ParsedCell(src=c.src, kind=c.kind, id=c.id) for c in self.cells]
 
-    def save(self, path: str, overwrite: bool = False) -> dict:
+    def save(
+        self,
+        path: str,
+        overwrite: bool = False,
+        remember: bool = True,
+        notebook: str | None = None,
+    ) -> dict:
         """Write the notebook as a percent-format `.py`.
 
         Refuses to clobber a file that is not already a notebook. Parsing
         is too weak a test — any Python file parses as a one-cell notebook
         — so the guard is the marker itself: no `# %%` in the file that is
         already there means it was written by something other than us.
+
+        `remember=False` writes without adopting the path. That is what the
+        automatic checkpoint uses: it is not the file the user asked for, so
+        it must not become the answer to "where was this saved".
         """
         target = Path(path)
         if target.exists() and not overwrite:
@@ -338,9 +336,11 @@ class Notebook:
                     f"{path} exists and is not a percent-format notebook "
                     "(no `# %%` marker) — pass overwrite to replace it"
                 )
-        text = emit_percent(self._parsed())
+        text = emit_percent(self._parsed(), notebook=notebook)
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf8")
-        self.path = path
+        if remember:
+            self.path = path
         return {"path": path, "cells": len(self.cells), "bytes": len(text)}
 
     def load(self, path: str) -> dict:
@@ -371,7 +371,7 @@ class Notebook:
                     and kept.kind == item.kind
                     and old_index == index
                 )
-                kept.src, kept.kind, kept.name = item.src, item.kind, item.name
+                kept.src, kept.kind = item.src, item.kind
                 if not intact:
                     kept.ran_at = None
                     kept.execution_count = None
@@ -385,7 +385,6 @@ class Notebook:
                 id=item.id if adopt else self._new_id(),
                 src=item.src,
                 kind=item.kind,
-                name=item.name,
                 touched_at=self._bump(),
             )
             cells.append(cell)

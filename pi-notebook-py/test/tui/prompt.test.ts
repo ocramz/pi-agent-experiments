@@ -42,7 +42,7 @@ test("P1: every tool reaches the Available tools section", async (t) => {
 	for (const [name, snippet] of [
 		["nb_cell", "create or edit a cell in a persistent Python notebook"],
 		["nb_run", "run one notebook cell, everything, or everything above or below"],
-		["nb_notebook", "list, read, delete, move, restart, save or open the notebook"],
+		["nb_notebook", "list, read, delete, move, restart, save, open, or switch between notebooks"],
 		["nb_install", "pip-install packages into the notebook kernel"],
 	]) {
 		assert.match(
@@ -71,8 +71,8 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// point: an unattributed guideline cannot reach the model quietly.
 	assert.equal(
 		bullets.length,
-		10,
-		`expected 10 extension guidelines (5 on nb_cell, 2 on nb_run, 3 on nb_notebook), got ${bullets.length}.\n` +
+		11,
+		`expected 11 extension guidelines (5 on nb_cell, 2 on nb_run, 4 on nb_notebook), got ${bullets.length}.\n` +
 			"A guideline that names none of the nb_* tools is invisible to this filter — and to the model.\n" +
 			bullets.join("\n"),
 	);
@@ -84,7 +84,7 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// the bullets joined — joined, two guidelines could satisfy an anchor
 	// between them.
 	const anchors: [string, ...(string | RegExp)[]][] = [
-		["small cells, so a re-run is cheap", /nb_cell/, /one coherent step per cell/],
+		["small cells, so a re-run is cheap", /nb_cell/, /per cell/, /cheap/],
 		["the trailing expression is the display value", /nb_cell/, /trailing expression/],
 		["what stale means and what to do", /nb_cell/, /stale/, /re-run/],
 		["editing discards the old output", /nb_cell/, /discards its previous output/],
@@ -94,6 +94,7 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 		["run below, spelled as the call it is", '`nb_run {op: "below"'],
 		["list, spelled as the call it is", '`nb_notebook {op: "list"}`'],
 		["save stores no outputs", '`nb_notebook {op: "save"}`', /no outputs/],
+		["a new notebook is how you get a separate environment", '`nb_notebook {op: "new", name}`', /own venv/],
 		["deleting a cell does not retract its globals", /nb_notebook/, /does NOT remove/],
 	];
 
