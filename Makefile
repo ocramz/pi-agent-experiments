@@ -4,6 +4,11 @@ DEV_NAME    ?= pi-dev
 ENV_FILE    ?= .env
 CONFIG_VOL  ?= pi-config
 STORAGE_VOL ?= pi-dev-storage
+# pi-notebook-py builds one venv per notebook under ~/.pi/notebook-py, which is
+# inside CONFIG_VOL. It gets its own volume anyway: that is gigabytes of
+# rebuildable packages sharing a lifecycle with kilobytes of pi credentials, and
+# reclaiming the disk should not mean logging in again.
+NB_VENV_VOL ?= pi-notebook-venvs
 
 # The image digest, the live model and the pi release, pinned once for the whole
 # repo. Everything here and in the shell suites reads them from that one file;
@@ -55,11 +60,16 @@ NEST_FLAGS = \
 # fuse-overlayfs, which needs the device.
 
 # Minimal volumes: the source tree, the inner image cache (which also keeps the
-# inner graphroot off the outer overlayfs), and pi's credentials and sessions.
+# inner graphroot off the outer overlayfs), pi's credentials and sessions, and
+# the notebook venvs. The last one is nested inside the third on purpose —
+# podman orders mounts by depth, so the inner one wins for its subtree — and
+# exists so `make dev`, which recreates the container every time, does not throw
+# away every notebook's installed packages with it.
 MOUNTS = \
   -v "$(CURDIR)":/workspace \
   -v $(STORAGE_VOL):/var/lib/containers/storage \
-  -v $(CONFIG_VOL):/root/.pi
+  -v $(CONFIG_VOL):/root/.pi \
+  -v $(NB_VENV_VOL):/root/.pi/notebook-py
 
 # No -w here: each target sets its own working directory, and two -w flags on one
 # command line is confusing to read even though podman takes the last.
@@ -153,7 +163,9 @@ test-image: image $(ENV_FILE)
 check: test-image test typecheck pack test-tui test-container
 
 # The inner image cache and the dev container. Leaves $(CONFIG_VOL) alone — that
-# is the pi login.
+# is the pi login — and $(NB_VENV_VOL), which is minutes of pip per notebook.
+# To reclaim that one: `podman volume rm $(NB_VENV_VOL)`, or drop a single
+# notebook's environment from inside a session with nb_notebook op "drop".
 clean: dev-stop
 	- $(ENGINE) volume rm $(STORAGE_VOL)
 
