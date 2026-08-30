@@ -79,12 +79,12 @@ test("L3: the model saves a notebook that is really on disk", async (t) => {
 	assert.match(text, /answer\s*=\s*42/);
 });
 
-// L4: an ImportError should send the model to nb_install, not to bash. Each
+// L4: an ImportError should send the model to nb_env {op: "install"}, not to bash. Each
 // fixture's kernel runs in a fresh project venv, so cowsay genuinely is not
 // installed.
 test("L4: the model installs into the kernel rather than shelling out to pip", async (t) => {
 	const s = await session(t, { live: true });
-	// Deliberately does not say how to fix it: reaching for nb_install rather
+	// Deliberately does not say how to fix it: reaching for nb_env rather
 	// than for bash is the thing under test, and naming the tool would hand the
 	// model the answer.
 	await s.command(
@@ -98,5 +98,5 @@ test("L4: the model installs into the kernel rather than shelling out to pip", a
 	// pip in bash would install somewhere the kernel is not looking, so the
 	// cell could not have come to work that way.
 	const transcript = s.sessionText();
-	assert.match(transcript, /nb_install/, "the model never reached for nb_install");
+	assert.match(transcript, /nb_env/, "the model never reached for nb_env {op: \"install\"}");
 });

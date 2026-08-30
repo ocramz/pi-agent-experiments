@@ -6,7 +6,7 @@
 # bare interpreter, nothing below it is worth the time.
 #
 # No REQUIRE_API_KEY: nothing here drives a model. test/tui/live.test.ts already
-# covers a real model reaching nb_cell and nb_install. What only a container
+# covers a real model reaching nb_cell and nb_env. What only a container
 # reaches is the *userland* — a cold HOME, no site-packages, an unprivileged
 # uid with HOME forced to /tmp — so that is what these suites are about.
 #

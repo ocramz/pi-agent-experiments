@@ -286,7 +286,7 @@ test("a lock that was not asked for leaves the interpreter report intact", () =>
 
 test("an interpreter that is not the planned one is called out, not papered over", () => {
 	// The venv could not be built, so `source` describes an environment
-	// nothing is running in — and nb_install has been putting packages
+	// nothing is running in — and nb_env has been putting packages
 	// somewhere other than this notebook the whole time.
 	const text = formatEnv(
 		envResponse({ executable: "/usr/bin/python3.13" }),
@@ -294,7 +294,7 @@ test("an interpreter that is not the planned one is called out, not papered over
 	);
 	assert.match(text, /^python {3}\/usr\/bin\/python3\.13$/m);
 	assert.match(text, /NOTE: the rules choose \S+sales\/bin\/python \(venv\)/);
-	assert.match(text, /nb_install/);
+	assert.match(text, /nb_env/);
 });
 
 test("a failed env call is an error, not an empty report", () => {

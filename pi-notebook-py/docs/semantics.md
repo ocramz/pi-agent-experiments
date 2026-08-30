@@ -84,26 +84,39 @@ leaving it in both. `failing` is read off the last output. A cell is in at most 
 | delete a cell | everything from the hole down is stale |
 | move a cell | the moved cell becomes unrun; everything from the earlier of its two positions down is stale |
 | restart | every cell becomes unrun; nothing is stale |
-| `env`, `digest`, `nb_run {op: "file"}` | nothing |
+| `nb_env {op: "report"}`, `digest`, `nb_run {op: "file"}`, `nb_run {op: "eval"}` | nothing |
 
 Restart is the one entry that is not a notebook operation at all. `Notebook.restart()` only swaps in
-a fresh namespace, and the client does not stop there: `nb_notebook {op: "restart"}` and the restart
+a fresh namespace, and the client does not stop there: `nb_env {op: "restart"}` and the restart
 half of `nb_run {op: "all"}` checkpoint the cells, kill the interpreter, and load the checkpoint back
 into a new one. The namespace is the smaller half of what a restart has to clear — `sys.modules`
 survives a namespace reset, so a module imported from the project directory would otherwise keep its
 old code no matter how many times the notebook was "restarted", and `install`'s `restart_required`
 would name a fix no op could deliver. Cells and their ids survive, because `load` reconciles by id.
 
+Which is also why `restart_required` names `nb_run {op: "all"}` and not `nb_env {op: "restart"}`,
+everywhere it is named. A bare restart clears `sys.modules` but leaves the namespace empty and every
+cell unrun, so it delivers half the fix and takes the values away; the run does both in one call.
+`nb_env {op: "restart"}` is for the case where the replay is *not* wanted — a wedged namespace to
+drop before re-running part of the notebook by hand.
+
 Deleting and moving mark *above* the affected span rather than at it (`_disturb`), because a cell's
 own `touched_at` affects the cells below it and not itself — marking at the span would leave the
 cell that inherited the position looking fresh when it is exactly as unreproducible as the ones
 under it. At index 0 there is no cell above, which is what `_floor` is for.
 
-The last row is three reports rather than an operation, and it is in the table because "nothing" is
-a claim worth making explicitly. `env` and `digest` read; `nb_run {op: "file"}` runs a separate
-process. None of them can bind a name, move a cell or advance the sequence counter, so none of them
-carries the three hint lists that every mutating response carries — a report that came back saying
-`stale: []` would be describing work it had not done.
+The last row is four reports rather than an operation, and it is in the table because "nothing" is
+a claim worth making explicitly. The env report and `digest` read; `nb_run {op: "file"}` runs a separate
+process; `nb_run {op: "eval"}` evaluates against the namespace without creating a cell. None of them
+can move a cell or advance the sequence counter, so none of them carries the three hint lists that
+every mutating response carries — a report that came back saying `stale: []` would be describing
+work it had not done.
+
+`eval` is the one of the four that can *bind* a name: `nb_run {op: "eval", src: "xs.append(1)"}` is
+an expression with a side effect, and nothing stops it. What follows is not a staleness claim — no
+cell moved, so no cell is stale — but it is still state that moved with nothing in the cell list to
+show for it, which is exactly what the client's `mut` counter exists to record. So `eval` counts as
+a mutation there while carrying no hint lists here. The two are answering different questions.
 
 Inserting is the least obvious entry. The new cell has not run, so the namespace has not moved and
 the cells below still hold correct values — but the notebook no longer *reproduces* them, because a
@@ -146,7 +159,7 @@ The format has no escape for its own delimiter. jupytext has the same limitation
 
 ### 3.6 Isolation between notebooks is dependency-scoped, and nothing more
 
-Each notebook runs in its own venv, so an `nb_install` in one cannot change what another imports,
+Each notebook runs in its own venv, so an `nb_env {op: "install"}` in one cannot change what another imports,
 and two notebooks may hold conflicting versions. That is the whole of the claim. A cell still runs
 as the same user, in the same working directory, with the same network and the same filesystem as
 every other notebook — and a cell that shells out to the *system* pip reaches past the venv
@@ -172,7 +185,9 @@ It is a slash command and not an agent op for the same reason. The agent is no b
 the kernel to know a notebook is done with — abandonment is a fact about what the user intends
 next, not about anything the notebook contains — and no analysis task has "delete a venv" as a
 step. Reclaiming disk is the user's decision, so it is on the user's surface. What the agent is
-left with is the reversible half: `new` and `use` cost a namespace, and `notebooks` costs nothing.
+left with is the reversible half: `use` costs a namespace, with or without `create`, and `notebooks`
+costs nothing. `nb_env` names the exclusion in its own description, because a tool whose stated
+subject is "the interpreter and its packages" is where a model will look to reclaim one.
 
 The listing reports a notebook's venv whether or not the notebook currently runs in it, because
 `PI_PYTHON`, a `/nb-python` pin and a `.pi/settings.json` entry all leave an already-built venv on

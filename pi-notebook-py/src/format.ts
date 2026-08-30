@@ -305,7 +305,7 @@ export function formatEnv(resp: EnvResponse, plan: EnvPlan): string {
 		lines.push(
 			`NOTE: the rules choose ${plan.python} (${plan.source}), but the kernel is running ` +
 				`${resp.executable} — the venv could not be built, so a fallback interpreter is in use. ` +
-				"Anything nb_install put here is not in the notebook's own environment.",
+				"Anything nb_env installed here is not in the notebook's own environment.",
 		);
 	}
 	const packages = resp.packages;

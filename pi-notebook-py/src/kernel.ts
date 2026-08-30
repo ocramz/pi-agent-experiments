@@ -216,7 +216,7 @@ function samePath(a: string, b: string): boolean {
  * `python3` — when a venv cannot be built, so the rule that chose the path
  * can end up describing an environment nothing is running in. That is
  * precisely when a caller recording an `env.lock` must be told, because
- * `nb_install` will have been putting packages somewhere other than the
+ * `nb_env {op: "install"}` will have been putting packages somewhere other than the
  * notebook's own venv the whole time.
  */
 export function envPlan(
@@ -235,7 +235,7 @@ export function envPlan(
 
 /**
  * Which interpreter the kernel runs under, and therefore which environment
- * `nb_install` installs into — building the notebook's venv if that is what
+ * `nb_env {op: "install"}` installs into — building the notebook's venv if that is what
  * it comes to.
  */
 export async function resolvePython(

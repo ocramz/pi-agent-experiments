@@ -40,10 +40,10 @@ test("P1: every tool reaches the Available tools section", async (t) => {
 	// a model that never reaches for nb_cell looks like a model that dislikes it
 	// rather than one that was never told it exists.
 	for (const [name, snippet] of [
-		["nb_cell", "create or edit a cell in a persistent Python notebook"],
-		["nb_run", "run one notebook cell, everything, everything above or below a cell, or a .py file"],
-		["nb_notebook", "switch between notebooks, or report the environment and the checkpoint"],
-		["nb_install", "pip-install packages into the notebook kernel"],
+		["nb_cell", "add, edit, delete, move, list or read the cells of a persistent Python notebook"],
+		["nb_run", "run one notebook cell, everything, everything above or below a cell, a bare expression, or a .py file"],
+		["nb_notebook", "switch between notebooks, save one to a .py, open one back"],
+		["nb_env", "install packages into the notebook's own interpreter"],
 	]) {
 		assert.match(
 			prompt,
@@ -71,8 +71,8 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// point: an unattributed guideline cannot reach the model quietly.
 	assert.equal(
 		bullets.length,
-		18,
-		`expected 18 extension guidelines (6 on nb_cell, 3 on nb_run, 6 on nb_notebook, 3 on nb_install), got ${bullets.length}.\n` +
+		19,
+		`expected 19 extension guidelines (7 on nb_cell, 4 on nb_run, 3 on nb_notebook, 5 on nb_env), got ${bullets.length}.\n` +
 			"A guideline that names none of the nb_* tools is invisible to this filter — and to the model.\n" +
 			bullets.join("\n"),
 	);
@@ -88,21 +88,26 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 		["the trailing expression is the display value", /nb_cell/, /trailing expression/],
 		["what stale means and what to do", /nb_cell/, /stale/, /re-run/],
 		["editing discards the old output", /nb_cell/, /discards its previous output/],
-		["nb_install over the bash escape hatch", /nb_install/, /pip/, /bash/],
+		["nb_env install over the bash escape hatch", '`nb_env {op: "install"}`', /pip/, /bash/],
 		// The ops, spelled as the calls they are. Bare, they read as English.
 		["run all, spelled as the call it is", '`nb_run {op: "all"}`', /restarts/],
 		["run below, spelled as the call it is", '`nb_run {op: "below"'],
-		["list, spelled as the call it is", '`nb_notebook {op: "list"}`'],
+		["list, spelled as the call it is", '`nb_cell {op: "list"}`'],
 		["save stores no outputs", '`nb_notebook {op: "save"}`', /no outputs/],
-		["a new notebook is how you get a separate environment", '`nb_notebook {op: "new", name}`', /own venv/],
-		["deleting a cell does not retract its globals", /nb_notebook/, /does NOT remove/],
-		["one nb_install call for the whole set", /nb_install/, /one call/],
-		["a conflict is answered with a new notebook", /nb_install/, '`nb_notebook {op: "new", name}`'],
-		["an install disturbs no cell", /nb_install/, /disturbs no cell/, /namespace is untouched/],
-		// The three reports. Each has to carry *what it is for*: a model that
+		[
+			"a new notebook is how you get a separate environment",
+			'`nb_notebook {op: "use", name, create: true}`',
+			/own venv/,
+		],
+		["deleting a cell does not retract its globals", /nb_cell/, /does NOT remove/],
+		["one nb_env install call for the whole set", '`nb_env {op: "install"}`', /one call/],
+		["a conflict is answered with a new notebook", /nb_env/, '`nb_notebook {op: "use", name, create: true}`'],
+		["an install disturbs no cell", /nb_env/, /disturbs no cell/, /namespace is untouched/],
+		// The four reports. Each has to carry *what it is for*: a model that
 		// knows the op exists but not when to reach for it will not reach for it.
 		["run a file, and what it does not touch", '`nb_run {op: "file", path}`', /fresh process/, /disturbs no cell/],
-		["env is the thing you record", '`nb_notebook {op: "env"}`', /name==version/, /reproducible/],
+		["eval is a peek, not a record", '`nb_run {op: "eval", src}`', /without creating a cell/, /should be a cell/],
+		["the env report is the thing you record", '`nb_env {op: "report"}`', /name==version/, /reproducible/],
 		["digest, and the call that resolves a divergence", '`nb_notebook {op: "digest"}`', '`nb_notebook {op: "open", path}`'],
 	];
 
@@ -126,17 +131,34 @@ test("P3: the schema carries the parameter documentation, not just the types", a
 	assert.match(props.after.description ?? "", /"start"/);
 	assert.match(props.after.description ?? "", /"end"/);
 
-	assert.match(props.id?.description ?? "", /Omit to create/);
 	assert.match(props.run?.description ?? "", /default true/);
 	assert.match(props.kind?.description ?? "", /never executed/);
-	assert.deepEqual(cell.parameters?.required, ["src"]);
 
-	// The two ops whose defaults a model would otherwise have to guess.
+	// `op` is the only required parameter of any tool here: four of nb_cell's
+	// six ops take no `src`, so the schema can no longer insist on one. What
+	// the schema cannot check, the `op` description has to say instead — a
+	// discriminated union on `op` would not survive the trip to the provider.
+	assert.deepEqual(cell.parameters?.required, ["op"]);
+	for (const tool of ["nb_cell", "nb_run", "nb_notebook", "nb_env"]) {
+		const op = s.tool(tool).parameters?.properties?.op;
+		assert.ok(op, `${tool} has no op parameter`);
+		assert.match(
+			op.description ?? "",
+			/needs/,
+			`${tool}'s op description does not say which parameters each op takes, and nothing else can.`,
+		);
+	}
+
+	// The ops whose defaults a model would otherwise have to guess.
 	const run = s.tool("nb_run").parameters?.properties ?? {};
-	assert.match(run.restart?.description ?? "", /default true/);
 	const notebook = s.tool("nb_notebook").parameters?.properties ?? {};
 	assert.match(notebook.overwrite?.description ?? "", /refused/);
-	assert.match(notebook.lock?.description ?? "", /default true/);
+	// Both directions, because `create` is O_CREAT|O_EXCL rather than
+	// "create if needed" and a model that reads it the other way errors either way.
+	assert.match(notebook.create?.description ?? "", /does NOT already exist/);
+	assert.match(notebook.create?.description ?? "", /asserts it does/);
+	const env = s.tool("nb_env").parameters?.properties ?? {};
+	assert.match(env.lock?.description ?? "", /default true/);
 
 	// `op: "file"`'s two parameters. The sys.path difference is the one thing
 	// about it that will surprise someone who knows how a cell behaves, and a
@@ -146,7 +168,7 @@ test("P3: the schema carries the parameter documentation, not just the types", a
 
 	// Each description is the tool's whole case for itself against `bash python`.
 	assert.match(cell.description ?? "", /Prefer this over running python in bash/);
-	assert.match(s.tool("nb_install").description ?? "", /instead of pip or uv in bash/);
+	assert.match(s.tool("nb_env").description ?? "", /instead of pip or uv in bash/);
 	// The one thing a user must be told about the file format.
 	assert.match(s.tool("nb_notebook").description ?? "", /stores no outputs/);
 });
@@ -182,15 +204,17 @@ test("P5: a scripted run drives the real tools against a real kernel", async (t)
 	// — is exercised for free.
 	const s = await session(t, {
 		faux: [
-			{ tool: "nb_cell", args: { src: "total = 20" } },
-			{ tool: "nb_cell", args: { src: "total + 2" } },
-			{ tool: "nb_notebook", args: { op: "list" } },
-			// The three reporting ops. They are dispatched differently from
-			// everything above them — `file` never reaches the kernel at all, and
-			// `digest` reads the checkpoint before deciding whether to — so this
-			// is the only tier where that wiring runs.
-			{ tool: "nb_notebook", args: { op: "env", lock: false } },
+			{ tool: "nb_cell", args: { op: "add", src: "total = 20" } },
+			{ tool: "nb_cell", args: { op: "add", src: "total + 2" } },
+			{ tool: "nb_cell", args: { op: "list" } },
+			// The four reporting ops. They are dispatched differently from
+			// everything above them — `file` never reaches the kernel at all,
+			// `digest` reads the checkpoint before deciding whether to, and `eval`
+			// goes over the wire but reports no staleness — so this is the only
+			// tier where that wiring runs.
+			{ tool: "nb_env", args: { op: "report", lock: false } },
 			{ tool: "nb_notebook", args: { op: "digest" } },
+			{ tool: "nb_run", args: { op: "eval", src: "total * 2" } },
 			{ tool: "nb_run", args: { op: "file", path: "hello.py", args: ["world"] } },
 			{ text: DONE },
 		],
@@ -209,11 +233,15 @@ test("P5: a scripted run drives the real tools against a real kernel", async (t)
 	);
 	assert.ok(
 		results.some((r) => /2 cells/.test(r)),
-		`nb_notebook list did not report two cells:\n${results.join("\n---\n")}`,
+		`nb_cell list did not report two cells:\n${results.join("\n---\n")}`,
+	);
+	assert.ok(
+		results.some((r) => /^40$/m.test(r)),
+		`nb_run eval did not evaluate against the live namespace:\n${results.join("\n---\n")}`,
 	);
 	assert.ok(
 		results.some((r) => /^version {2}3\.\d+/m.test(r)),
-		`nb_notebook env did not report a python version:\n${results.join("\n---\n")}`,
+		`nb_env report did not report a python version:\n${results.join("\n---\n")}`,
 	);
 	// Three cells' worth of mutation have been checkpointed by now, so the
 	// file and the kernel must agree — that is the invariant the op reports on.
@@ -242,7 +270,7 @@ function extensionSlice(prompt: string): string {
  * make it so — pi's own never mention one. P2's count assertion is what holds
  * that property in place.
  */
-const OURS = /\bnb_(cell|run|notebook|install)\b/;
+const OURS = /\bnb_(cell|run|notebook|env)\b/;
 
 function ourGuidelines(prompt: string): string[] {
 	const guidelines = prompt.slice(prompt.indexOf("\nGuidelines:\n"));

@@ -166,7 +166,7 @@ check: test-image test typecheck pack test-tui test-container
 # The inner image cache and the dev container. Leaves $(CONFIG_VOL) alone — that
 # is the pi login — and $(NB_VENV_VOL), which is minutes of pip per notebook.
 # To reclaim that one: `podman volume rm $(NB_VENV_VOL)`, or drop a single
-# notebook's environment from inside a session with nb_notebook op "drop".
+# notebook's environment from inside a session with `/nb drop-venv <name>`.
 clean: dev-stop
 	- $(ENGINE) volume rm $(STORAGE_VOL)
 

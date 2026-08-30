@@ -50,10 +50,10 @@ kernel exists to report.
 
 | Tool | What it does |
 |---|---|
-| `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing; `kind: "markdown"` makes a prose cell, which is never executed. |
-| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh interpreter (Restart & Run All) — `restart: false` replays over the current one instead. `file` runs a `.py` as a fresh process, without touching the namespace. |
-| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open` (`run: true` to run every cell after loading), the notebook-level `notebooks`, `new`, `use`, and the two reports `env` and `digest`. |
-| `nb_install` | pip, into the interpreter the kernel is actually running. |
+| `nb_cell` | The cell list: `add`, `edit`, `delete`, `move`, `list`, `read`. `after` puts a cell anywhere; `run: false` writes without executing; `kind: "markdown"` makes a prose cell, which is never executed. |
+| `nb_run` | `cell`, `all`, `above`, `below`. `all` always restarts the interpreter first (Restart & Run All) — for a replay over the *current* namespace, `below` from the first cell is the same run without the restart. `eval` evaluates one expression without creating a cell; `file` runs a `.py` as a fresh process. Neither touches a cell. |
+| `nb_notebook` | The notebook as a named document: `notebooks`, `use` (`create: true` starts a fresh one), `save`, `open` (`run: true` to run every cell after loading), and the `digest` report. |
+| `nb_env` | The interpreter the cells run in: `install` (pip, into the interpreter the kernel is actually running), `report` (which python, and what is in it), `restart` (replace it — the namespace and every imported module go, the cells stay). |
 
 And two slash commands, so the human shares the same namespace:
 
@@ -71,18 +71,18 @@ And two slash commands, so the human shares the same namespace:
 /nb-python clear          undo the pin; back to the notebook's own venv
 ```
 
-## Three reports
+## Four reports
 
-None of these disturbs a cell: nothing becomes stale, nothing is re-run, and the namespace is not
-touched.
+None of these disturbs a cell: nothing becomes stale, nothing is re-run, and no cell moves.
 
 ```
-nb_notebook {op: "env"}     which python is this, and what is in it
+nb_env {op: "report"}       which python is this, and what is in it
 nb_notebook {op: "digest"}  is the committed checkpoint still what the kernel holds
 nb_run {op: "file", path}   run a .py in this interpreter, as a fresh process
+nb_run {op: "eval", src}    evaluate one expression, without creating a cell
 ```
 
-**`env`** prints the interpreter that is *actually running*, which of the four rules below chose it,
+**`nb_env {op: "report"}`** prints the interpreter that is *actually running*, which of the four rules below chose it,
 the version, and every installed package as `name==version` lines — a requirements.txt you can store
 next to a result as `env.lock`. The package list comes from `importlib.metadata`, in the kernel
 process, so it needs no pip: a uv-built venv has none, and bootstrapping one to answer would mutate
@@ -93,7 +93,7 @@ The report names which of the two produced it, and `lock: false` asks for just t
 The interpreter is read from the live process rather than re-derived, because the two can disagree:
 if a venv cannot be built, the kernel comes up under the base interpreter and the rule that chose the
 path is describing an environment nothing is running in. That case is called out in the report,
-since it also means `nb_install` has been installing somewhere else.
+since it also means `nb_env {op: "install"}` has been installing somewhere else.
 
 **`digest`** hashes the checkpoint and asks the kernel to hash the file it *would* write. They should
 always match — the checkpoint is rewritten after every change — so a divergence means one of exactly
@@ -103,7 +103,7 @@ process running there is nothing that could have diverged, and building a venv t
 would be a strange thing to do to someone who asked for a hash.
 
 **`nb_run {op: "file"}`** runs a `.py` under the notebook's own interpreter, as an ordinary fresh
-process — so it sees whatever `nb_install` put there, and binds nothing in the namespace. It is how
+process — so it sees whatever `nb_env {op: "install"}` put there, and binds nothing in the namespace. It is how
 to check the helper module from the section below before importing it, without paying a restart or
 making everything stale. It takes `args` as `sys.argv[1:]`, has its own time budget separate from the
 kernel's (a script that hangs costs the script, not the session), and keeps the tail of each output
@@ -111,6 +111,13 @@ stream. Two things it deliberately does not do: capture plots — a fresh proces
 hook — and put the project directory on `sys.path`. A script gets its *own* directory there, exactly
 as `python file.py` from a shell would, where a cell gets the project directory; see
 [docs/semantics.md](docs/semantics.md) §3.10.
+
+**`nb_run {op: "eval"}`** evaluates one expression against the live namespace and creates no cell —
+the agent's half of what `/nb <expr>` has always been for the human. It is for looking: a shape, a
+column name, a length. It is the one report that is not purely a read, because an expression can
+have side effects, so it counts as a mutation for the purposes of the session's own bookkeeping even
+though it moves no cell. Nothing about it is recorded in the notebook, which is the point and also
+the limit: anything worth keeping should be a cell.
 
 ## Notebooks have their own environments
 
@@ -122,7 +129,7 @@ things:
 ~/.pi/notebook-py/venvs/<project>/sales/    its interpreter. Never in the repo.
 ```
 
-`nb_install` installs into the notebook the session is on, and nowhere else, so two notebooks in
+`nb_env {op: "install"}` installs into the notebook the session is on, and nowhere else, so two notebooks in
 one project can hold conflicting versions of the same package. Switching is `nb_notebook {op:
 "use", name}` — it discards the namespace, because the new notebook has a different interpreter and
 carrying globals across would be exactly the stale state this kernel exists to report.
@@ -201,7 +208,7 @@ then a note saying what was dropped.
 
 The kernel runs in the project directory and puts it on `sys.path`, as Jupyter does, so long or
 reusable code can go in a `.py` file next to the notebook and be imported from a small cell. Editing
-that file afterwards needs `nb_notebook {op: "restart"}`: `import` is a `sys.modules` hit, so a
+that file afterwards needs `nb_env {op: "restart"}`: `import` is a `sys.modules` hit, so a
 restart here replaces the interpreter rather than just resetting the namespace — the cells survive,
 by way of the checkpoint. Same caveat as Jupyter for the path order: a project file named `io.py`
 shadows the stdlib one. See [docs/semantics.md](docs/semantics.md) §3.9.
@@ -278,6 +285,35 @@ podman volume rm pi-notebook-venvs      # all of them
 
 or, from inside a session, `/nb drop-venv <name>` for one notebook at a time. The checkpoints
 under `.pi/notebooks/` are in the repo and are never touched by either.
+
+## Breaking changes in 0.3
+
+The tool grammar was re-cut so that each tool owns one thing — the cell list, execution, the
+document, the interpreter — and each action has one spelling. Nothing moved on the wire; every op
+still reaches the verb it always did.
+
+| 0.2 | 0.3 |
+|---|---|
+| `nb_cell {src, …}` (no `id`) | `nb_cell {op: "add", src, …}` |
+| `nb_cell {id, src, …}` | `nb_cell {op: "edit", id, src, …}` |
+| `nb_notebook {op: "delete" \| "move" \| "list" \| "read"}` | `nb_cell {op: <same>}` |
+| `nb_notebook {op: "new", name}` | `nb_notebook {op: "use", name, create: true}` |
+| `nb_notebook {op: "env", lock?}` | `nb_env {op: "report", lock?}` |
+| `nb_notebook {op: "restart"}` | `nb_env {op: "restart"}` |
+| `nb_install {packages, upgrade?}` | `nb_env {op: "install", packages, upgrade?}` |
+| `nb_run {op: "all", restart: false}` | `nb_run {op: "below", id: <first cell>}` |
+| — | `nb_run {op: "eval", src}`, new: the agent's half of `/nb <expr>` |
+
+Two removals worth their own line. `nb_run`'s `restart` parameter is gone: `op: "all"` always
+restarts, because it is the only run that proves the notebook reproduces, and the no-restart replay
+is `run_below` from the first cell — the same call, under a name that does not promise a guarantee
+it cannot give. And `nb_notebook {op: "new"}` is gone into `use`'s `create` flag, which asserts in
+both directions: `create: true` fails if the notebook exists, its absence fails if it does not, so a
+mistyped name cannot quietly become a new empty notebook.
+
+The `/nb` slash commands are unchanged. They are a human's surface, and their last clause is a
+bare-expression `eval` fallback — every keyword added to that matcher is an expression a person can
+no longer evaluate, so the keyword set stays small.
 
 ## Development
 
