@@ -11,18 +11,29 @@
  * without it every case would build into the developer's real `~/.pi`.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 
 import {
+	FILE_RUN_MAX_CHARS,
 	Kernel,
 	MIN_PYTHON,
 	NOTEBOOKS_DIR,
 	STATE_DIR,
 	dropVenv,
+	envPlan,
+	fileDigest,
 	interpreterVersion,
 	listNotebooks,
 	nameError,
@@ -31,6 +42,7 @@ import {
 	plannedInterpreter,
 	projectSlug,
 	resolvePython,
+	runFile,
 	venvDir,
 } from "../src/kernel.ts";
 import type { InspectResponse, RunResponse } from "../src/format.ts";
@@ -532,4 +544,169 @@ test("the version floor is checked before the script is handed over", async () =
 	const version = await interpreterVersion("python3");
 	if (!version) return; // no python3 at all; the spawn path covers that
 	assert.ok(MIN_PYTHON[0] === 3 && MIN_PYTHON[1] >= 12);
+});
+
+// ---- reporting: which interpreter this is, and whether the file still matches
+
+test("env reports the interpreter that is really running, not the planned one", async (t) => {
+	const { k } = kernelIn(t);
+	await k.call({ tool: "add_cell", src: "a = 1" }); // force a spawn
+	const resp = await k.call({ tool: "env" });
+	assert.equal(resp.ok, true);
+	// `sys.executable` from the live child is the ground truth: resolvePython
+	// falls back to a base interpreter when a venv cannot be built, and only
+	// the child knows which one it ended up as.
+	assert.equal(realpathSync(resp.executable as string), realpathSync(k.interpreter!));
+	assert.match(resp.version as string, /^3\.\d+\.\d+$/);
+	assert.ok(Array.isArray(resp.packages));
+	// A report is not a mutation, so it carries no staleness lists.
+	assert.equal("stale" in resp, false);
+});
+
+test("env can be asked for the interpreter without the lock", async (t) => {
+	const { k } = kernelIn(t);
+	const resp = await k.call({ tool: "env", lock: false });
+	assert.equal(resp.ok, true);
+	assert.equal("packages" in resp, false);
+	assert.ok(resp.executable);
+});
+
+test("envPlan flags an interpreter that is not the one the rules chose", (t) => {
+	const dir = dirIn(t);
+	const env = bareEnvIn(dir);
+	const planned = plannedInterpreter(dir, "sales", { env });
+	assert.equal(envPlan(dir, "sales", planned.python, { env }).mismatch, false);
+	// The case that matters: a venv that could not be built, so the kernel is
+	// running something else and `source` describes an environment nothing is in.
+	const strayed = envPlan(dir, "sales", "/usr/bin/python3", { env });
+	assert.equal(strayed.mismatch, true);
+	assert.equal(strayed.source, "venv");
+	// With nothing running there is nothing to compare against, and no claim.
+	assert.equal(envPlan(dir, "sales", undefined, { env }).mismatch, false);
+});
+
+test("the digest matches the checkpoint the client writes", async (t) => {
+	const { k } = kernelIn(t);
+	await k.call({ tool: "add_cell", src: "a = 1" });
+	await k.saveCheckpoint();
+	const resp = await k.call({ tool: "digest", notebook: k.notebook });
+	const file = fileDigest(k.checkpoint);
+	assert.equal(resp.sha256, file?.sha256);
+	assert.equal(resp.bytes, file?.bytes);
+	assert.equal(resp.cells, 1);
+});
+
+test("editing the checkpoint by hand is what divergence looks like", async (t) => {
+	const { k } = kernelIn(t);
+	await k.call({ tool: "add_cell", src: "a = 1" });
+	await k.saveCheckpoint();
+	// The file is ordinary source and is meant to be edited; this is the case
+	// the report exists for.
+	writeFileSync(k.checkpoint, readFileSync(k.checkpoint, "utf8") + '\n# %% id="c9"\nb = 2\n');
+	const resp = await k.call({ tool: "digest", notebook: k.notebook });
+	assert.notEqual(resp.sha256, fileDigest(k.checkpoint)?.sha256);
+});
+
+test("fileDigest answers null rather than throwing for a file that is not there", (t) => {
+	assert.equal(fileDigest(join(dirIn(t), "nope.py")), null);
+});
+
+test("running is false until there is a child, and false again after a kill", async (t) => {
+	// This is what keeps `digest` from building a venv as a side effect of
+	// being asked whether a hash matches.
+	const { k } = kernelIn(t);
+	assert.equal(k.running, false);
+	await k.call({ tool: "inspect" });
+	assert.equal(k.running, true);
+	k.kill();
+	assert.equal(k.running, false);
+});
+
+// ---- running a .py as a fresh process
+
+/** A script in the kernel's own directory, so a relative path works too. */
+function script(dir: string, name: string, body: string): string {
+	const path = join(dir, name);
+	writeFileSync(path, body);
+	return path;
+}
+
+test("a file run reports stdout and the exit status", async (t) => {
+	const { k, dir } = kernelIn(t);
+	script(dir, "ok.py", "print('hello')\n");
+	const run = await runFile(await k.pythonFor(), "ok.py", [], dir);
+	assert.equal(run.error, undefined);
+	assert.equal(run.code, 0);
+	assert.match(run.stdout, /hello/);
+	assert.equal(run.timedOut, false);
+});
+
+test("a script that raises is a non-zero exit and a traceback, not a throw", async (t) => {
+	const { k, dir } = kernelIn(t);
+	script(dir, "boom.py", "raise KeyError('total')\n");
+	const run = await runFile(await k.pythonFor(), "boom.py", [], dir);
+	assert.equal(run.code, 1);
+	assert.match(run.stderr, /KeyError/);
+});
+
+test("args reach the script as sys.argv[1:]", async (t) => {
+	const { k, dir } = kernelIn(t);
+	script(dir, "argv.py", "import sys; print('|'.join(sys.argv[1:]))\n");
+	const run = await runFile(await k.pythonFor(), "argv.py", ["--n", "3"], dir);
+	assert.match(run.stdout, /^--n\|3$/m);
+});
+
+test("a missing path is a message rather than an exception", async (t) => {
+	const { k, dir } = kernelIn(t);
+	const run = await runFile(await k.pythonFor(), "nope.py", [], dir);
+	assert.match(run.error!, /no such file/);
+	assert.equal(run.code, null);
+	// A directory parses as a path and would otherwise hand python a
+	// confusing IsADirectoryError from somewhere else entirely.
+	assert.match((await runFile(await k.pythonFor(), ".", [], dir)).error!, /directory/);
+});
+
+test("a script that hangs is killed on its own budget, and says so", async (t) => {
+	const { k, dir } = kernelIn(t);
+	script(dir, "hang.py", "import time\nwhile True: time.sleep(1)\n");
+	const run = await runFile(await k.pythonFor(), "hang.py", [], dir, 1_000);
+	assert.equal(run.timedOut, true);
+	// The kernel is untouched: the round-trip timer would have killed it and
+	// taken the namespace, which is the whole reason this runs outside it.
+	assert.equal((await k.call({ tool: "inspect" })).ok, true);
+});
+
+test("a chatty script keeps its tail and says how much was dropped", async (t) => {
+	const { k, dir } = kernelIn(t);
+	// The last line is what a caller wants; the first hundred thousand are
+	// what would otherwise fill the context window.
+	script(dir, "loud.py", "for i in range(200_000): print(i)\nprint('LAST')\n");
+	const run = await runFile(await k.pythonFor(), "loud.py", [], dir);
+	assert.ok(run.stdoutDropped > 0, "expected output to be truncated");
+	assert.ok(run.stdout.length <= FILE_RUN_MAX_CHARS);
+	assert.match(run.stdout, /LAST/);
+	assert.equal(/^0$/m.test(run.stdout), false, "the head should be the part that went");
+});
+
+test("a file run leaves the notebook namespace alone", async (t) => {
+	// The contract the op is named for. Same interpreter, same working
+	// directory, and none of it reaches the cells.
+	const { k, dir } = kernelIn(t);
+	await k.call({ tool: "add_cell", src: "total = 20" });
+	script(dir, "clobber.py", "total = 999\nprint('ran')\n");
+	const run = await runFile(await k.pythonFor(), "clobber.py", [], dir);
+	assert.equal(run.code, 0);
+	const after = (await k.call({ tool: "eval", src: "total" })) as RunResponse;
+	assert.equal((after as { value?: string }).value, "20");
+	const inspected = (await k.call({ tool: "inspect" })) as InspectResponse;
+	assert.equal(inspected.cells?.length, 1);
+	assert.deepEqual(inspected.stale, []);
+});
+
+test("a file run uses the notebook's own interpreter", async (t) => {
+	const { k, dir } = kernelIn(t);
+	await k.call({ tool: "inspect" }); // spawn, so there is a live interpreter
+	script(dir, "which.py", "import sys; print(sys.executable)\n");
+	const run = await runFile(await k.pythonFor(), "which.py", [], dir);
+	assert.equal(realpathSync(run.stdout.trim()), realpathSync(k.interpreter!));
 });

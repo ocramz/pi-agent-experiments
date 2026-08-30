@@ -308,6 +308,14 @@ class Notebook:
     def _parsed(self) -> list[ParsedCell]:
         return [ParsedCell(src=c.src, kind=c.kind, id=c.id) for c in self.cells]
 
+    def text(self, notebook: str | None = None) -> str:
+        """text digest of the notebook. The param `notebook` has to be
+        passed here for the same reason it is passed to `save`: it decides
+        whether there is a frontmatter fence, and a digest computed without
+        one would never match a checkpoint written with one.
+        """
+        return emit_percent(self._parsed(), notebook=notebook)
+
     def save(
         self,
         path: str,
@@ -336,7 +344,7 @@ class Notebook:
                     f"{path} exists and is not a percent-format notebook "
                     "(no `# %%` marker) — pass overwrite to replace it"
                 )
-        text = emit_percent(self._parsed(), notebook=notebook)
+        text = self.text(notebook)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf8")
         if remember:

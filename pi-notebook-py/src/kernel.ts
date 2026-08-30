@@ -28,6 +28,7 @@ import {
 	readdirSync,
 	realpathSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
@@ -188,6 +189,48 @@ export function plannedInterpreter(
 
 	const venv = venvDir(cwd, notebook, opts);
 	return { source: "venv", python: join(venv, "bin", "python"), venv };
+}
+
+export interface EnvPlan extends Planned {
+	notebook: string;
+	/** True when the interpreter actually running is not the planned one. */
+	mismatch: boolean;
+}
+
+/** The same file, once symlinks are resolved. Unresolvable paths compare literally. */
+function samePath(a: string, b: string): boolean {
+	const real = (p: string) => {
+		try {
+			return realpathSync(p);
+		} catch {
+			return p;
+		}
+	};
+	return real(a) === real(b);
+}
+
+/**
+ * The resolution rules' answer, checked against what is really running.
+ *
+ * `resolvePython` falls back to the base interpreter — or to a bare
+ * `python3` — when a venv cannot be built, so the rule that chose the path
+ * can end up describing an environment nothing is running in. That is
+ * precisely when a caller recording an `env.lock` must be told, because
+ * `nb_install` will have been putting packages somewhere other than the
+ * notebook's own venv the whole time.
+ */
+export function envPlan(
+	cwd: string,
+	notebook: string,
+	executable: string | undefined,
+	opts: ConfigOpts = {},
+): EnvPlan {
+	const planned = plannedInterpreter(cwd, notebook, opts);
+	return {
+		...planned,
+		notebook,
+		mismatch: executable !== undefined && !samePath(planned.python, executable),
+	};
 }
 
 /**
@@ -354,29 +397,222 @@ export function dropVenv(cwd: string, notebook: string, opts: ConfigOpts = {}): 
  */
 export const MIN_PYTHON: readonly [number, number] = [3, 12];
 
+export interface CaptureOpts {
+	/** Kill the child after this many milliseconds. Omit for no limit. */
+	timeoutMs?: number;
+	env?: NodeJS.ProcessEnv;
+	/** Keep at most this many characters of each stream — the *tail*. */
+	maxChars?: number;
+}
+
+export interface Captured {
+	status: number | null;
+	stdout: string;
+	stderr: string;
+	/** Characters dropped off the head of each stream by `maxChars`. */
+	stdoutDropped: number;
+	stderrDropped: number;
+	timedOut: boolean;
+	/** Set when the child could not be started at all. */
+	error?: string;
+}
+
+/**
+ * A bounded sink for one of a child's streams.
+ *
+ * The slice happens as chunks arrive rather than at the end: a runaway
+ * script can emit gigabytes, and accumulating all of it in order to keep
+ * the last few kilobytes would put the pi session out of memory to answer
+ * a question about the first page of a traceback. Slicing at twice the cap
+ * amortises it — one copy per `maxChars` of output, not one per chunk.
+ */
+class Tail {
+	text = "";
+	dropped = 0;
+	// A plain field and an assignment, not a parameter property: node strips
+	// types rather than compiling them, and `constructor(private x)` is
+	// syntax it refuses to run.
+	private readonly max: number | undefined;
+	constructor(max?: number) {
+		this.max = max;
+	}
+	push(chunk: string): void {
+		this.text += chunk;
+		if (this.max === undefined || this.text.length <= this.max * 2) return;
+		const keep = this.text.slice(-this.max);
+		this.dropped += this.text.length - keep.length;
+		this.text = keep;
+	}
+	/** The tail, and how much was thrown away to get it. */
+	finish(): [string, number] {
+		if (this.max !== undefined && this.text.length > this.max) {
+			const keep = this.text.slice(-this.max);
+			this.dropped += this.text.length - keep.length;
+			this.text = keep;
+		}
+		return [this.text, this.dropped];
+	}
+}
+
 /** Spawn something, collect its output, and never throw. */
 function capture(
 	cmd: string,
 	args: string[],
 	cwd?: string,
-): Promise<{ status: number | null; stdout: string; stderr: string }> {
+	opts: CaptureOpts = {},
+): Promise<Captured> {
 	return new Promise((resolve) => {
+		const out = new Tail(opts.maxChars);
+		const err = new Tail(opts.maxChars);
+		let timedOut = false;
+		let timer: NodeJS.Timeout | undefined;
+		const done = (status: number | null, error?: string) => {
+			clearTimeout(timer);
+			const [stdout, stdoutDropped] = out.finish();
+			const [stderr, stderrDropped] = err.finish();
+			resolve({ status, stdout, stderr, stdoutDropped, stderrDropped, timedOut, error });
+		};
+
 		let proc: ChildProcess;
 		try {
-			proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-		} catch {
-			resolve({ status: null, stdout: "", stderr: "" });
+			proc = spawn(cmd, args, { cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+		} catch (e) {
+			done(null, (e as Error).message);
 			return;
 		}
-		let stdout = "";
-		let stderr = "";
+		if (opts.timeoutMs !== undefined) {
+			timer = setTimeout(() => {
+				timedOut = true;
+				proc.kill("SIGKILL");
+			}, opts.timeoutMs);
+		}
 		proc.stdout?.setEncoding("utf8");
-		proc.stdout?.on("data", (c: string) => (stdout += c));
+		proc.stdout?.on("data", (c: string) => out.push(c));
 		proc.stderr?.setEncoding("utf8");
-		proc.stderr?.on("data", (c: string) => (stderr += c));
-		proc.on("error", () => resolve({ status: null, stdout, stderr }));
-		proc.on("close", (code) => resolve({ status: code, stdout, stderr }));
+		proc.stderr?.on("data", (c: string) => err.push(c));
+		proc.on("error", (e: NodeJS.ErrnoException) => done(null, e.message));
+		proc.on("close", (code) => done(code));
 	});
+}
+
+/**
+ * Every package in an interpreter, as uv sees it — or null if uv cannot
+ * answer.
+ *
+ * The kernel's own `env` op enumerates `importlib.metadata`, which is
+ * stdlib and needs no pip in the venv. uv is asked as well because it
+ * renders an editable or VCS install as the reference it is (`-e /path`,
+ * `pkg @ git+…`) where the metadata shows only a version — and a lock that
+ * silently turns a checkout into a released version number is worse than
+ * no lock. `--python` so it reports on the interpreter the kernel is
+ * running rather than on whatever it would resolve from the environment.
+ */
+export async function uvFreeze(python: string): Promise<string[] | null> {
+	const out = await capture("uv", ["pip", "freeze", "--python", python]);
+	if (out.status !== 0) return null;
+	const lines = out.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+	return lines.length ? lines : null;
+}
+
+/** sha256 and byte length of a file, or null when it is not there. */
+export function fileDigest(path: string): { sha256: string; bytes: number } | null {
+	try {
+		// The bytes, not the decoded text: the kernel hashes what `save`
+		// writes, and `save` writes utf-8. Decoding here to re-encode there
+		// would be two chances to disagree about a BOM or a lone surrogate.
+		const raw = readFileSync(path);
+		return { sha256: createHash("sha256").update(raw).digest("hex"), bytes: raw.length };
+	} catch {
+		return null;
+	}
+}
+
+/** One run of a `.py` in the notebook's interpreter, as a fresh process. */
+export interface FileRun {
+	path: string;
+	python: string;
+	/** Exit status, or null when the process was killed or never started. */
+	code: number | null;
+	seconds: number;
+	stdout: string;
+	stderr: string;
+	stdoutDropped: number;
+	stderrDropped: number;
+	timedOut: boolean;
+	/** Set when this never became a run at all: no such file, spawn failed. */
+	error?: string;
+}
+
+/** How much of each stream a file run keeps. Enough for a traceback and a tail. */
+export const FILE_RUN_MAX_CHARS = 8_192;
+
+/** A file run's own budget, separate from the kernel's round trip. */
+export const FILE_RUN_TIMEOUT_MS = 120_000;
+
+/**
+ * Run a `.py` under `python`, as an ordinary fresh process.
+ *
+ * Deliberately not routed through the kernel. The wire is one request and
+ * one response on a single thread, so a script sent down it would block
+ * every other tool call for its whole duration — and it would inherit the
+ * round-trip timer, whose expiry *kills the kernel and takes the namespace
+ * with it*. A tool whose contract is "this does not touch the namespace"
+ * must not be able to destroy it, so it gets its own process and its own
+ * clock.
+ *
+ * Nothing is added to `sys.path`. CPython puts the *script's* directory at
+ * `sys.path[0]`, where a cell gets the kernel's cwd (`bootstrap_path`);
+ * injecting the cwd here would make this the one way of running the file
+ * that disagrees with `python file.py` from a shell, which is the bug
+ * `docs/semantics.md` §3.9 argues is worse than the one it would fix.
+ */
+export async function runFile(
+	python: string,
+	path: string,
+	args: string[],
+	cwd: string,
+	timeoutMs = FILE_RUN_TIMEOUT_MS,
+): Promise<FileRun> {
+	const target = isAbsolute(path) ? path : join(cwd, path);
+	const base: FileRun = {
+		path,
+		python,
+		code: null,
+		seconds: 0,
+		stdout: "",
+		stderr: "",
+		stdoutDropped: 0,
+		stderrDropped: 0,
+		timedOut: false,
+	};
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(target);
+	} catch {
+		return { ...base, error: `no such file: ${target}` };
+	}
+	if (stat.isDirectory()) return { ...base, error: `${target} is a directory, not a file` };
+
+	const started = Date.now();
+	const out = await capture(python, [target, ...args], cwd, {
+		timeoutMs,
+		maxChars: FILE_RUN_MAX_CHARS,
+		// The kernel's own spawn forces a headless matplotlib backend for the
+		// same reason: a script that plots would otherwise reach for a display
+		// that is not there, and block or fail on it.
+		env: { ...process.env, MPLBACKEND: process.env.MPLBACKEND ?? "Agg" },
+	});
+	return {
+		...base,
+		code: out.status,
+		seconds: (Date.now() - started) / 1000,
+		stdout: out.stdout,
+		stderr: out.stderr,
+		stdoutDropped: out.stdoutDropped,
+		stderrDropped: out.stderrDropped,
+		timedOut: out.timedOut,
+		error: out.error,
+	};
 }
 
 /** Version and absolute path of an interpreter, or null if it cannot be run. */
@@ -457,6 +693,30 @@ export class Kernel {
 	/** The interpreter the live child is running, once there has been one. */
 	get interpreter(): string | null {
 		return this.python;
+	}
+
+	/**
+	 * Whether there is a live child right now.
+	 *
+	 * What this is for: a question *about* the kernel must be answerable
+	 * without creating one. `call` spawns, and on a fresh clone spawning
+	 * means building a venv — seconds of work as a side effect of asking
+	 * whether a hash matches. Reading this first is the same split
+	 * `plannedInterpreter` makes against `resolvePython`.
+	 */
+	get running(): boolean {
+		return this.proc !== null && this.proc.exitCode === null;
+	}
+
+	/**
+	 * The interpreter to use for work outside the kernel process — exactly
+	 * what the live child runs, or what it would be spawned with.
+	 *
+	 * `cwd` and `opts` are private, so a caller cannot reach `resolvePython`
+	 * with the right arguments on its own.
+	 */
+	async pythonFor(): Promise<string> {
+		return this.python ?? (await resolvePython(this.cwd, this.notebook, this.opts));
 	}
 
 	/** Where this session's checkpoint is written. */

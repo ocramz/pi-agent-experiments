@@ -25,21 +25,30 @@ import { Type } from "typebox";
 import {
 	Kernel,
 	dropVenv,
+	envPlan,
+	fileDigest,
 	listNotebooks,
 	nameError,
 	notebookFile,
 	pinPython,
 	plannedInterpreter,
+	runFile,
 	unpinPython,
+	uvFreeze,
 	type KernelResponse,
 } from "../src/kernel.ts";
 import {
+	formatDigest,
+	formatEnv,
 	formatEval,
+	formatFile,
 	formatInspect,
 	formatNotebooks,
 	formatRead,
 	formatRun,
 	imagesOf,
+	type DigestReport,
+	type EnvResponse,
 	type InspectResponse,
 	type ReadResponse,
 	type RunResponse,
@@ -308,11 +317,15 @@ export default function (pi: ExtensionAPI) {
 			"Execute cells that already exist. Ops: cell (just that one), all (every cell from the " +
 			"top, into a fresh interpreter by default — the Restart & Run All button), above (every " +
 			"cell before the given one), below (the given cell and everything after it). A run stops " +
-			"at the first cell that raises.",
-		promptSnippet: "run one notebook cell, everything, or everything above or below a cell.",
+			"at the first cell that raises. Also file: run a .py in the notebook's own interpreter as " +
+			"a fresh process — it sees the packages nb_install put there, but it is not a cell, so it " +
+			"binds nothing in the namespace, makes nothing stale, and returns no plots.",
+		promptSnippet:
+			"run one notebook cell, everything, everything above or below a cell, or a .py file.",
 		promptGuidelines: [
 			'`nb_run {op: "all"}` restarts the interpreter and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces — including re-importing any project file that changed on disk.',
 			'After editing a cell in the middle, `nb_run {op: "below", id: <that cell>}` is usually what you want: it re-runs the edited cell and everything that could depend on it, without redoing the expensive setup above.',
+			'`nb_run {op: "file", path}` runs a .py as a fresh process in the notebook\'s own interpreter — use it to check a script or a project file you just wrote, instead of `python` in bash, which runs under an interpreter the notebook is not using. It binds nothing in the namespace and disturbs no cell.',
 		],
 		parameters: Type.Object({
 			op: Type.Union(
@@ -321,6 +334,7 @@ export default function (pi: ExtensionAPI) {
 					Type.Literal("all"),
 					Type.Literal("above"),
 					Type.Literal("below"),
+					Type.Literal("file"),
 				],
 				{ description: "Which cells to run." },
 			),
@@ -331,8 +345,27 @@ export default function (pi: ExtensionAPI) {
 						'Only for op "all": start from a fresh namespace (default true). False replays over the current one.',
 				}),
 			),
+			path: Type.Optional(
+				Type.String({
+					description:
+						'Only for op "file": the .py to run, absolute or relative to the project. It runs as an ordinary script, so its own directory is on sys.path — not the project directory, which is what a cell gets.',
+				}),
+			),
+			args: Type.Optional(
+				Type.Array(Type.String(), {
+					description: 'Only for op "file": command-line arguments, passed to the script as sys.argv[1:].',
+				}),
+			),
 		}),
 		async execute(_id, params) {
+			if (params.op === "file") {
+				if (!params.path) return reply('Error: path required for op "file"', "nb.error");
+				// Deliberately not through `call`: this never reaches the kernel, so
+				// it counts as no mutation, writes no checkpoint, and reports no
+				// staleness — there is none to report.
+				const run = await runFile(await kernel.pythonFor(), params.path, params.args ?? [], cwd);
+				return reply(formatFile(run), "nb.file", run);
+			}
 			if (params.op === "all") {
 				// The restart is done out here rather than passed down, so that
 				// "into a fresh namespace" means a fresh interpreter: a run that
@@ -360,17 +393,22 @@ export default function (pi: ExtensionAPI) {
 			"interpreter — the namespace and every imported module go, the cells stay), " +
 			"save (export to a percent-format .py), open (read one back), " +
 			"notebooks (every notebook in this project), new (start a fresh one under a name), use " +
-			"(switch to an existing one). " +
+			"(switch to an existing one), env (the interpreter, its version and every installed " +
+			"package — the lock to record when a result has to be reproducible later), digest (the " +
+			"checkpoint's content hash, and whether the live kernel has drifted from it). " +
 			"Each notebook has its own interpreter and its own installed packages, and is checkpointed " +
 			"to .pi/notebooks/<name>.py, which is ordinary source and is meant to be committed. " +
 			"The file format is jupytext `# %%` blocks, so it opens in Jupyter and VS Code and diffs " +
 			"like source — but it stores no outputs, so an opened notebook has code and no results.",
-		promptSnippet: "list, read, delete, move, restart, save, open, or switch between notebooks.",
+		promptSnippet:
+			"list, read, delete, move, restart, save, open, switch between notebooks, or report the environment and the checkpoint.",
 		promptGuidelines: [
 			'Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.',
 			'Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv. NB: Switching venv discards the current namespace.',
 			'`nb_notebook {op: "save"}` exports a .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.',
 			'Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need to refresh the namespace.',
+			'`nb_notebook {op: "env"}` reports the interpreter actually running, which rule chose it, and every installed package as `name==version` lines. Record it alongside a result that has to be reproducible later, and read it when an import fails in a way that suggests the wrong environment.',
+			'`nb_notebook {op: "digest"}` says whether .pi/notebooks/<name>.py still matches the live kernel. It should be in step, because it is rewritten after every change — so check it after editing that file outside the session, and `nb_notebook {op: "open", path}` to adopt the file if it diverged.',
 		],
 		parameters: Type.Object({
 			op: Type.Union(
@@ -385,6 +423,8 @@ export default function (pi: ExtensionAPI) {
 					Type.Literal("notebooks"),
 					Type.Literal("new"),
 					Type.Literal("use"),
+					Type.Literal("env"),
+					Type.Literal("digest"),
 				],
 				{ description: "Notebook operation." },
 			),
@@ -406,6 +446,12 @@ export default function (pi: ExtensionAPI) {
 			),
 			run: Type.Optional(
 				Type.Boolean({ description: "Only for open: run every cell after loading (default false)." }),
+			),
+			lock: Type.Optional(
+				Type.Boolean({
+					description:
+						"Only for env: include the package list (default true). False reports just the interpreter, its version and where it came from.",
+				}),
 			),
 		}),
 		async execute(_id, params) {
@@ -462,6 +508,50 @@ export default function (pi: ExtensionAPI) {
 						"nb.notebooks",
 						listNotebooks(cwd),
 					);
+				case "env": {
+					const wantLock = params.lock ?? true;
+					const response = (await call({ tool: "env", lock: wantLock })) as EnvResponse;
+					if (!response.ok) {
+						return reply(`Error: ${response.error ?? "unknown"}`, "nb.error", response);
+					}
+					// uv is asked second and wins when it answers: it renders an
+					// editable or VCS install as the reference it is, where the
+					// kernel's `importlib.metadata` scan shows only a version — and a
+					// lock that turns a checkout into a release number is worse than
+					// no lock. The kernel's answer stands when uv is not installed.
+					if (wantLock && response.executable) {
+						const uv = await uvFreeze(response.executable);
+						if (uv) {
+							response.packages = uv;
+							response.producer = "uv pip freeze";
+						}
+					}
+					const plan = envPlan(cwd, kernel.notebook, response.executable);
+					return reply(formatEnv(response, plan), "nb.env", { ...response, plan });
+				}
+				case "digest": {
+					const file = fileDigest(kernel.checkpoint);
+					// Only a *live* kernel is asked. Going through `call` would spawn
+					// one — and on a fresh clone that means building a venv, seconds
+					// of work as a side effect of asking whether a hash matches.
+					let live: DigestReport["kernel"] = null;
+					if (kernel.running) {
+						const resp = await call({ tool: "digest", notebook: kernel.notebook });
+						if (!resp.ok) return reply(`Error: ${resp.error ?? "unknown"}`, "nb.error", resp);
+						live = {
+							sha256: resp.sha256 as string,
+							bytes: resp.bytes as number,
+							cells: resp.cells as number,
+						};
+					}
+					const report: DigestReport = {
+						notebook: kernel.notebook,
+						checkpoint: kernel.checkpoint,
+						file,
+						kernel: live,
+					};
+					return reply(formatDigest(report), "nb.digest", report);
+				}
 				case "new":
 				case "use": {
 					if (!params.name) return reply(`Error: name required for ${params.op}`, "nb.error");

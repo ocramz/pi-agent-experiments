@@ -84,6 +84,7 @@ leaving it in both. `failing` is read off the last output. A cell is in at most 
 | delete a cell | everything from the hole down is stale |
 | move a cell | the moved cell becomes unrun; everything from the earlier of its two positions down is stale |
 | restart | every cell becomes unrun; nothing is stale |
+| `env`, `digest`, `nb_run {op: "file"}` | nothing |
 
 Restart is the one entry that is not a notebook operation at all. `Notebook.restart()` only swaps in
 a fresh namespace, and the client does not stop there: `nb_notebook {op: "restart"}` and the restart
@@ -97,6 +98,12 @@ Deleting and moving mark *above* the affected span rather than at it (`_disturb`
 own `touched_at` affects the cells below it and not itself — marking at the span would leave the
 cell that inherited the position looking fresh when it is exactly as unreproducible as the ones
 under it. At index 0 there is no cell above, which is what `_floor` is for.
+
+The last row is three reports rather than an operation, and it is in the table because "nothing" is
+a claim worth making explicitly. `env` and `digest` read; `nb_run {op: "file"}` runs a separate
+process. None of them can bind a name, move a cell or advance the sequence counter, so none of them
+carries the three hint lists that every mutating response carries — a report that came back saying
+`stale: []` would be describing work it had not done.
 
 Inserting is the least obvious entry. The new cell has not run, so the namespace has not moved and
 the cells below still hold correct values — but the notebook no longer *reproduces* them, because a
@@ -201,6 +208,30 @@ That is universal CPython behaviour — `python helper.py` twice in one second d
 is left alone for the same reason the path order is Jupyter's: a notebook that disagreed with every
 other way of running the code in that directory would be the worse bug. It is narrow in practice,
 since an edit that changes nothing about a file's length is rare.
+
+### 3.10 A file run and a cell disagree about `sys.path[0]`
+
+`nb_run {op: "file", path}` spawns `python <path>` in the project directory. CPython puts the
+*script's* directory at `sys.path[0]` for a script path, so a file in a subdirectory imports its
+siblings and does *not* import the project's own modules — where a cell gets the project directory
+there, because `bootstrap_path` puts it there (§3.9). For a script sitting in the project root the
+two coincide; below it they do not.
+
+Nothing is injected to close the gap. Setting `PYTHONPATH` would make this the one way of running
+that file which disagrees with `python file.py` from a shell — the same trade §3.9 makes about path
+order, and in the same direction: a discrepancy that only appears under this kernel is worse than one
+that appears everywhere. The op is `python <path>`, and it is documented as being exactly that.
+
+The other two differences from a cell follow from it being a separate process: nothing it binds
+reaches the namespace (which is the point), and a figure it draws is not captured, because the
+capture hook lives in the kernel's own `run_cell`. A script that needs to show a plot has to write
+it to a file.
+
+Its clock is its own, too. A cell that outlives the client's round-trip timeout costs the session its
+namespace (§3.4); a file run that outlives its budget costs only the script. That asymmetry is why
+this is not routed through the wire: the op's whole claim is that it does not touch the namespace,
+and a version of it that could time out and take the namespace down would not be able to make that
+claim.
 
 ## 4. Not planned
 

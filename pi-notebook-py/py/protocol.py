@@ -10,10 +10,16 @@ kernel, not part of the kernel. Unlike pi-incremental-py's, it invalidates
 nothing — there is no cache here to go stale — but it still reports which
 of the installed packages were already imported, because those keep their
 old code until the namespace is restarted.
+
+`env` and `digest` are here for the same reason: they are questions about
+the kernel — which interpreter is actually running, and whether the file
+the client checkpoints still matches what this process holds — rather than
+about the notebook model.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -23,9 +29,9 @@ import subprocess
 import sys
 from dataclasses import asdict
 
-from nbkernel import CellNotFound, Notebook, NotebookError, Output
+from nbkernel import CellNotFound, Notebook, NotebookError, Output, environment
 
-__all__ = ["bootstrap_path", "handle", "install", "serve"]
+__all__ = ["bootstrap_path", "digest", "handle", "install", "serve"]
 
 # PEP 668 marks Debian/Ubuntu interpreters as externally managed; inside a
 # venv the flag is neither needed nor always accepted.
@@ -78,6 +84,24 @@ def install(nb: Notebook, *packages: str, upgrade: bool = False) -> dict:
     # sys.modules hit, and reload() is unsound for C extensions.
     loaded = sorted({_import_name(p) for p in packages} & set(sys.modules))
     return _response(nb, [], installed=list(packages), restart_required=loaded)
+
+
+def digest(nb: Notebook, notebook: str | None = None) -> dict:
+    """Hash the file this notebook *would* be saved as.
+
+    The client hashes the checkpoint on disk and compares. Both sides hash
+    the same bytes — `Notebook.text` is what `save` writes, and `save`
+    writes utf-8 — so a mismatch means the file and the kernel have
+    genuinely parted company, not that two hashes were taken of two
+    different encodings.
+    """
+    text = nb.text(notebook).encode("utf8")
+    return {
+        "ok": True,
+        "sha256": hashlib.sha256(text).hexdigest(),
+        "bytes": len(text),
+        "cells": len(nb.cells),
+    }
 
 
 # -------------------------------------------------------------- protocol
@@ -186,6 +210,13 @@ def handle(nb: Notebook, req: dict) -> dict:
             case "install":
                 packages = _need(req, "packages")
                 return install(nb, *packages, upgrade=req.get("upgrade", False))
+            case "env":
+                # Hand-built rather than through `_response`: this changes
+                # nothing, so carrying the staleness hint lists would say a
+                # report had disturbed the notebook.
+                return {"ok": True, **environment(packages=req.get("lock", True))}
+            case "digest":
+                return digest(nb, req.get("notebook"))
             case other:
                 return {"ok": False, "error": f"unknown tool {other!r}"}
     except EXPECTED_ERRORS as exc:

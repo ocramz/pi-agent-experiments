@@ -101,6 +101,34 @@ print("REFUSED_OK=" + str(refused["ok"]))
 print("REFUSED_INTERNAL=" + str(refused.get("internal", False)))
 with open("/tmp/plain.py") as fh:
     print("PLAIN_INTACT=" + ("yes" if "important" in fh.read() else "no"))
+
+# ── the environment report, from a cold interpreter ─────────────
+env = call({"tool": "env"})
+print("ENV_IS_SELF=" + ("yes" if env["executable"] == sys.executable else "no"))
+print("ENV_VERSION_SHAPE=" + ("yes" if env["version"].count(".") == 2 else "no"))
+print("ENV_HAS_LOCK=" + ("yes" if isinstance(env["packages"], list) else "no"))
+# A report is not a mutation: the three hint lists must not ride on it.
+print("ENV_HINTLESS=" + ("yes" if "stale" not in env else "no"))
+print("ENV_NO_LOCK=" + ("yes" if "packages" not in call({"tool": "env", "lock": False}) else "no"))
+# Asked of the kernel, not of this driver: the lock must not have reached for
+# pip to answer. A uv-built venv has none, and bootstrapping one with ensurepip
+# would have changed the environment it was asked to describe. (No apostrophes
+# anywhere in this file: the whole script is one single-quoted argument to
+# `in_image`, and a lone quote silently reassembles the line into something else.)
+probe = "__import__(\"sys\").modules.get(\"pip\") is None"
+print("ENV_NO_PIP_IMPORT=" + ("yes" if call({"tool": "eval", "src": probe})["value"] == "True" else "no"))
+
+# ── the digest, against the bytes save actually wrote ───────────
+import hashlib
+
+digest_path = "/tmp/nb-digest.py"
+call({"tool": "save", "path": digest_path, "notebook": "wire", "overwrite": True})
+with open(digest_path, "rb") as fh:
+    on_disk = hashlib.sha256(fh.read()).hexdigest()
+reported = call({"tool": "digest", "notebook": "wire"})
+print("DIGEST_MATCHES=" + ("yes" if reported["sha256"] == on_disk else "no"))
+# The control: a digest that matched everything would prove nothing.
+print("DIGEST_MOVES=" + ("yes" if call({"tool": "digest"})["sha256"] != on_disk else "no"))
 PY
 
 	python3 /tmp/drive.py
@@ -145,5 +173,19 @@ assert_contains "and it loads back"                      "LOAD_CELLS=5"   "$out"
 assert_contains "saving over a plain .py is refused"     "REFUSED_OK=False"        "$out"
 assert_contains "as an expected error, not an internal one" "REFUSED_INTERNAL=False" "$out"
 assert_contains "and the file is left alone"             "PLAIN_INTACT=yes"        "$out"
+
+# The environment report answers from the process that is running, which is the
+# only thing that can: the client's resolution rules can name an interpreter a
+# failed venv build left nothing running in.
+assert_contains "env reports the running interpreter"  "ENV_IS_SELF=yes"       "$out"
+assert_contains "with a full version number"           "ENV_VERSION_SHAPE=yes" "$out"
+assert_contains "and a package list"                   "ENV_HAS_LOCK=yes"      "$out"
+assert_contains "a report carries no staleness hints"  "ENV_HINTLESS=yes"      "$out"
+assert_contains "the lock can be left out"             "ENV_NO_LOCK=yes"       "$out"
+# The reason the lock is read from importlib.metadata rather than from pip.
+assert_contains "and answering never reaches for pip"  "ENV_NO_PIP_IMPORT=yes" "$out"
+
+assert_contains "the digest is of the bytes save writes" "DIGEST_MATCHES=yes" "$out"
+assert_contains "and the notebook name is part of it"    "DIGEST_MOVES=yes"   "$out"
 
 summary
