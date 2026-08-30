@@ -1,7 +1,7 @@
 /**
  * pi-notebook-py: a Jupyter-shaped Python notebook for the pi agent.
  *
- * Four agent tools (nb_cell, nb_run, nb_notebook, nb_install) over a
+ * Four agent tools (nb_cell, nb_run, nb_notebook, nb_env) over a
  * long-lived Python subprocess, plus /nb slash commands so the human can
  * poke the same namespace. Cells are an ordered list over one mutable
  * dict, exactly as in Jupyter; what the kernel adds is a report, on every
@@ -73,8 +73,20 @@ const SWITCH_NOTE =
 	'cell is unrun — nb_run {op: "all"} to rebuild. It also has its own ' +
 	"interpreter: packages installed in another notebook are not here.";
 
-/** Requests that change kernel state. `inspect`, `read` and `eval` do not. */
-const MUTATING = new Set([
+/**
+ * Requests that move kernel state, and the narrower set that acts on cells.
+ *
+ * `MUTATES` drives the `mut` counter, whose job is to record that state moved
+ * — including the moves with nothing in the transcript to show for them.
+ * `save` is in it because `remember` sets `Notebook.path`, which `inspect`
+ * reports; `eval` because an expression can bind a name.
+ *
+ * `CHECKPOINTS` is the subset worth writing the checkpoint after: the cell
+ * operations. `install`, `save` and `eval` touch no cell, so a checkpoint
+ * after one of them would rewrite the bytes already on disk. `inspect`,
+ * `read`, `env` and `digest` are in neither set — they read.
+ */
+const CHECKPOINTS = new Set([
 	"add_cell",
 	"set_cell",
 	"delete_cell",
@@ -83,10 +95,11 @@ const MUTATING = new Set([
 	"run_all",
 	"run_above",
 	"run_below",
-	"restart",
 	"load",
-	"install",
 ]);
+// `restart` is deliberately absent from both: nothing routes it through
+// `call`. `hardRestart` goes straight to the kernel and counts itself.
+const MUTATES = new Set([...CHECKPOINTS, "install", "save", "eval"]);
 
 /**
  * The notebook a percent file says it belongs to, or null if it does not say.
@@ -139,8 +152,8 @@ export default function (pi: ExtensionAPI) {
 
 	async function call(req: Record<string, unknown>): Promise<KernelResponse> {
 		const resp = await kernel.call(req);
-		const mutating = MUTATING.has(req.tool as string);
-		if (mutating) mut++;
+		const tool = req.tool as string;
+		if (MUTATES.has(tool)) mut++;
 		let lost = false;
 		if (kernel.lostState) {
 			kernel.lostState = false;
@@ -150,7 +163,7 @@ export default function (pi: ExtensionAPI) {
 		// Never checkpoint a kernel that has just been replaced: its cell list
 		// is empty because the process died, not because the user emptied it,
 		// and writing that out would destroy the file it was meant to protect.
-		if (mutating && resp.ok && !lost) await checkpoint();
+		if (CHECKPOINTS.has(tool) && resp.ok && !lost) await checkpoint();
 		return lost ? { ...resp, _lostState: true } : resp;
 	}
 
@@ -175,6 +188,22 @@ export default function (pi: ExtensionAPI) {
 
 	type CellImages = { mime: string; b64: string }[];
 
+	/**
+	 * One wording for every "that op needs this parameter" refusal.
+	 *
+	 * The schema cannot carry the rule. A tool's parameters reach the model as
+	 * one flat object, and a discriminated union on `op` does not survive the
+	 * trip: the Anthropic path rebuilds a non-strict schema from its
+	 * `properties`, and a union root has none, so the tool would arrive looking
+	 * as though it took no arguments at all. So op→param validity is checked
+	 * here, and every op says it the same way.
+	 */
+	function need(value: unknown, key: string, op: string) {
+		return value === undefined || value === null
+			? reply(`Error: ${key} required for op "${op}"`, "nb.error")
+			: null;
+	}
+
 	/** The common tail of every tool that runs cells. */
 	function runReply(resp: KernelResponse, preamble = "", postamble = "") {
 		const response = resp as RunResponse;
@@ -188,25 +217,47 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * How each surface spells the two ways a switch can be refused.
+	 *
+	 * The function below serves both, so the remedy has to come from the
+	 * caller: telling a human at a `/nb` prompt to pass `create: true` names a
+	 * parameter they have no way to type.
+	 */
+	type SwitchHints = { exists: string; missing: string };
+	const AGENT_HINTS: SwitchHints = {
+		exists: "switch to it by leaving `create` off",
+		missing: "start it with `create: true`",
+	};
+	const HUMAN_HINTS: SwitchHints = {
+		exists: "switch to it with /nb use <name>",
+		missing: "create it with /nb new <name>",
+	};
+
+	/**
 	 * Move the session to another notebook, killing the kernel so the next
 	 * call comes up under that notebook's interpreter, and loading its
 	 * checkpoint if it has one.
 	 */
-	async function switchTo(name: string, create: boolean, loadCheckpoint = true): Promise<string> {
+	async function switchTo(
+		name: string,
+		create: boolean,
+		hints: SwitchHints,
+		loadCheckpoint = true,
+	): Promise<string> {
 		const bad = nameError(name);
 		if (bad) return `Error: ${bad}`;
 
 		const file = notebookFile(cwd, name);
 		const known = existsSync(file) || listNotebooks(cwd).some((n) => n.name === name);
 		if (create && known) {
-			return `Error: notebook "${name}" already exists — switch to it with op "use"`;
+			return `Error: notebook "${name}" already exists — ${hints.exists}`;
 		}
 		if (!create && !known && name !== kernel.notebook) {
 			const have = listNotebooks(cwd).map((n) => n.name);
 			return (
 				`Error: no notebook "${name}"` +
 				(have.length ? ` — this project has: ${have.join(", ")}` : "") +
-				'. Create it with op "new".'
+				`. ${hints.missing[0].toUpperCase()}${hints.missing.slice(1)}.`
 			);
 		}
 
@@ -242,18 +293,23 @@ export default function (pi: ExtensionAPI) {
 		return resp;
 	}
 
-	// ── nb_cell: write a cell ───────────────────────────────────────
+	// ── nb_cell: the cell list ──────────────────────────────────────
 	pi.registerTool({
 		name: "nb_cell",
 		label: "Notebook Cell",
 		description:
-			"Create or edit a cell in a persistent Python notebook, and run it. Cells are an ordered " +
-			"list over one shared namespace and execute top to bottom, as in Jupyter. Omit " +
-			"`id` to create a cell (the generated id comes back; quote it to edit that cell later); " +
-			"pass `after` to insert somewhere other than the end. Set `run: false` to write without " +
-			"executing. Prefer this over running python in bash: the nb_cell namespace persists between calls.",
+			"The cells of a persistent Python notebook: an ordered list over one shared namespace, " +
+			"executing top to bottom as in Jupyter. Ops, with the parameters each takes: " +
+			"add (src, and optionally after/kind/run) — the generated id comes back, quote it to " +
+			"edit that cell later; edit (id, src, and optionally kind/run); delete (id); " +
+			"move (id, after); list (nothing — every cell with its state, cheap, use it to orient); " +
+			"read (optionally id — full source of that cell, or of every cell when id is omitted). " +
+			"add and edit run the cell as well unless you pass `run: false`. Prefer this over " +
+			"running python in bash: the namespace persists between calls. To execute cells that " +
+			"already exist, see nb_run.",
 		// pi renders this as `- nb_cell: <snippet>`, so the name is already there.
-		promptSnippet: "create or edit a cell in a persistent Python notebook and run it.",
+		promptSnippet:
+			"add, edit, delete, move, list or read the cells of a persistent Python notebook.",
 		// Every guideline names the tool it is about. pi concatenates each
 		// active tool's guidelines into one flat list alongside its own
 		// bash/edit/write advice, deduped and bulleted, with nothing recording
@@ -262,50 +318,97 @@ export default function (pi: ExtensionAPI) {
 			"Aim to use nb_cell with one small, self-contained statement per cell (eg. a data load, a transform, a plot): small cells are what make re-running a single step cheap.",
 			"In nb_cell, a cell whose last line is an expression displays that value; use that to show a result. print() also works and its output is captured, but the trailing expression also prints a summary or a value's shape.",
 			"nb_cell reports `stale` cells: ones that ran before something above them changed. Their variables are still in the namespace but the notebook no longer reproduces them — re-run with nb_run before trusting those values.",
-			"Editing a cell with nb_cell discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.",
-			"On ImportError in nb_cell, use nb_install rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.",
-			'The nb_cell kernel runs in the project directory and that directory is on sys.path, so a module you write there can be imported from a notebook cell. After editing such a file, run `nb_notebook {op: "restart"}` before importing.',
+			'Editing a cell with `nb_cell {op: "edit"}` discards its previous output, because that output belonged to code the cell no longer contains. The cell comes back as `unrun`.',
+			'`nb_cell {op: "delete"}` does NOT remove the variables the cell defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need to refresh the namespace.',
+			'Call `nb_cell {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.',
+			'The nb_cell kernel runs in the project directory and that directory is on sys.path, so a module you write there can be imported from a notebook cell. After editing such a file, run `nb_env {op: "restart"}` before importing.',
 		],
 		parameters: Type.Object({
-			id: Type.Optional(
-				Type.String({ description: "Existing cell id to edit. Omit to create a new cell." }),
+			op: Type.Union(
+				[
+					Type.Literal("add"),
+					Type.Literal("edit"),
+					Type.Literal("delete"),
+					Type.Literal("move"),
+					Type.Literal("list"),
+					Type.Literal("read"),
+				],
+				{
+					description:
+						"Cell operation. add needs src; edit needs id and src; delete needs id; " +
+						"move needs id and after; list needs nothing; read takes an optional id.",
+				},
 			),
-			src: Type.String({ description: "The cell's source." }),
+			id: Type.Optional(
+				Type.String({ description: "Cell id. Required for edit, delete and move; optional for read." }),
+			),
+			src: Type.Optional(Type.String({ description: "The cell's source. Required for add and edit." })),
 			after: Type.Optional(
 				Type.String({
 					description:
-						'Where to insert a new cell: a cell id to go after, "start", or "end" (the default). Ignored when editing.',
+						'Where the cell goes: a cell id to sit after, "start", or "end". For add it defaults to "end"; for move it is the destination.',
 				}),
 			),
 			kind: Type.Optional(
 				Type.Union([Type.Literal("code"), Type.Literal("markdown")], {
-					description: "Cell type. Markdown cells are never executed. Defaults to code.",
+					description:
+						"Only for add and edit: cell type. Markdown cells are never executed. Defaults to code.",
 				}),
 			),
 			run: Type.Optional(
-				Type.Boolean({ description: "Execute immediately (default true). False writes without running." }),
+				Type.Boolean({
+					description:
+						"Only for add and edit: execute immediately (default true). False writes without running.",
+				}),
 			),
 		}),
 		async execute(_id, params) {
-			return runReply(
-				await call(
-					params.id
-						? {
-								tool: "set_cell",
-								id: params.id,
-								src: params.src,
-								kind: params.kind,
-								run: params.run ?? true,
-							}
-						: {
-								tool: "add_cell",
-								src: params.src,
-								after: params.after,
-								kind: params.kind ?? "code",
-								run: params.run ?? true,
-							},
-				),
-			);
+			switch (params.op) {
+				case "add": {
+					const missing = need(params.src, "src", "add");
+					if (missing) return missing;
+					return runReply(
+						await call({
+							tool: "add_cell",
+							src: params.src,
+							after: params.after,
+							kind: params.kind ?? "code",
+							run: params.run ?? true,
+						}),
+					);
+				}
+				case "edit": {
+					const missing = need(params.id, "id", "edit") ?? need(params.src, "src", "edit");
+					if (missing) return missing;
+					return runReply(
+						await call({
+							tool: "set_cell",
+							id: params.id,
+							src: params.src,
+							kind: params.kind,
+							run: params.run ?? true,
+						}),
+					);
+				}
+				case "delete": {
+					const missing = need(params.id, "id", "delete");
+					if (missing) return missing;
+					return runReply(await call({ tool: "delete_cell", id: params.id }));
+				}
+				case "move": {
+					const missing = need(params.id, "id", "move");
+					if (missing) return missing;
+					return runReply(await call({ tool: "move_cell", id: params.id, after: params.after }));
+				}
+				case "list": {
+					const response = (await call({ tool: "inspect" })) as InspectResponse;
+					return reply(formatInspect(response, kernel.notebook), "nb.list", response);
+				}
+				case "read": {
+					const response = (await call({ tool: "read", id: params.id })) as ReadResponse;
+					return reply(formatRead(response), "nb.read", response);
+				}
+			}
 		},
 	});
 
@@ -314,17 +417,20 @@ export default function (pi: ExtensionAPI) {
 		name: "nb_run",
 		label: "Notebook Run",
 		description:
-			"Execute cells that already exist. Ops: cell (just that one), all (every cell from the " +
-			"top, into a fresh interpreter by default — the Restart & Run All button), above (every " +
-			"cell before the given one), below (the given cell and everything after it). A run stops " +
-			"at the first cell that raises. Also file: run a .py in the notebook's own interpreter as " +
-			"a fresh process — it sees the packages nb_install put there, but it is not a cell, so it " +
-			"binds nothing in the namespace, makes nothing stale, and returns no plots.",
+			"Execute Python in the notebook. Ops over cells that already exist: cell (just that one), " +
+			"all (every cell from the top, into a fresh interpreter — the Restart & Run All button), " +
+			"above (every cell before the given one), below (the given cell and everything after it, " +
+			"which from the first cell is a replay of the whole notebook without the restart). A run " +
+			"stops at the first cell that raises. Two ops are not cell runs: eval evaluates one " +
+			"expression against the namespace without creating a cell, and file runs a .py in the " +
+			"notebook's own interpreter as a fresh process — it sees the packages nb_env installed " +
+			"there, but it binds nothing in the namespace, makes nothing stale, and returns no plots.",
 		promptSnippet:
-			"run one notebook cell, everything, everything above or below a cell, or a .py file.",
+			"run one notebook cell, everything, everything above or below a cell, a bare expression, or a .py file.",
 		promptGuidelines: [
 			'`nb_run {op: "all"}` restarts the interpreter and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces — including re-importing any project file that changed on disk.',
 			'After editing a cell in the middle, `nb_run {op: "below", id: <that cell>}` is usually what you want: it re-runs the edited cell and everything that could depend on it, without redoing the expensive setup above.',
+			'`nb_run {op: "eval", src}` evaluates an expression against the namespace without creating a cell — use it to look at a value or check a shape. It disturbs no cell, but nothing records it either: anything worth keeping should be a cell.',
 			'`nb_run {op: "file", path}` runs a .py as a fresh process in the notebook\'s own interpreter — use it to check a script or a project file you just wrote, instead of `python` in bash, which runs under an interpreter the notebook is not using. It binds nothing in the namespace and disturbs no cell.',
 		],
 		parameters: Type.Object({
@@ -334,15 +440,20 @@ export default function (pi: ExtensionAPI) {
 					Type.Literal("all"),
 					Type.Literal("above"),
 					Type.Literal("below"),
+					Type.Literal("eval"),
 					Type.Literal("file"),
 				],
-				{ description: "Which cells to run." },
+				{
+					description:
+						"What to run. cell, above and below need id; all needs nothing; " +
+						"eval needs src; file needs path.",
+				},
 			),
 			id: Type.Optional(Type.String({ description: "Cell id (required for cell, above, below)." })),
-			restart: Type.Optional(
-				Type.Boolean({
+			src: Type.Optional(
+				Type.String({
 					description:
-						'Only for op "all": start from a fresh namespace (default true). False replays over the current one.',
+						'Only for op "eval": one expression, evaluated against the namespace. It creates no cell, so nothing about it is recorded in the notebook.',
 				}),
 			),
 			path: Type.Optional(
@@ -366,76 +477,88 @@ export default function (pi: ExtensionAPI) {
 				const run = await runFile(await kernel.pythonFor(), params.path, params.args ?? [], cwd);
 				return reply(formatFile(run), "nb.file", run);
 			}
+			if (params.op === "eval") {
+				const missing = need(params.src, "src", "eval");
+				if (missing) return missing;
+				// Like `file`, this reports no staleness — it moved no cell. It does
+				// go through `call`, because an expression can still bind a name, and
+				// `mut` is what records a move the cell list cannot show.
+				const resp = await call({ tool: "eval", src: params.src });
+				return reply(
+					formatEval(resp as { ok: boolean; value?: string | null; error?: string | null }),
+					"nb.eval",
+					resp,
+				);
+			}
 			if (params.op === "all") {
 				// The restart is done out here rather than passed down, so that
 				// "into a fresh namespace" means a fresh interpreter: a run that
 				// replays over a stale imported module proves nothing about
-				// whether the notebook reproduces.
-				if (params.restart ?? true) {
-					const restarted = await hardRestart();
-					if (!restarted.ok) return runReply(restarted);
-				}
+				// whether the notebook reproduces. It is unconditional — a replay
+				// into the *current* namespace is `below` from the first cell, and
+				// naming it that way keeps the run with the guarantee the only one
+				// spelled "all".
+				const restarted = await hardRestart();
+				if (!restarted.ok) return runReply(restarted);
 				return runReply(await call({ tool: "run_all", restart: false }));
 			}
-			if (!params.id) return reply(`Error: id required for op ${params.op}`, "nb.error");
+			if (!params.id) return reply(`Error: id required for op "${params.op}"`, "nb.error");
 			const tool = { cell: "run_cell", above: "run_above", below: "run_below" }[params.op];
 			return runReply(await call({ tool, id: params.id }));
 		},
 	});
 
-	// ── nb_notebook: everything that is not writing or running ──────
+	// ── nb_notebook: the notebook as a named document ───────────────
 	pi.registerTool({
 		name: "nb_notebook",
 		label: "Notebook",
 		description:
-			"Inspect and manage the notebook itself. Ops: list (every cell with its state — cheap, use " +
-			"it to orient), read (full source of one cell or all), delete, move, restart (replace the " +
-			"interpreter — the namespace and every imported module go, the cells stay), " +
-			"save (export to a percent-format .py), open (read one back), " +
-			"notebooks (every notebook in this project), new (start a fresh one under a name), use " +
-			"(switch to an existing one), env (the interpreter, its version and every installed " +
-			"package — the lock to record when a result has to be reproducible later), digest (the " +
-			"checkpoint's content hash, and whether the live kernel has drifted from it). " +
+			"The notebook as a named document: which one the session is on, and its file on disk. " +
+			"Ops: notebooks (every notebook in this project, and where its environment lives), " +
+			"use (switch to another by name — pass `create: true` to start a fresh one instead), " +
+			"save (export to a percent-format .py), open (read one back; `run: true` runs every cell " +
+			"after loading), digest (the checkpoint's content hash, and whether the live kernel has " +
+			"drifted from it). The cells are nb_cell's — including `nb_cell {op: \"list\"}` to see " +
+			"what is in the notebook — and the interpreter is nb_env's. " +
 			"Each notebook has its own interpreter and its own installed packages, and is checkpointed " +
 			"to .pi/notebooks/<name>.py, which is ordinary source and is meant to be committed. " +
 			"The file format is jupytext `# %%` blocks, so it opens in Jupyter and VS Code and diffs " +
 			"like source — but it stores no outputs, so an opened notebook has code and no results.",
 		promptSnippet:
-			"list, read, delete, move, restart, save, open, switch between notebooks, or report the environment and the checkpoint.",
+			"switch between notebooks, save one to a .py, open one back, or report the checkpoint.",
 		promptGuidelines: [
-			'Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.',
-			'Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv. NB: Switching venv discards the current namespace.',
+			'Use `nb_notebook {op: "use", name, create: true}` when starting work that needs different packages from what is already loaded: each notebook has its own venv. NB: Switching venv discards the current namespace.',
 			'`nb_notebook {op: "save"}` exports a .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.',
-			'Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need to refresh the namespace.',
-			'`nb_notebook {op: "env"}` reports the interpreter actually running, which rule chose it, and every installed package as `name==version` lines. Record it alongside a result that has to be reproducible later, and read it when an import fails in a way that suggests the wrong environment.',
 			'`nb_notebook {op: "digest"}` says whether .pi/notebooks/<name>.py still matches the live kernel. It should be in step, because it is rewritten after every change — so check it after editing that file outside the session, and `nb_notebook {op: "open", path}` to adopt the file if it diverged.',
 		],
 		parameters: Type.Object({
 			op: Type.Union(
 				[
-					Type.Literal("list"),
-					Type.Literal("read"),
-					Type.Literal("delete"),
-					Type.Literal("move"),
-					Type.Literal("restart"),
+					Type.Literal("notebooks"),
+					Type.Literal("use"),
 					Type.Literal("save"),
 					Type.Literal("open"),
-					Type.Literal("notebooks"),
-					Type.Literal("new"),
-					Type.Literal("use"),
-					Type.Literal("env"),
 					Type.Literal("digest"),
 				],
-				{ description: "Notebook operation." },
+				{
+					description:
+						"Notebook operation. use needs name; save and open need path; " +
+						"notebooks and digest need nothing.",
+				},
 			),
-			id: Type.Optional(Type.String({ description: "Cell id (read, delete, move)." })),
-			after: Type.Optional(
-				Type.String({ description: 'Where to move the cell: a cell id, "start", or "end".' }),
-			),
-			path: Type.Optional(Type.String({ description: "File path (save, open)." })),
+			path: Type.Optional(Type.String({ description: "File path. Required for save and open." })),
 			name: Type.Optional(
 				Type.String({
-					description: "Notebook name (new, use). Letters, digits, dot, dash and underscore.",
+					description:
+						"Only for use: the notebook's name. Letters, digits, dot, dash and underscore.",
+				}),
+			),
+			create: Type.Optional(
+				Type.Boolean({
+					description:
+						"Only for use: true asserts the notebook does NOT already exist and starts a fresh one; " +
+						"false (the default) asserts it does. Either way the mismatch is an error rather than a " +
+						"silent create, so a mistyped name cannot quietly become a new empty notebook.",
 				}),
 			),
 			overwrite: Type.Optional(
@@ -447,33 +570,11 @@ export default function (pi: ExtensionAPI) {
 			run: Type.Optional(
 				Type.Boolean({ description: "Only for open: run every cell after loading (default false)." }),
 			),
-			lock: Type.Optional(
-				Type.Boolean({
-					description:
-						"Only for env: include the package list (default true). False reports just the interpreter, its version and where it came from.",
-				}),
-			),
 		}),
 		async execute(_id, params) {
 			switch (params.op) {
-				case "list": {
-					const response = (await call({ tool: "inspect" })) as InspectResponse;
-					return reply(formatInspect(response, kernel.notebook), "nb.list", response);
-				}
-				case "read": {
-					const response = (await call({ tool: "read", id: params.id })) as ReadResponse;
-					return reply(formatRead(response), "nb.read", response);
-				}
-				case "delete":
-					if (!params.id) return reply("Error: id required for delete", "nb.error");
-					return runReply(await call({ tool: "delete_cell", id: params.id }));
-				case "move":
-					if (!params.id) return reply("Error: id required for move", "nb.error");
-					return runReply(await call({ tool: "move_cell", id: params.id, after: params.after }));
-				case "restart":
-					return runReply(await hardRestart(), "", RESTART_NOTE);
 				case "save":
-					if (!params.path) return reply("Error: path required for save", "nb.error");
+					if (!params.path) return reply('Error: path required for op "save"', "nb.error");
 					return runReply(
 						await call({
 							tool: "save",
@@ -483,13 +584,13 @@ export default function (pi: ExtensionAPI) {
 						}),
 					);
 				case "open": {
-					if (!params.path) return reply("Error: path required for open", "nb.error");
+					if (!params.path) return reply('Error: path required for op "open"', "nb.error");
 					const declared = declaredNotebook(params.path);
 					let preamble = "";
 					if (declared && !nameError(declared) && declared !== kernel.notebook) {
 						// The file names the environment it was written under, so put it
 						// back there rather than running it against whatever is loaded.
-						const switched = await switchTo(declared, false, false);
+						const switched = await switchTo(declared, false, AGENT_HINTS, false);
 						if (switched.startsWith("Error:")) return reply(switched, "nb.error");
 						preamble = `${switched}\n\n`;
 					} else if (!declared) {
@@ -508,27 +609,6 @@ export default function (pi: ExtensionAPI) {
 						"nb.notebooks",
 						listNotebooks(cwd),
 					);
-				case "env": {
-					const wantLock = params.lock ?? true;
-					const response = (await call({ tool: "env", lock: wantLock })) as EnvResponse;
-					if (!response.ok) {
-						return reply(`Error: ${response.error ?? "unknown"}`, "nb.error", response);
-					}
-					// uv is asked second and wins when it answers: it renders an
-					// editable or VCS install as the reference it is, where the
-					// kernel's `importlib.metadata` scan shows only a version — and a
-					// lock that turns a checkout into a release number is worse than
-					// no lock. The kernel's answer stands when uv is not installed.
-					if (wantLock && response.executable) {
-						const uv = await uvFreeze(response.executable);
-						if (uv) {
-							response.packages = uv;
-							response.producer = "uv pip freeze";
-						}
-					}
-					const plan = envPlan(cwd, kernel.notebook, response.executable);
-					return reply(formatEnv(response, plan), "nb.env", { ...response, plan });
-				}
 				case "digest": {
 					const file = fileDigest(kernel.checkpoint);
 					// Only a *live* kernel is asked. Going through `call` would spawn
@@ -552,48 +632,108 @@ export default function (pi: ExtensionAPI) {
 					};
 					return reply(formatDigest(report), "nb.digest", report);
 				}
-				case "new":
 				case "use": {
-					if (!params.name) return reply(`Error: name required for ${params.op}`, "nb.error");
-					const text = await switchTo(params.name, params.op === "new");
+					const missing = need(params.name, "name", "use");
+					if (missing) return missing;
+					const text = await switchTo(params.name as string, params.create ?? false, AGENT_HINTS);
 					return reply(text, text.startsWith("Error:") ? "nb.error" : "nb.switch");
 				}
 			}
 		},
 	});
 
-	// ── nb_install: packages into the kernel's own interpreter ──────
+	// ── nb_env: the interpreter the cells run in ────────────────────
 	pi.registerTool({
-		name: "nb_install",
-		label: "Notebook Install",
+		name: "nb_env",
+		label: "Notebook Environment",
 		description:
-			"Install Python packages INTO the notebook kernel's interpreter. Use this instead of pip " +
-			"or uv in bash, which install somewhere the kernel is not looking. Each notebook has its " +
-			"own environment, so this affects only the notebook the session is on. A package that was " +
-			"already imported keeps its old code until the interpreter is restarted; the result says so " +
-			'when that happens, and `nb_notebook {op: "restart"}` is what clears it.',
-		promptSnippet: "pip-install packages into the notebook kernel's own interpreter.",
+			"The notebook kernel's own Python interpreter. Ops: install (put packages INTO it — use " +
+			"this instead of pip or uv in bash, which install somewhere the kernel is not looking), " +
+			"report (which interpreter is running, its version, and every installed package — the lock " +
+			"to record when a result has to be reproducible later), restart (replace the interpreter: " +
+			"the namespace and every imported module go, the cells stay). Each notebook has its own " +
+			"environment, so all three are about the notebook the session is on, and an install into " +
+			"one cannot reach another. A package that was already imported keeps its old code until " +
+			"the interpreter is replaced; the result says so when that happens, and " +
+			'`nb_run {op: "all"}` is what clears it — that replaces the interpreter *and* rebuilds ' +
+			"the namespace, where a bare restart would leave every cell unrun. Removing an " +
+			"environment is deliberately not an op here: that is `/nb drop-venv <name>`, the human's " +
+			"call.",
+		// Leads with install, because that is the op a model reaches for without
+		// reading anything — on an ImportError, with bash one keystroke away.
+		promptSnippet:
+			"install packages into the notebook's own interpreter, report it, or replace it.",
 		promptGuidelines: [
-			"Give nb_install all packages in one call, so pip can resolve the whole set together.",
-			'When nb_install raises a version conflict, creating a fresh environment with `nb_notebook {op: "new", name}` can be a quick fix.',
+			'On ImportError, use `nb_env {op: "install"}` rather than pip or uv from bash, so the package lands in the interpreter the kernel is actually running.',
+			'Give `nb_env {op: "install"}` all packages in one call, so pip can resolve the whole set together.',
+			'When `nb_env {op: "install"}` raises a version conflict, creating a fresh environment with `nb_notebook {op: "use", name, create: true}` can be a quick fix.',
 			// The remedy named here is the one `formatRun` prints at the moment it
 			// happens, so the guideline and the tool result cannot disagree.
-			'An nb_install disturbs no cell: nothing becomes `stale` and the namespace is untouched, so there is nothing to re-run afterwards — unless the result names a package that was already imported, which keeps its old code until `nb_run {op: "all"}`.',
+			'An nb_env install disturbs no cell: nothing becomes `stale` and the namespace is untouched, so there is nothing to re-run afterwards — unless the result names a package that was already imported, which keeps its old code until `nb_run {op: "all"}`.',
+			'`nb_env {op: "report"}` reports the interpreter actually running, which rule chose it, and every installed package as `name==version` lines. Record it alongside a result that has to be reproducible later, and read it when an import fails in a way that suggests the wrong environment.',
 		],
 		parameters: Type.Object({
-			packages: Type.Array(Type.String(), {
-				description: 'Package specifiers, e.g. ["pandas", "matplotlib==3.9.2"].',
-			}),
-			upgrade: Type.Optional(Type.Boolean({ description: "Pass -U to pip." })),
+			op: Type.Union(
+				[Type.Literal("install"), Type.Literal("report"), Type.Literal("restart")],
+				{
+					description:
+						"Environment operation. install needs packages; report and restart need nothing.",
+				},
+			),
+			packages: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						'Only for install: package specifiers, e.g. ["pandas", "matplotlib==3.9.2"].',
+				}),
+			),
+			upgrade: Type.Optional(
+				Type.Boolean({ description: "Only for install: pass -U to pip." }),
+			),
+			lock: Type.Optional(
+				Type.Boolean({
+					description:
+						"Only for report: include the package list (default true). False reports just the interpreter, its version and where it came from.",
+				}),
+			),
 		}),
 		async execute(_id, params) {
-			return runReply(
-				await call({
-					tool: "install",
-					packages: params.packages,
-					upgrade: params.upgrade ?? false,
-				}),
-			);
+			switch (params.op) {
+				case "install": {
+					if (!params.packages?.length) {
+						return reply('Error: packages required for op "install"', "nb.error");
+					}
+					return runReply(
+						await call({
+							tool: "install",
+							packages: params.packages,
+							upgrade: params.upgrade ?? false,
+						}),
+					);
+				}
+				case "restart":
+					return runReply(await hardRestart(), "", RESTART_NOTE);
+				case "report": {
+					const wantLock = params.lock ?? true;
+					const response = (await call({ tool: "env", lock: wantLock })) as EnvResponse;
+					if (!response.ok) {
+						return reply(`Error: ${response.error ?? "unknown"}`, "nb.error", response);
+					}
+					// uv is asked second and wins when it answers: it renders an
+					// editable or VCS install as the reference it is, where the
+					// kernel's `importlib.metadata` scan shows only a version — and a
+					// lock that turns a checkout into a release number is worse than
+					// no lock. The kernel's answer stands when uv is not installed.
+					if (wantLock && response.executable) {
+						const uv = await uvFreeze(response.executable);
+						if (uv) {
+							response.packages = uv;
+							response.producer = "uv pip freeze";
+						}
+					}
+					const plan = envPlan(cwd, kernel.notebook, response.executable);
+					return reply(formatEnv(response, plan), "nb.env", { ...response, plan });
+				}
+			}
 		},
 	});
 
@@ -674,7 +814,7 @@ export default function (pi: ExtensionAPI) {
 
 			const switching = input.match(/^(new|use)\s+(\S+)$/);
 			if (switching) {
-				const text = await switchTo(switching[2], switching[1] === "new");
+				const text = await switchTo(switching[2], switching[1] === "new", HUMAN_HINTS);
 				notify(text, text.startsWith("Error:") ? "error" : "info");
 				return;
 			}
@@ -743,7 +883,7 @@ export default function (pi: ExtensionAPI) {
 				if (declared && !nameError(declared) && declared !== kernel.notebook) {
 					// Same as the tool's `open`: the file about to be loaded is the
 					// point, so the notebook's own checkpoint is not read first.
-					notify(await switchTo(declared, false, false));
+					notify(await switchTo(declared, false, HUMAN_HINTS, false));
 				}
 				return show(await call({ tool: "load", path: open[1] }));
 			}
