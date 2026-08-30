@@ -1,6 +1,6 @@
 - nb_cell: create or edit a cell in a persistent Python notebook and run it.
-- nb_run: run one notebook cell, everything, or everything above or below a cell.
-- nb_notebook: list, read, delete, move, restart, save, open, or switch between notebooks.
+- nb_run: run one notebook cell, everything, everything above or below a cell, or a .py file.
+- nb_notebook: list, read, delete, move, restart, save, open, switch between notebooks, or report the environment and the checkpoint.
 - nb_install: pip-install packages into the notebook kernel's own interpreter.
 
 - Aim to use nb_cell with one small, self-contained statement per cell (eg. a data load, a transform, a plot): small cells are what make re-running a single step cheap.
@@ -11,10 +11,13 @@
 - The nb_cell kernel runs in the project directory and that directory is on sys.path, so a module you write there can be imported from a notebook cell. After editing such a file, run `nb_notebook {op: "restart"}` before importing.
 - `nb_run {op: "all"}` restarts the interpreter and replays the notebook as a program. It is the way to clear a `stale` report, and the only run that proves the notebook reproduces — including re-importing any project file that changed on disk.
 - After editing a cell in the middle, `nb_run {op: "below", id: <that cell>}` is usually what you want: it re-runs the edited cell and everything that could depend on it, without redoing the expensive setup above.
+- `nb_run {op: "file", path}` runs a .py as a fresh process in the notebook's own interpreter — use it to check a script or a project file you just wrote, instead of `python` in bash, which runs under an interpreter the notebook is not using. It binds nothing in the namespace and disturbs no cell.
 - Call `nb_notebook {op: "list"}` to orient before editing cells you did not create — the user may have added their own via /nb, or opened a notebook from disk.
 - Use `nb_notebook {op: "new", name}` when starting work that needs different packages from what is already loaded: each notebook has its own venv. NB: Switching venv discards the current namespace.
 - `nb_notebook {op: "save"}` exports a .py that stores source but no outputs; the notebook is already checkpointed to .pi/notebooks/ after every change, so save is for handing a copy somewhere else.
 - Deleting a cell with nb_notebook does NOT remove the variables it defined — they stay in the namespace until a restart. Use `nb_run {op: "all"}` if you need to refresh the namespace.
+- `nb_notebook {op: "env"}` reports the interpreter actually running, which rule chose it, and every installed package as `name==version` lines. Record it alongside a result that has to be reproducible later, and read it when an import fails in a way that suggests the wrong environment.
+- `nb_notebook {op: "digest"}` says whether .pi/notebooks/<name>.py still matches the live kernel. It should be in step, because it is rewritten after every change — so check it after editing that file outside the session, and `nb_notebook {op: "open", path}` to adopt the file if it diverged.
 - Give nb_install all packages in one call, so pip can resolve the whole set together.
 - When nb_install raises a version conflict, creating a fresh environment with `nb_notebook {op: "new", name}` can be a quick fix.
 - An nb_install disturbs no cell: nothing becomes `stale` and the namespace is untouched, so there is nothing to re-run afterwards — unless the result names a package that was already imported, which keeps its old code until `nb_run {op: "all"}`.

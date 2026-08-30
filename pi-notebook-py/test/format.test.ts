@@ -10,7 +10,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+	formatDigest,
+	formatEnv,
 	formatEval,
+	formatFile,
 	formatHints,
 	formatInspect,
 	formatNotebooks,
@@ -18,6 +21,10 @@ import {
 	formatRun,
 	imagesOf,
 	type CellOutput,
+	type DigestReport,
+	type EnvPlan,
+	type EnvResponse,
+	type FileRunResult,
 	type NotebookListing,
 	type RunResponse,
 } from "../src/format.ts";
@@ -225,4 +232,163 @@ test("a pin with no venv behind it says nothing about one", () => {
 	);
 	assert.match(text, /^ {4}pin: \/usr\/bin\/python3\.13$/m);
 	assert.equal(/built, unused/.test(text), false);
+});
+
+// ---- env: which interpreter this is, and what is in it
+
+function envResponse(over: Partial<EnvResponse> = {}): EnvResponse {
+	return {
+		ok: true,
+		executable: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales/bin/python",
+		version: "3.13.2",
+		implementation: "cpython",
+		prefix: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales",
+		base_prefix: "/usr",
+		packages: ["numpy==2.1.3", "pandas==2.2.3"],
+		producer: "importlib.metadata",
+		...over,
+	};
+}
+
+function envPlan(over: Partial<EnvPlan> = {}): EnvPlan {
+	return {
+		notebook: "sales",
+		python: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales/bin/python",
+		source: "venv",
+		venv: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales",
+		mismatch: false,
+		...over,
+	};
+}
+
+test("the lock is plain requirements lines, so it can be stored as one", () => {
+	// The point of the op: something else records this. Anything decorating
+	// the package lines would have to be stripped back off before use.
+	const text = formatEnv(envResponse(), envPlan());
+	assert.match(text, /^lock {5}2 package\(s\), via importlib\.metadata$/m);
+	assert.match(text, /^numpy==2\.1\.3$/m);
+	assert.match(text, /^pandas==2\.2\.3$/m);
+	assert.match(text, /^version {2}3\.13\.2 \(cpython\)$/m);
+	assert.match(text, /^source {3}venv \(\/home\/u\/\.pi\/notebook-py\/venvs\/proj-ab12\/sales\)$/m);
+});
+
+test("the base prefix is printed only when it differs, which is what venv means", () => {
+	assert.match(formatEnv(envResponse(), envPlan()), /^prefix {3}\S+sales \(base \/usr\)$/m);
+	const outside = envResponse({ prefix: "/usr", base_prefix: "/usr" });
+	assert.equal(/base/.test(formatEnv(outside, envPlan({ source: "pin" }))), false);
+});
+
+test("a lock that was not asked for leaves the interpreter report intact", () => {
+	const text = formatEnv(envResponse({ packages: undefined, producer: undefined }), envPlan());
+	assert.equal(/lock/.test(text), false);
+	assert.match(text, /^python {3}\S+sales\/bin\/python$/m);
+});
+
+test("an interpreter that is not the planned one is called out, not papered over", () => {
+	// The venv could not be built, so `source` describes an environment
+	// nothing is running in — and nb_install has been putting packages
+	// somewhere other than this notebook the whole time.
+	const text = formatEnv(
+		envResponse({ executable: "/usr/bin/python3.13" }),
+		envPlan({ mismatch: true }),
+	);
+	assert.match(text, /^python {3}\/usr\/bin\/python3\.13$/m);
+	assert.match(text, /NOTE: the rules choose \S+sales\/bin\/python \(venv\)/);
+	assert.match(text, /nb_install/);
+});
+
+test("a failed env call is an error, not an empty report", () => {
+	assert.match(formatEnv({ ok: false, error: "kernel process exited" }, envPlan()), /^Error: kernel/);
+});
+
+// ---- digest: whether the checkpoint still is what the kernel would write
+
+function digest(over: Partial<DigestReport> = {}): DigestReport {
+	return {
+		notebook: "sales",
+		checkpoint: ".pi/notebooks/sales.py",
+		file: { sha256: "9f3a", bytes: 1412 },
+		kernel: { sha256: "9f3a", bytes: 1412, cells: 12 },
+		...over,
+	};
+}
+
+test("matching hashes say so in one line and offer nothing to do", () => {
+	const text = formatDigest(digest());
+	assert.match(text, /in step: the kernel would write exactly this file\./);
+	assert.equal(/diverged/.test(text), false);
+});
+
+test("a divergence names both hashes and the call that resolves it", () => {
+	const text = formatDigest(digest({ kernel: { sha256: "7b21", bytes: 1509, cells: 13 } }));
+	assert.match(text, /^ {2}kernel {3}7b21 {2}\(1509 bytes, 13 cell\(s\)\)$/m);
+	assert.match(text, /^ {2}on disk {2}9f3a {2}\(1412 bytes\)$/m);
+	// A report that says "diverged" and stops is a report the model cannot act on.
+	assert.match(text, /nb_notebook \{op: "open", path: "\.pi\/notebooks\/sales\.py"\}/);
+});
+
+test("with no kernel running there is nothing that could have diverged", () => {
+	// The property that keeps a digest from building a venv to answer.
+	const text = formatDigest(digest({ kernel: null }));
+	assert.match(text, /^sha256 {5}9f3a {2}\(1412 bytes\)$/m);
+	assert.match(text, /the kernel is not running, so nothing can have diverged\./);
+	assert.equal(/diverged:/.test(text), false);
+});
+
+test("an empty kernel with no checkpoint is not a divergence", () => {
+	const text = formatDigest(digest({ file: null, kernel: { sha256: "e3b0", bytes: 0, cells: 0 } }));
+	assert.match(text, /nothing has been written because nothing has happened/);
+	assert.equal(/diverged/.test(text), false);
+});
+
+test("cells with no checkpoint behind them means a write failed, and says which", () => {
+	const text = formatDigest(digest({ file: null, kernel: { sha256: "7b21", bytes: 1509, cells: 13 } }));
+	assert.match(text, /diverged: there is no checkpoint, but the kernel holds 13 cell\(s\)/);
+	assert.match(text, /\.pi\/notebooks\/ is writable/);
+});
+
+// ---- a .py run as a fresh process
+
+function fileRun(over: Partial<FileRunResult> = {}): FileRunResult {
+	return {
+		path: "etl.py",
+		python: "/home/u/.pi/notebook-py/venvs/proj-ab12/sales/bin/python",
+		code: 0,
+		seconds: 3.21,
+		stdout: "loaded 40122 rows\n",
+		stderr: "",
+		stdoutDropped: 0,
+		stderrDropped: 0,
+		timedOut: false,
+		...over,
+	};
+}
+
+test("a file run reads like a cell result, with the same marks and gutter", () => {
+	const text = formatFile(fileRun());
+	assert.match(text, /^\* etl\.py exited 0 in 3\.2s$/m);
+	assert.match(text, /^ {2}\| loaded 40122 rows$/m);
+});
+
+test("a non-zero exit is marked as a failure and shows stderr", () => {
+	const text = formatFile(fileRun({ code: 1, stdout: "", stderr: "KeyError: 'total'\n" }));
+	assert.match(text, /^! etl\.py exited 1 in 3\.2s$/m);
+	assert.match(text, /^ {2}\| KeyError: 'total'$/m);
+});
+
+test("a timeout says whose budget ran out and that the namespace survived", () => {
+	// The reason this runs outside the kernel at all: the round-trip timer
+	// would have killed the kernel and taken the namespace with it.
+	const text = formatFile(fileRun({ code: null, timedOut: true, seconds: 120 }));
+	assert.match(text, /^! etl\.py was killed after 120\.0s/m);
+	assert.match(text, /namespace is untouched/);
+});
+
+test("truncation is stated rather than left to look like the whole output", () => {
+	const text = formatFile(fileRun({ stdout: "tail\n", stdoutDropped: 214032 }));
+	assert.match(text, /\(stdout truncated: 214032 characters dropped, the last 5 are shown\)/);
+});
+
+test("a run that never started is an error rather than an exit status of null", () => {
+	assert.match(formatFile(fileRun({ error: "no such file: /proj/etl.py" })), /^Error: no such file/);
 });

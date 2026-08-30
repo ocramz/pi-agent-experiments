@@ -51,8 +51,8 @@ kernel exists to report.
 | Tool | What it does |
 |---|---|
 | `nb_cell` | Create or edit a cell and run it. `after` inserts anywhere; `run: false` writes without executing; `kind: "markdown"` makes a prose cell, which is never executed. |
-| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh interpreter (Restart & Run All) — `restart: false` replays over the current one instead. |
-| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open` (`run: true` to run every cell after loading), and the notebook-level `notebooks`, `new`, `use`. |
+| `nb_run` | `cell`, `all`, `above`, `below`. `all` means restart from a fresh interpreter (Restart & Run All) — `restart: false` replays over the current one instead. `file` runs a `.py` as a fresh process, without touching the namespace. |
+| `nb_notebook` | `list`, `read`, `delete`, `move`, `restart`, `save`, `open` (`run: true` to run every cell after loading), the notebook-level `notebooks`, `new`, `use`, and the two reports `env` and `digest`. |
 | `nb_install` | pip, into the interpreter the kernel is actually running. |
 
 And two slash commands, so the human shares the same namespace:
@@ -70,6 +70,47 @@ And two slash commands, so the human shares the same namespace:
 /nb-python <path>         pin this notebook's interpreter (restarts the kernel)
 /nb-python clear          undo the pin; back to the notebook's own venv
 ```
+
+## Three reports
+
+None of these disturbs a cell: nothing becomes stale, nothing is re-run, and the namespace is not
+touched.
+
+```
+nb_notebook {op: "env"}     which python is this, and what is in it
+nb_notebook {op: "digest"}  is the committed checkpoint still what the kernel holds
+nb_run {op: "file", path}   run a .py in this interpreter, as a fresh process
+```
+
+**`env`** prints the interpreter that is *actually running*, which of the four rules below chose it,
+the version, and every installed package as `name==version` lines — a requirements.txt you can store
+next to a result as `env.lock`. The package list comes from `importlib.metadata`, in the kernel
+process, so it needs no pip: a uv-built venv has none, and bootstrapping one to answer would mutate
+the environment the question was about. When `uv` is on `PATH`, `uv pip freeze` answers instead,
+because it renders an editable or VCS install as the reference it is rather than as a bare version.
+The report names which of the two produced it, and `lock: false` asks for just the interpreter.
+
+The interpreter is read from the live process rather than re-derived, because the two can disagree:
+if a venv cannot be built, the kernel comes up under the base interpreter and the rule that chose the
+path is describing an environment nothing is running in. That case is called out in the report,
+since it also means `nb_install` has been installing somewhere else.
+
+**`digest`** hashes the checkpoint and asks the kernel to hash the file it *would* write. They should
+always match — the checkpoint is rewritten after every change — so a divergence means one of exactly
+two things: the file was edited outside the session, or a checkpoint write failed. The report says
+which hashes differ and names the call that resolves it. It never starts a kernel to answer: with no
+process running there is nothing that could have diverged, and building a venv to compute a hash
+would be a strange thing to do to someone who asked for a hash.
+
+**`nb_run {op: "file"}`** runs a `.py` under the notebook's own interpreter, as an ordinary fresh
+process — so it sees whatever `nb_install` put there, and binds nothing in the namespace. It is how
+to check the helper module from the section below before importing it, without paying a restart or
+making everything stale. It takes `args` as `sys.argv[1:]`, has its own time budget separate from the
+kernel's (a script that hangs costs the script, not the session), and keeps the tail of each output
+stream. Two things it deliberately does not do: capture plots — a fresh process has no figure
+hook — and put the project directory on `sys.path`. A script gets its *own* directory there, exactly
+as `python file.py` from a shell would, where a cell gets the project directory; see
+[docs/semantics.md](docs/semantics.md) §3.10.
 
 ## Notebooks have their own environments
 

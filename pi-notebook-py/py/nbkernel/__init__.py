@@ -15,6 +15,7 @@ on its own initiative.
 Layering, and each module imports only from the ones above it:
 
     errors      the exceptions the protocol layer expects
+    env         which interpreter this is, and what is installed in it
     values      one-line summaries of runtime values
     source      text -> code, and text <-> percent-format file
     display     figures and `_repr_png_` -> image payloads
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 from .cell import Cell, Output, fresh_namespace, run_cell
 from .display import Image, capture
+from .env import distributions, environment
 from .errors import CellNotFound, NotebookError, PercentFormatError
 from .notebook import Notebook
 from .source import (
@@ -54,7 +56,9 @@ __all__ = [
     "brief",
     "capture",
     "compile_cell",
+    "distributions",
     "emit_percent",
+    "environment",
     "fresh_namespace",
     "globals_brief",
     "parse_percent",

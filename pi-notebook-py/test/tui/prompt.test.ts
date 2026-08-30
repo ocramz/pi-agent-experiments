@@ -1,6 +1,6 @@
 // What the model is *told*, as against what the human sees (commands.test.ts).
 //
-// Four tools, four long descriptions, ten promptGuidelines and a typebox schema
+// Four tools, four long descriptions, eighteen promptGuidelines and a typebox schema
 // per tool — all of it addressed to a model, none of it reachable from any
 // other tier. It appears in no message, so the transcript cannot show it;
 // `before_provider_request`, which carries the wire payload, never fires here
@@ -41,8 +41,8 @@ test("P1: every tool reaches the Available tools section", async (t) => {
 	// rather than one that was never told it exists.
 	for (const [name, snippet] of [
 		["nb_cell", "create or edit a cell in a persistent Python notebook"],
-		["nb_run", "run one notebook cell, everything, or everything above or below"],
-		["nb_notebook", "list, read, delete, move, restart, save, open, or switch between notebooks"],
+		["nb_run", "run one notebook cell, everything, everything above or below a cell, or a .py file"],
+		["nb_notebook", "switch between notebooks, or report the environment and the checkpoint"],
 		["nb_install", "pip-install packages into the notebook kernel"],
 	]) {
 		assert.match(
@@ -71,8 +71,8 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 	// point: an unattributed guideline cannot reach the model quietly.
 	assert.equal(
 		bullets.length,
-		15,
-		`expected 15 extension guidelines (6 on nb_cell, 2 on nb_run, 4 on nb_notebook, 3 on nb_install), got ${bullets.length}.\n` +
+		18,
+		`expected 18 extension guidelines (6 on nb_cell, 3 on nb_run, 6 on nb_notebook, 3 on nb_install), got ${bullets.length}.\n` +
 			"A guideline that names none of the nb_* tools is invisible to this filter — and to the model.\n" +
 			bullets.join("\n"),
 	);
@@ -99,6 +99,11 @@ test("P2: the guidelines the tools registered are the guidelines sent", async (t
 		["one nb_install call for the whole set", /nb_install/, /one call/],
 		["a conflict is answered with a new notebook", /nb_install/, '`nb_notebook {op: "new", name}`'],
 		["an install disturbs no cell", /nb_install/, /disturbs no cell/, /namespace is untouched/],
+		// The three reports. Each has to carry *what it is for*: a model that
+		// knows the op exists but not when to reach for it will not reach for it.
+		["run a file, and what it does not touch", '`nb_run {op: "file", path}`', /fresh process/, /disturbs no cell/],
+		["env is the thing you record", '`nb_notebook {op: "env"}`', /name==version/, /reproducible/],
+		["digest, and the call that resolves a divergence", '`nb_notebook {op: "digest"}`', '`nb_notebook {op: "open", path}`'],
 	];
 
 	for (const [rule, ...needles] of anchors) {
@@ -131,6 +136,13 @@ test("P3: the schema carries the parameter documentation, not just the types", a
 	assert.match(run.restart?.description ?? "", /default true/);
 	const notebook = s.tool("nb_notebook").parameters?.properties ?? {};
 	assert.match(notebook.overwrite?.description ?? "", /refused/);
+	assert.match(notebook.lock?.description ?? "", /default true/);
+
+	// `op: "file"`'s two parameters. The sys.path difference is the one thing
+	// about it that will surprise someone who knows how a cell behaves, and a
+	// bare `path: string` says nothing about it.
+	assert.match(run.path?.description ?? "", /sys\.path/);
+	assert.match(run.args?.description ?? "", /sys\.argv\[1:\]/);
 
 	// Each description is the tool's whole case for itself against `bash python`.
 	assert.match(cell.description ?? "", /Prefer this over running python in bash/);
@@ -173,9 +185,19 @@ test("P5: a scripted run drives the real tools against a real kernel", async (t)
 			{ tool: "nb_cell", args: { src: "total = 20" } },
 			{ tool: "nb_cell", args: { src: "total + 2" } },
 			{ tool: "nb_notebook", args: { op: "list" } },
+			// The three reporting ops. They are dispatched differently from
+			// everything above them — `file` never reaches the kernel at all, and
+			// `digest` reads the checkpoint before deciding whether to — so this
+			// is the only tier where that wiring runs.
+			{ tool: "nb_notebook", args: { op: "env", lock: false } },
+			{ tool: "nb_notebook", args: { op: "digest" } },
+			{ tool: "nb_run", args: { op: "file", path: "hello.py", args: ["world"] } },
 			{ text: DONE },
 		],
 	});
+	// The fixture the file op runs. Written after the session is up and before
+	// the turn that uses it — the faux script does not execute until then.
+	writeFileSync(join(s.root, "hello.py"), "import sys\nprint('hello', sys.argv[1])\n");
 	await s.command("go");
 	await s.expect(DONE, { timeout: 120_000 });
 	await s.close();
@@ -188,6 +210,20 @@ test("P5: a scripted run drives the real tools against a real kernel", async (t)
 	assert.ok(
 		results.some((r) => /2 cells/.test(r)),
 		`nb_notebook list did not report two cells:\n${results.join("\n---\n")}`,
+	);
+	assert.ok(
+		results.some((r) => /^version {2}3\.\d+/m.test(r)),
+		`nb_notebook env did not report a python version:\n${results.join("\n---\n")}`,
+	);
+	// Three cells' worth of mutation have been checkpointed by now, so the
+	// file and the kernel must agree — that is the invariant the op reports on.
+	assert.ok(
+		results.some((r) => /in step: the kernel would write exactly this file\./.test(r)),
+		`nb_notebook digest did not report the checkpoint in step:\n${results.join("\n---\n")}`,
+	);
+	assert.ok(
+		results.some((r) => /hello world/.test(r) && /exited 0/.test(r)),
+		`nb_run file did not run the script with its argv:\n${results.join("\n---\n")}`,
 	);
 });
 

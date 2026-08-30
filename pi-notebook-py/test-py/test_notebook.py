@@ -5,6 +5,7 @@
 No third-party packages required.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -386,6 +387,47 @@ class TestProtocol(unittest.TestCase):
         response = self.call(tool="load", path="/nonexistent/nb.py")
         self.assertFalse(response["ok"])
         self.assertNotIn("internal", response)
+
+    def test_env_reports_this_interpreter_and_carries_no_hints(self):
+        response = self.call(tool="env")
+        self.assertEqual(response["executable"], sys.executable)
+        self.assertIn("packages", response)
+        # A report is not a mutation. Carrying the three hint lists would
+        # say the notebook had been disturbed by being asked about.
+        for key in ("results", "stale", "unrun", "failing"):
+            self.assertNotIn(key, response)
+
+    def test_env_can_leave_the_lock_out(self):
+        self.assertNotIn("packages", self.call(tool="env", lock=False))
+
+    def test_the_digest_is_of_the_bytes_save_would_write(self):
+        # The basis of the whole divergence report: the two sides must hash
+        # the same thing, or "diverged" means nothing.
+        self.call(tool="add_cell", src="a = 1")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "nb.py")
+            self.call(tool="save", path=path, notebook="sales")
+            with open(path, "rb") as handle_:
+                on_disk = hashlib.sha256(handle_.read()).hexdigest()
+        response = self.call(tool="digest", notebook="sales")
+        self.assertEqual(response["sha256"], on_disk)
+        self.assertEqual(response["cells"], 1)
+
+    def test_the_digest_moves_when_a_cell_changes(self):
+        self.call(tool="add_cell", src="a = 1")
+        before = self.call(tool="digest", notebook="sales")["sha256"]
+        self.call(tool="set_cell", id="c1", src="a = 2")
+        after = self.call(tool="digest", notebook="sales")["sha256"]
+        self.assertNotEqual(after, before)
+
+    def test_the_notebook_name_is_part_of_the_digest(self):
+        # The checkpoint is written with a frontmatter fence naming the
+        # notebook, so a digest taken without one could never match it.
+        self.call(tool="add_cell", src="a = 1")
+        self.assertNotEqual(
+            self.call(tool="digest", notebook="sales")["sha256"],
+            self.call(tool="digest")["sha256"],
+        )
 
 
 class TestInstall(unittest.TestCase):
