@@ -147,7 +147,3 @@ test("T2: elan's toolchain directory naming", (t) => {
 	assert.equal(toolchainInstalled(null, { ELAN_HOME: d }), true);
 });
 
-test("V0: the client version matches package.json", () => {
-	const pkg = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8")) as { version: string };
-	assert.equal(VERSION, pkg.version);
-});

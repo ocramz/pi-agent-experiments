@@ -1,6 +1,8 @@
-// A real model drives the extension through pi. Costs money.
+// A real model drives the extension through pi. 
+// 
+//NB : uses pi API calls so could cost money.
 //
-// The only coverage of what no script can show: that a model, given these
+// Test coverage to show that a model, given these
 // tools and skills, actually uses them to finish a proof. It refuses to start
 // without OPENROUTER_API_KEY rather than skipping — a run without a key must not
 // report green over the one thing this tier exists to check. Assertions are on

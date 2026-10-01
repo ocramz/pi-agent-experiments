@@ -161,9 +161,9 @@ project's `.pi/settings.json` (read only for trusted projects), then defaults.
 | Lean | `npm run test:lean` | pi, the pinned toolchain | Lean's behaviour the design relies on (`contract.test.ts`), every op on a real server, the lifecycle through `pi -p` with a scripted model, `/lean autoprove` headless, and one paid live case |
 | container | `npm run test:container` | podman | the unit suites and the extension in the pinned distroless image, with no Lean |
 
-The Lean tier runs on the host. From the repository root: `make lean-install` (elan, the toolchain
+NB: The Lean tier runs on the host. From the repository root: `make lean-install` (elan, the toolchain
 pinned in `shared/versions.env`, ripgrep — into `$HOME`, no sudo), then `make test-lean PKG=pi-lean4`.
-Its live case needs `OPENROUTER_API_KEY` and fails without it.
+The live case of the Lean tier needs `OPENROUTER_API_KEY` and fails without it.
 
 Layout: `src/` is plain TypeScript with no pi imports (the LSP client in `src/lsp/`, the server and
 runtime in `src/lean/`, one module per op in `src/ops/`, the hooks' logic in `src/hooks/`);
