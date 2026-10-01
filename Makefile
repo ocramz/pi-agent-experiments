@@ -31,8 +31,8 @@ PI_REVIEW_MODEL    ?= $(DEFAULT_PI_REVIEW_MODEL)
 # Every extension in the repo. `make check` runs against all packages in this list;
 # PKG=... narrows any target to one. Adding an extension is a one-line edit here 
 # and one in .github/workflows/test.yml : see "Adding an extension" in the README.
-# PKGS        ?= pi-issue-tracker pi-incremental-py pi-notebook-py pi-web-search
-PKGS ?= pi-notebook-py # to save CI minutes
+# PKGS        ?= pi-issue-tracker pi-incremental-py pi-notebook-py pi-web-search pi-lean4
+PKGS ?= pi-notebook-py pi-lean4 # to save CI minutes
 # PKGS ?= pi-issue-tracker
 
 # What the test targets iterate over: PKG if it was given, otherwise all of them.
@@ -133,6 +133,42 @@ endef
 pack:
 	$(call for_each_pkg_host,pack-check)
 
+# The host loop again, with $(ENV_FILE) in the environment — for tiers that need
+# a toolchain the dev image does not carry *and* a key. Read the way podman reads
+# --env-file (KEY=value per line, no quote processing, # comments), exported
+# without being echoed: the file holds secrets. The pins ride along as they do
+# for the container loop.
+define for_each_pkg_host_env
+	@set -e; while IFS= read -r line || [ -n "$$line" ]; do \
+	  case "$$line" in ''|\#*) continue;; esac; export "$$line"; \
+	done < "$(CURDIR)/$(ENV_FILE)"; \
+	export PI_PROVIDER='$(PI_PROVIDER)' PI_MODEL='$(PI_MODEL)'; \
+	for pkg in $(TARGETS); do \
+	  printf '\n=== %s: %s (host) ===\n' "$$pkg" "$(1)"; \
+	  (cd $$pkg && npm run $(1) --if-present); \
+	done
+endef
+
+# A Lean toolchain on the host: elan, the pinned toolchain and ripgrep, into
+# $HOME and never with sudo. Package-agnostic like every other loop — a package
+# that needs a host toolchain says so with a `toolchain:install` script; today
+# that is pi-lean4 alone (its scripts/toolchain.sh). The pins are in
+# shared/versions.env; `lean-update` converges onto them again and reports what
+# upstream has released since, but never moves one.
+lean-install:
+	$(call for_each_pkg_host,toolchain:install)
+
+lean-update:
+	$(call for_each_pkg_host,toolchain:update)
+
+# The tier that needs that toolchain: pi-lean4 driving a real `lake serve`. On
+# the host, not in the dev container — the dev image carries no Lean, and CI's
+# runner is a host too, so the two run the same thing. Fails, rather than
+# skips, on a host without the toolchain: run `make lean-install` first. Its
+# live case calls a model and costs money, like test-tui's.
+test-lean: $(ENV_FILE)
+	$(call for_each_pkg_host_env,test:lean)
+
 # One-shot and disposable, so a laptop and CI run the same thing. Includes the
 # live suite, which calls a model API and costs money.
 test-container: image $(ENV_FILE)
@@ -161,7 +197,7 @@ test-image: image $(ENV_FILE)
 	$(ENGINE) run --rm $(RUN_FLAGS) -w /workspace $(DEV_IMAGE) \
 	  bash -lc 'IMAGE=$(TEST_IMAGE) shared/test/container/run-image-tests.sh'
 
-check: test-image test typecheck pack test-tui test-container
+check: test-image test typecheck pack test-tui test-lean test-container
 
 # The inner image cache and the dev container. Leaves $(CONFIG_VOL) alone — that
 # is the pi login — and $(NB_VENV_VOL), which is minutes of pip per notebook.
@@ -170,4 +206,5 @@ check: test-image test typecheck pack test-tui test-container
 clean: dev-stop
 	- $(ENGINE) volume rm $(STORAGE_VOL)
 
-.PHONY: image dev shell dev-stop test typecheck test-tui test-container test-image check pack clean
+.PHONY: image dev shell dev-stop test typecheck test-tui test-container test-image check pack clean \
+        lean-install lean-update test-lean

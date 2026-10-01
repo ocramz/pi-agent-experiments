@@ -10,14 +10,21 @@ in it). `.env` contains **SECRETS**, do not open it or print it. `.env` with `OP
 
 
 ```bash
-make check          # test-image, test, typecheck, pack, test-tui, test-container — in that order
+make check          # test-image, test, typecheck, pack, test-tui, test-lean, test-container — in that order
 make test           # host unit suites (node --test)
 make typecheck      # tsc against pi's real declarations
 make test-tui       # interactive suites: pi's real TUI, driven in a pty
 make test-container # container suites, including the live model-driven tier
 make test-image     # the pinned image's git capability probe — once for the repo, not per package
 make pack           # what each package would publish — host only, no container, no key
+make lean-install   # elan + pinned Lean toolchain + ripgrep into $HOME — host only, no sudo
+make lean-update    # converge onto the pins again and report newer upstream releases (never re-pins)
+make test-lean      # pi-lean4's real-Lean tier — host only (loads .env for its one live case)
 ```
+
+`make check` also runs `test-lean`. Unlike the other tiers it runs on the **host**, not in the dev
+container: the dev image carries no Lean, and CI's runner is a host too. Without the toolchain it
+fails (run `make lean-install` first) rather than skipping.
 
 Narrow any target except `test-image` to one package with `PKG=`:
 
@@ -54,7 +61,7 @@ no second pin; set them to review with something genuinely different.
 ## Repo-wide invariants
 
 - **Everything version-pinned lives in [shared/versions.env](shared/versions.env)** — the test image
-  digest, the live model, the pi release. Three consumers read it (Makefile via `include`, shell/npm
+  digest, the live model, the pi release, pi-lean4's Lean toolchain/elan/ripgrep. Three consumers read it (Makefile via `include`, shell/npm
   via `shared/versions.sh` or `shared/with-versions.sh`, CI via `$DEFAULT_PI_VERSION`). Names are
   `DEFAULT_`-prefixed and each maps to its real name only when unset, which is what keeps
   `make check PI_MODEL=...` and CI `env:` overrides working. Never duplicate a pin elsewhere.

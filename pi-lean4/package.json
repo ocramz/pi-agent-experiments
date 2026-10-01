@@ -1,0 +1,77 @@
+{
+	"name": "@ocramz/pi-lean4",
+	"version": "0.1.2",
+	"description": "Lean 4 theorem proving for the pi agent: one managed Lean language server per session, goal/diagnostic/search/verification tools, proof-workflow skills, an autoprove loop and git guardrails.",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"lean",
+		"lean4",
+		"mathlib",
+		"theorem-proving",
+		"lsp"
+	],
+	"license": "MIT",
+	"type": "module",
+	"scripts": {
+		"test": "node --test 'test/*.test.ts'",
+		"test:lean": "../shared/with-versions.sh node --test --test-concurrency=1 'test/lean/*.test.ts'",
+		"typecheck": "npm --prefix ../shared/typecheck install --no-audit --no-fund --silent && npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && node ../shared/typecheck/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+		"test:tui": "npm --prefix ../shared/test/tui install --no-audit --no-fund --silent && ../shared/with-versions.sh node --test 'test/tui/*.test.ts'",
+		"test:container": "test/container/run.sh",
+		"toolchain:install": "../shared/with-versions.sh scripts/toolchain.sh install",
+		"toolchain:update": "../shared/with-versions.sh scripts/toolchain.sh update",
+		"toolchain:check": "../shared/with-versions.sh scripts/toolchain.sh check",
+		"pack-check": "../shared/check-tarball.mjs"
+	},
+	"author": "Marco Zocca",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ocramz/pi-agent-experiments.git",
+		"directory": "pi-lean4"
+	},
+	"homepage": "https://github.com/ocramz/pi-agent-experiments/tree/main/pi-lean4#readme",
+	"bugs": {
+		"url": "https://github.com/ocramz/pi-agent-experiments/issues"
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"files": [
+		"extensions/**/*.ts",
+		"src/**/*.ts",
+		"skills/*/SKILL.md",
+		"skills/lean4/references/*.md",
+		"prompts/lean-*.md",
+		"LICENSE",
+		"THIRD_PARTY_NOTICES.md",
+		"README.md",
+		"package.json"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		],
+		"skills": [
+			"./skills"
+		],
+		"prompts": [
+			"./prompts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-ai": { "optional": true },
+		"@earendil-works/pi-coding-agent": { "optional": true },
+		"@earendil-works/pi-tui": { "optional": true },
+		"typebox": { "optional": true }
+	}
+}
