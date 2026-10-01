@@ -39,3 +39,9 @@ export PY_TEST_IMAGE="${PY_TEST_IMAGE:-$DEFAULT_PY_TEST_IMAGE}"
 # The ruff the lint job runs. Nothing in the container tiers reads this — it is
 # for the one CI job and for a human who wants to lint with exactly what CI does.
 export RUFF_VERSION="${RUFF_VERSION:-$DEFAULT_RUFF_VERSION}"
+
+# pi-lean4's host toolchain: what `make lean-install` installs, what its Lean
+# tier's fixtures name in `lean-toolchain`, and what the CI cache is keyed on.
+export LEAN_TOOLCHAIN="${LEAN_TOOLCHAIN:-$DEFAULT_LEAN_TOOLCHAIN}"
+export ELAN_VERSION="${ELAN_VERSION:-$DEFAULT_ELAN_VERSION}"
+export RIPGREP_VERSION="${RIPGREP_VERSION:-$DEFAULT_RIPGREP_VERSION}"

@@ -1,0 +1,20 @@
+- lean_diagnostics: errors, warnings and sorries Lean reports for a .lean file, or for one declaration or line range of it.
+- lean_goal: the proof goals at a line (before and after it) or at an exact position in a .lean file.
+- lean_nav: hover info, completions, definitions, references, code actions (e.g. exact?/simp? suggestions) and an outline of a .lean file.
+- lean_attempt: try several tactics at a proof position, or check a standalone Lean snippet, on a scratch copy — the file is not modified.
+- lean_search: find lemmas and definitions: by name locally (project, packages, Lean core), in natural language, by type pattern, or for the goal at a position.
+- lean_verify: which axioms a theorem depends on (sorryAx = unfinished), and every sorry in a file or project.
+- lean_build: run lake build for the project (skipped when nothing changed since the last successful build).
+- lean_analyze: profile a slow proof line by line, find hypotheses a theorem does not need, or list proof-shortening candidates.
+- Results of edit and write on a .lean file may end with a [lean auto-check] summary of errors and sorries after the edit; when there is none, or you need every message, use lean_diagnostics.
+- A lean_diagnostics result that says Lean is still elaborating is a partial answer, not a failure: call it again to keep waiting instead of editing blindly.
+- Use lean_goal before writing each proof step and after any step whose effect you are unsure of; never guess the goal state.
+- lean_nav {op: "code_actions", path, line} lists the edits Lean suggests on a line (e.g. from exact?, apply?, simp?) without applying them; apply the one you choose with edit.
+- Before editing a proof step, try 2-4 candidates at once with lean_attempt {op: "tactics", path, line, snippets}; write only a candidate that closes the goal or clearly makes progress.
+- Use lean_attempt {op: "code"} for throwaway experiments (#check, #eval, a test lemma) instead of creating scratch files in the project.
+- Search before you prove, and check a lemma name exists with lean_search {source: "local", query} before using it: a guessed name costs a failed compile.
+- Choose the lean_search source by the question: local for names, leansearch or leanfinder for statements in words, loogle for type shapes, premises for the goal you are stuck on.
+- lean_search remote sources are rate-limited public services: when one reports a rate limit, switch to another source or to local — never retry it in a loop.
+- Before reporting a proof as finished, run lean_verify {op: "axioms", path, name}: only propext, Classical.choice and Quot.sound are standard, and sorryAx means it is not finished.
+- Use lean_build only after changing imports or adding modules, when lean_diagnostics reports imports that failed to build, or before a final checkpoint; ordinary edits never need it.
+- lean_analyze {op: "golf"} only finds candidates: try each with lean_attempt and keep it only if it compiles; never change a theorem statement while golfing.

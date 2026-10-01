@@ -50,8 +50,8 @@ jobs:
       fail-fast: false
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
-        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4]
+        pkg: [pi-notebook-py, pi-lean4] # to save CI minutes
         # pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
@@ -115,8 +115,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
-        pkg: [pi-notebook-py] # to save CI minutes
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4]
+        pkg: [pi-notebook-py, pi-lean4] # to save CI minutes
         # pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
@@ -160,9 +160,9 @@ jobs:
     strategy:
       fail-fast: false
       # matrix:
-      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search]
+      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4]
       matrix:
-        pkg: [pi-notebook-py] # to save CI minutes
+        pkg: [pi-notebook-py, pi-lean4] # to save CI minutes
         # pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
@@ -192,3 +192,51 @@ jobs:
       # The git capability probe is not run here — the `image` job covers it once
       # for every package.
       - run: npm run test:container --if-present
+
+  # The tier that needs a Lean toolchain on the host: pi-lean4 driving a real
+  # `lake serve`. Same as `make test-lean` on a laptop — the runner is a host, so
+  # the toolchain goes where `make lean-install` puts it there too. Cached by the
+  # three pins together, so a re-pin is a cold install and nothing else is.
+  lean:
+    name: lean (host toolchain)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only packages with a `test:lean` script belong here.
+        pkg: [pi-lean4]
+    defaults:
+      run:
+        working-directory: ${{ matrix.pkg }}
+    env:
+      # One case drives a real model and test/lean/live.test.ts refuses to
+      # start without this, same rule as the tui job: a fork pull request fails
+      # here rather than going green over the only coverage the entry point has.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - id: pins
+        working-directory: .
+        run: |
+          SHARED_DIR=shared . shared/versions.sh
+          echo "key=$(printf '%s-%s-%s' "$LEAN_TOOLCHAIN" "$ELAN_VERSION" "$RIPGREP_VERSION" | tr ':/' '__')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            ~/.local/bin/rg
+          key: lean-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.key }}
+      - run: make lean-install PKG=${{ matrix.pkg }}
+        working-directory: .
+      - run: |
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # The Lean tier drives pi in print mode, so pi is under test here as in
+      # the tui job, and pinned for the same reason.
+      - name: install the pinned pi
+        working-directory: .
+        run: SHARED_DIR=shared . shared/versions.sh && npm i -g @earendil-works/pi-coding-agent@"$PI_VERSION"
+      - run: npm run test:lean --if-present

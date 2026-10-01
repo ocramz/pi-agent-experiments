@@ -9,6 +9,7 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 | [pi-incremental-py/](pi-incremental-py/) | An incremental computing kernel for Python, plus the pi extension that drives it |
 | [pi-notebook-py/](pi-notebook-py/) | A Jupyter-like Python kernel : an ordered list of cells over one namespace, with staleness hints, and image output for multimodal agents |
 | [pi-web-search/](pi-web-search/) | Web search as agent tools, one per backend, normalised into a shared result shape (first backend: Tavily) |
+| [pi-lean4/](pi-lean4/) | Lean 4 theorem proving: one managed Lean language server per session, goal/diagnostic/search/verification tools, proof-workflow skills, an autoprove loop and git guardrails |
 | [shared/](shared/) | Version pins, the tsconfig base, and the shell + pty test harnesses |
 
 # Development
@@ -48,6 +49,9 @@ make typecheck            # types only, against pi's real declarations
 make test-tui             # interactive suites (pi's real TUI, in a pty)
 make test-container       # container suites
 make pack                 # what each package would publish (host only, no key)
+make test-lean            # pi-lean4 against a real Lean server (host only; needs the toolchain)
+make lean-install         # elan + the pinned Lean toolchain + ripgrep, into $HOME (host)
+make lean-update          # converge onto the pins again; report newer upstream releases
 ```
 
 Every target except `test-image` runs over all of `PKGS`. Narrow any of them to one
@@ -144,7 +148,7 @@ Two things to know:
 
 | | |
 |---|---|
-| [shared/versions.env](shared/versions.env) | The image digest, the live model, the pi release. Pinned **once**; the Makefile includes it, the shell scripts load it through `versions.sh`, CI reads `PI_VERSION` from it |
+| [shared/versions.env](shared/versions.env) | The image digest, the live model, the pi release, the Lean toolchain. Pinned **once**; the Makefile includes it, the shell scripts load it through `versions.sh`, CI reads `PI_VERSION` from it |
 | [shared/tsconfig.base.json](shared/tsconfig.base.json) | Compiler settings and the `paths` that map `@earendil-works/*` onto real declaration files |
 | [shared/typecheck/](shared/typecheck/) | The 260 MB dependency scope those paths point into. One install for the repo |
 | [shared/test/assert.sh](shared/test/assert.sh) | `ok` / `fail` / `assert_*` / `summary` for every shell suite |
