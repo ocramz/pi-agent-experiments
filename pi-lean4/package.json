@@ -1,6 +1,6 @@
 {
 	"name": "@ocramz/pi-lean4",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Lean 4 theorem proving for the pi agent: one managed Lean language server per session, goal/diagnostic/search/verification tools, proof-workflow skills, an autoprove loop and git guardrails.",
 	"keywords": [
 		"pi-package",
