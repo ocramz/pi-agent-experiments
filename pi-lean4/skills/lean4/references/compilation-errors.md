@@ -101,7 +101,7 @@ lemma my_lemma : Statement := by
 
 **⚡ CRITICAL for sub-σ-algebras:** If working with multiple `MeasurableSpace` instances, **read [instance-pollution.md](instance-pollution.md) FIRST** to avoid subtle bugs and timeout errors!
 
-**For deep patterns with sub-σ-algebras, conditional expectation, and measure theory type class issues, see:** [measure-theory.md](https://github.com/cameronfreer/lean4-skills/blob/b6243b85b9b0a0ddff5bb6773889044daf687f8e/plugins/lean4/skills/lean4/references/measure-theory.md)
+**For deep patterns with sub-σ-algebras, conditional expectation, and measure theory type class issues, see:** [measure-theory.md](measure-theory.md)
 
 **Debug with:**
 ```lean

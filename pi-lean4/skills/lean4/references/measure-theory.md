@@ -9,7 +9,7 @@ Deep patterns and pitfalls for measure theory and probability in Lean 4.
 - Choosing between scalar `μ[·|m]` and kernel `condExpKernel` forms
 - Understanding Kernel vs Measure API distinctions
 - Using Measure.map for pushforward operations
-- Discovering measure theory lemmas with lean_leanfinder
+- Discovering measure theory lemmas with `lean_search {source: "leanfinder"}`
 
 ---
 
@@ -659,7 +659,7 @@ isProbabilityMeasure_map : IsProbabilityMeasure μ → AEMeasurable f μ →
 -- Pointwise measure construction (not itself a proof of kernel measurability)
 fun ω ↦ (μ_ω ω).map f
 
--- Search with lean_leanfinder:
+-- Search with lean_search {source: "leanfinder"}:
 -- "Measure.map pushforward measurable function"
 -- "isProbabilityMeasure preserved by Measure.map"
 ```
@@ -700,12 +700,12 @@ The Markov instance supplies the probability-measure property at each point.
 **Search strategy when stuck:**
 1. Look for `condDistrib` lemmas (underlying construction)
 2. Search for `IsMarkovKernel` or `IsCondKernel` instances
-3. Use `lean_leanfinder` with "conditional kernel probability measure"
+3. Use `lean_search {source: "leanfinder", query: "conditional kernel probability measure"}`
 
 **Example searches:**
-```python
-lean_leanfinder(query="condExpKernel IsProbabilityMeasure")
-lean_leanfinder(query="Markov kernel conditional expectation")
+```
+lean_search {source: "leanfinder", query: "condExpKernel IsProbabilityMeasure"}
+lean_search {source: "leanfinder", query: "Markov kernel conditional expectation"}
 ```
 
 ### 5. Indicator Function Integration
@@ -754,7 +754,7 @@ have := measurableSet_preimage hf hs
 **Pattern:** When you see "unknown field" errors:
 1. Try standalone function: `lemma_name hf hs` instead of `hf.lemma_name hs`
 2. Use `#check @lemma_name` to see the signature
-3. Search with `lean_leanfinder` to find the right form
+3. Search with `lean_search {source: "leanfinder"}` to find the right form
 
 ### 7. Type Class Synthesis Fragility
 
@@ -790,26 +790,26 @@ have : IsProbabilityMeasure (μ.map f) := Measure.isProbabilityMeasure_map hf
 (μ.map f : Measure β)   -- a measure is a value, never `: Type`
 ```
 
-### 8. API Discovery with lean_leanfinder
+### 8. API Discovery with Lean Finder (`lean_search {source: "leanfinder"}`)
 
 **What works well:**
 
 **Natural language + Lean identifiers:**
-```python
-lean_leanfinder(query="Measure.map pushforward measurable function")
-lean_leanfinder(query="IsProbabilityMeasure preserved map")
+```
+lean_search {source: "leanfinder", query: "Measure.map pushforward measurable function"}
+lean_search {source: "leanfinder", query: "IsProbabilityMeasure preserved map"}
 ```
 
 **Mathematical concepts:**
-```python
-lean_leanfinder(query="kernel composition measurability")
-lean_leanfinder(query="conditional expectation integral representation")
+```
+lean_search {source: "leanfinder", query: "kernel composition measurability"}
+lean_search {source: "leanfinder", query: "conditional expectation integral representation"}
 ```
 
 **When stuck on names:**
-```python
+```
 # Instead of grepping, use semantic search
-lean_leanfinder(query="preimage measurable set is measurable")
+lean_search {source: "leanfinder", query: "preimage measurable set is measurable"}
 # Finds: measurableSet_preimage
 ```
 

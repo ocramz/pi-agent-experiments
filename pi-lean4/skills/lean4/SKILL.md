@@ -169,10 +169,13 @@ Read when relevant (large files: search headings with `rg "^## " <file>` first).
   [axiom-elimination](references/axiom-elimination.md)
 - **Tactics:** [tactics-reference](references/tactics-reference.md),
   [tactic-patterns](references/tactic-patterns.md), [grind-tactic](references/grind-tactic.md),
-  [simp-reference](references/simp-reference.md)
+  [simp-reference](references/simp-reference.md), [calc-patterns](references/calc-patterns.md)
+  (`calc` chains)
 - **Proof development:** [proof-templates](references/proof-templates.md),
   [proof-simplification](references/proof-simplification.md),
   [proof-golfing](references/proof-golfing.md),
   [proof-golfing-patterns](references/proof-golfing-patterns.md)
 - **Style and review:** [mathlib-style](references/mathlib-style.md),
   [mathlib-review-taxonomy](references/mathlib-review-taxonomy.md)
+- **Domain:** [measure-theory](references/measure-theory.md) (measures, kernels, conditional
+  expectation, sub-σ-algebras — and their type-class pitfalls)

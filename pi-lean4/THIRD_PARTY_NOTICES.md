@@ -27,7 +27,7 @@ The table below is the record of origin for every skill and reference file. Kind
 | skills/lean4/references/mathlib-guide.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/mathlib-guide.md |
 | skills/lean4/references/mathlib-review-taxonomy.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/mathlib-review-taxonomy.md |
 | skills/lean4/references/mathlib-style.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/mathlib-style.md |
-| skills/lean4/references/measure-theory.md | verbatim | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/measure-theory.md |
+| skills/lean4/references/measure-theory.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/measure-theory.md |
 | skills/lean4/references/proof-golfing-patterns.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/proof-golfing-patterns.md |
 | skills/lean4/references/proof-golfing.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/proof-golfing.md |
 | skills/lean4/references/proof-simplification.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/proof-simplification.md |

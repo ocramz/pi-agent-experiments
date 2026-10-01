@@ -85,6 +85,7 @@ test("S1: five concurrent first calls start one server", async (t) => {
 	const results = await Promise.all(
 		Array.from({ length: 5 }, () => f.rt.use(f.root, (s) => s.withDocument(file, async (d) => d.version))),
 	);
+	await flush(f); // no request follows the didOpen here, so make sure the fake has logged it
 	assert.equal(f.sent("initialize").length, 1);
 	assert.equal(f.sent("textDocument/didOpen").length, 1);
 	assert.deepEqual(

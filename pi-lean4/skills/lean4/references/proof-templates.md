@@ -165,5 +165,5 @@ theorem iff_example : P ↔ Q := by
 ## See Also
 
 - [tactic-patterns.md](tactic-patterns.md) - Tactics by goal type
-- [calc-patterns.md](https://github.com/cameronfreer/lean4-skills/blob/b6243b85b9b0a0ddff5bb6773889044daf687f8e/plugins/lean4/skills/lean4/references/calc-patterns.md) - Calculation mode patterns
+- [calc-patterns.md](calc-patterns.md) - Calculation mode patterns
 - [lean-phrasebook.md](lean-phrasebook.md) - Common proof idioms
