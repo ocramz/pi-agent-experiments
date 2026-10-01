@@ -45,6 +45,8 @@ export const SUBCOMMANDS = ["status", "restart", "stop", "build", "autoprove", "
 
 /** The customType of autoprove's session entries and messages. */
 export const AUTOPROVE_TYPE = "lean-autoprove";
+/** The customType of the setup-check message the model is given. */
+export const SETUP_TYPE = "lean-setup";
 /** The flag that turns every network-reaching feature off. */
 export const OFFLINE_FLAG = "lean-offline";
 

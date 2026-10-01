@@ -66,8 +66,32 @@ reads is [skills/lean4/references/tools.md](skills/lean4/references/tools.md).
   tree, reopens the file, and fails a waiting call promptly instead of at its timeout. More than three
   server crashes a minute stops the restarts.
 
-`/lean status` shows where `lake` and `rg` were found, the project, the server and its open files,
-the build state, and the configuration. `/lean restart` / `/lean stop` replace or stop the server.
+`/lean status` shows where `lake` and `rg` were found, the setup check below, the project, the
+server and its open files, the build state, and the configuration. `/lean restart` / `/lean stop`
+replace or stop the server.
+
+## Setup check
+
+When a session starts inside a Lake project (or above one), pi-lean4 checks the machine — file
+lookups only, nothing spawned, no network — and reports each problem with what it breaks and the
+commands that fix it:
+
+| Finding | Severity |
+|---------|----------|
+| `lake` not found, or `PI_LEAN_LAKE` / `lean4.lake` points at nothing | error |
+| `lake` found in `~/.elan/bin` but not on `PATH` (bash `lake …` commands will fail) | warning |
+| the project's pinned toolchain not installed (downloaded on first use) — an error in offline mode | warning |
+| Lean older than 4.24; `lake` not managed by elan (pin not enforced) | warning |
+| dependencies unresolved or not downloaded; Mathlib's build files missing (would compile Mathlib from source) | warning (error offline) |
+| ripgrep not found (local search only) | warning |
+| `.lean` files but no Lake project | warning |
+| `.pi/settings.json` lean4 settings ignored in an untrusted project | info |
+
+The human sees the report on startup and `/reload` (a notification, or stderr in print mode) and a
+footer badge until it is fixed. The model is told before its first turn — what is broken, the fix, to
+ask before running a fix itself, and not to retry — and told again when the set of problems changes,
+including when they are resolved. A tool that fails for one of these reasons repeats the same fix in
+its error. Nothing needs a restart to pick up a fix, except adding a directory to `PATH` for bash.
 
 ## Auto-check
 
@@ -151,5 +175,5 @@ The tool behaviour, search backends and verification logic follow
 [lean-lsp-mcp](https://github.com/oOo0oOo/lean-lsp-mcp) (© 2025 Oliver Dressler); the skills,
 references, guardrail rules and autoprove budgets follow
 [lean4-skills](https://github.com/cameronfreer/lean4-skills) (© 2025 Lean 4 Theorem Proving Skill
-Contributors). Both MIT; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for what derives from
-what. If you use the search services in research, cite their authors.
+Contributors). Both MIT; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details and a map of what derives from
+what. If you use the Lean API search services in research, cite their respective authors.

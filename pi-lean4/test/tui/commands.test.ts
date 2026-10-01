@@ -40,7 +40,7 @@ test("TC3: a tool call outside any Lake project is an error that says how to mak
 	assert.match(textOf(result.content), /not inside a Lake project.*lake new/s);
 });
 
-test("TC4: inside a project but with no lake, the error names the install", async (t) => {
+test("TC4: inside a project with a lake setting that points nowhere, the error names the setting and the fix", async (t) => {
 	const s = await session(t, { lake: true, files: { "A.lean": "theorem a : True := trivial\n" }, faux: [{ tool: "lean_diagnostics", args: { path: "A.lean" } }, { text: DONE }] });
 	await s.command("go");
 	await s.expect(DONE, { timeout: 120_000 });
@@ -48,13 +48,16 @@ test("TC4: inside a project but with no lake, the error names the install", asyn
 	const turns = s.turns();
 	const result = turns[turns.length - 1].messages.find((m) => m.role === "toolResult")!;
 	assert.equal(result.isError, true);
-	assert.match(textOf(result.content), /cannot find lake.*elan/s);
+	// This tier sets PI_LEAN_LAKE=/nonexistent/lake; a plain missing lake (the
+	// elan-installer message) is covered by test/preflight.test.ts and the
+	// container tier, where nothing is configured.
+	assert.match(textOf(result.content), /lake is configured as \/nonexistent\/lake \(PI_LEAN_LAKE or the lean4\.lake setting\).*Point PI_LEAN_LAKE/s);
 });
 
 test("TC5: /lean autoprove without lake refuses, and no loop starts", async (t) => {
 	const s = await session(t, { lake: true, files: { "A.lean": "theorem a : True := sorry\n" } });
 	await s.command("/lean autoprove A.lean");
-	await s.expect("cannot find lake");
+	await s.expect("lake is configured as /nonexistent/lake");
 	await s.command("/lean status");
 	await s.refute("autoprove: running");
 	await s.close();
@@ -81,9 +84,43 @@ test("TC7: a prompt template expands into the skill's instructions", async (t) =
 	await s.command("/lean-review A.lean --stuck");
 	await s.expect(DONE, { timeout: 120_000 });
 	await s.close();
-	const first = s.turns()[0].messages.find((m) => m.role === "user")!;
+	// The setup check's message is user-role too (lake is missing here): find the prompt itself.
+	const first = s.turns()[0].messages.find((m) => m.role === "user" && /Read the/.test(textOf(m.content)))!;
 	const text = textOf(first.content);
 	assert.match(text, /Read the `lean4-review` skill first/);
 	assert.match(text, /Target and options: A\.lean --stuck/);
 	assert.match(text, /Read-only: do not edit files/);
+});
+
+test("TC8: the model hears about setup problems on its first turn — once — with the fix", async (t) => {
+	const s = await session(t, { lake: true, faux: [{ text: DONE }] });
+	await s.command("first");
+	await s.expect(DONE, { timeout: 120_000 });
+	await s.command("second");
+	await new Promise((r) => setTimeout(r, 1500));
+	await s.close();
+	const turns = s.turns();
+	const told = (n: number) => turns[n].messages.filter((m) => /\[pi-lean4 setup check\]/.test(textOf(m.content)));
+	assert.equal(told(0).length, 1, "not told on the first turn");
+	assert.match(textOf(told(0)[0].content), /ERROR: lake is configured as \/nonexistent\/lake.*Fix: Point PI_LEAN_LAKE/s);
+	assert.match(textOf(told(0)[0].content), /only if the user agrees/);
+	assert.equal(told(turns.length - 1).length, 1, "the message stays in context; it is not repeated");
+});
+
+test("TC9: /lean status runs the setup check and lists each fix", async (t) => {
+	const s = await session(t, { lake: true, files: { "lake-manifest.json": JSON.stringify({ packages: [{ name: "mathlib" }] }) } });
+	await s.command("/lean status");
+	await s.expect("pi-lean4 setup:");
+	await s.expect("Fix: Point PI_LEAN_LAKE");
+	await s.expect("depends on packages that are not downloaded yet: mathlib");
+	await s.expect("lake exe cache get");
+	await s.close();
+});
+
+test("TC10: outside a Lean project, nobody hears about Lean", async (t) => {
+	const s = await session(t, { faux: [{ text: DONE }] });
+	await s.command("go");
+	await s.expect(DONE, { timeout: 120_000 });
+	await s.close();
+	assert.ok(!JSON.stringify(s.turns()).includes("pi-lean4 setup check"));
 });

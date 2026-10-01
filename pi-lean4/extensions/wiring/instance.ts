@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { type ResolvedConfig, resolveConfig } from "../../src/config.ts";
 import { LeanToolError } from "../../src/errors.ts";
+import { type PreflightReport, preflight, statusBadge } from "../../src/lean/preflight.ts";
 import { LeanRuntime } from "../../src/lean/runtime.ts";
 import { locate } from "../../src/lean/toolchain.ts";
 import type { OpContext } from "../../src/ops/common.ts";
@@ -36,6 +37,10 @@ export class Instance {
 	#shutdown: Promise<void> | null = null;
 	/** Extra status text from the autoprove loop, shown in the footer. */
 	autoproveStatus: string | null = null;
+	/** The last setup check (src/lean/preflight.ts). */
+	setup: PreflightReport | null = null;
+	/** Which findings the model has been told about (their fingerprint); "" = none. */
+	agentToldAbout = "";
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
@@ -90,14 +95,23 @@ export class Instance {
 		return this.#shutdown;
 	}
 
-	rgPath(): string | null {
-		let extra: string[] = [];
+	rgDirs(): string[] {
 		try {
-			extra = [join(getAgentDir(), "bin")];
+			return [join(getAgentDir(), "bin")];
 		} catch {
-			extra = [];
+			return [];
 		}
-		return locate("rg", { explicit: this.cfg.rg, extraDirs: extra }).path;
+	}
+
+	rgPath(): string | null {
+		return locate("rg", { explicit: this.cfg.rg, extraDirs: this.rgDirs() }).path;
+	}
+
+	/** Re-run the setup check (file lookups only: cheap enough for every turn). */
+	checkSetup(ctx: ExtensionContext): PreflightReport {
+		this.refreshConfig(ctx);
+		this.setup = preflight({ cwd: ctx.cwd, cfg: this.cfg, trusted: ctx.isProjectTrusted(), rgDirs: this.rgDirs() });
+		return this.setup;
 	}
 
 	opContext(ctx: ExtensionContext, signal: AbortSignal | undefined, onProgress?: (m: string) => void): OpContext {
@@ -112,6 +126,10 @@ export class Instance {
 		if (s?.server?.alive) {
 			const name = s.project?.name ?? s.server.root.split("/").pop();
 			parts.push(`lean ● ${name} · ${s.server.openFiles.length} open`);
+		}
+		else if (this.setup) {
+			const badge = statusBadge(this.setup);
+			if (badge) parts.push(badge);
 		}
 		if (this.autoproveStatus) parts.push(this.autoproveStatus);
 		if (this.cfg.offline && parts.length) parts.push("offline");

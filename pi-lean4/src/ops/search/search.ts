@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { LeanToolError } from "../../errors.ts";
 import { findProjectRoot, resolveToolPath } from "../../lean/project.ts";
 import type { LeanRuntime } from "../../lean/runtime.ts";
+import { asError, rgMissing } from "../../lean/preflight.ts";
 import { leanPrefix, locate } from "../../lean/toolchain.ts";
 import { type OpContext, type OpResult, withFile, withNotes } from "../common.ts";
 import { tacticGoalAt } from "../goals.ts";
@@ -128,12 +129,7 @@ export async function searchOp(rt: LeanRuntime, input: SearchInput, oc: OpContex
 			const anchor = input.path ? resolveToolPath(input.path, oc.cwd) : oc.cwd;
 			const root = findProjectRoot(anchor) ?? rt.boundRoot();
 			if (!root) throw new LeanToolError('local search needs a Lake project: run from inside one, or pass path');
-			if (!oc.rg) {
-				throw new LeanToolError(
-					"ripgrep (rg) is not installed, and local search needs it. Install it (https://github.com/BurntSushi/ripgrep#installation), " +
-						"or point PI_LEAN_RG at it.",
-				);
-			}
+			if (!oc.rg) throw new LeanToolError(asError(rgMissing(oc.cfg)));
 			const stdlib = await stdlibFor(root);
 			const breadth = query.includes(".") ? 32 : 8;
 			const maxCandidates = Math.min(Math.max(limit * breadth, limit), 2048);

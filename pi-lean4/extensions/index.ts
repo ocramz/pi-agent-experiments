@@ -7,6 +7,10 @@
  * appended to edits of .lean files, and git guardrails. The skills and prompt
  * templates ship beside this file through package.json's `pi` manifest.
  *
+ * At session_start a setup check (src/lean/preflight.ts — file lookups only)
+ * reports a missing lake, toolchain, ripgrep or Mathlib cache, with the fix, to
+ * the human and, on its first turn, to the model.
+ *
  * The server is started by the first tool call that needs it — never here,
  * never at session_start — and stopped at session_shutdown, whatever the
  * reason (quit, /new, /resume, /fork, /reload). If pi exits without that
@@ -17,7 +21,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { OFFLINE_FLAG } from "../src/tools.ts";
+import { fingerprintFindings, formatForAgent, formatForUser, worst } from "../src/lean/preflight.ts";
+import { OFFLINE_FLAG, SETUP_TYPE } from "../src/tools.ts";
 import { Autoprove } from "./wiring/autoprove.ts";
 import { registerCommand } from "./wiring/command.ts";
 import { registerHooks } from "./wiring/hooks.ts";
@@ -38,10 +43,33 @@ export default function (pi: ExtensionAPI) {
 	registerHooks(inst);
 	registerCommand(inst, autoprove);
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		inst.start(ctx);
 		autoprove.restoreFrom(ctx);
+		// The setup check: file lookups only, nothing spawned. Shown to the human
+		// on startup and /reload (a /new or /resume has already seen it); the
+		// model hears about it on its first turn (before_agent_start below).
+		const report = inst.checkSetup(ctx);
+		if (report.findings.length && (event.reason === "startup" || event.reason === "reload")) {
+			const text = formatForUser(report);
+			const level = worst(report.findings) === "error" ? "error" : worst(report.findings) === "warning" ? "warning" : "info";
+			if (ctx.hasUI) ctx.ui.notify(text, level);
+			else if (level !== "info") console.error(text);
+		}
 		inst.refreshStatus(ctx);
+	});
+
+	// Tell the model about setup problems before it reaches for a tool that
+	// cannot work — once, and again whenever the set of problems changes
+	// (including when the user has fixed them).
+	pi.on("before_agent_start", (_event, ctx) => {
+		if (!inst.active) return;
+		const report = inst.checkSetup(ctx);
+		inst.refreshStatus(ctx);
+		const key = fingerprintFindings(report);
+		if (key === inst.agentToldAbout) return;
+		inst.agentToldAbout = key;
+		return { message: { customType: SETUP_TYPE, content: formatForAgent(report), display: false, details: { findings: report.findings } } };
 	});
 
 	pi.on("agent_end", (event) => autoprove.onAgentEnd(event.messages));

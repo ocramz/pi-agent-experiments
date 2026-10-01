@@ -218,16 +218,19 @@ test("SK9: the ground-rules block is the same in all six skills", () => {
 	for (const b of blocks) assert.equal(b, blocks[0]);
 });
 
-test("SK10: every file carries its attribution, and the notices list them all", () => {
+test("SK10: the shipped notices carry both licences and list every skill and reference", () => {
 	const notices = readFileSync(join(PKG, "THIRD_PARTY_NOTICES.md"), "utf8");
 	assert.match(notices, /Copyright \(c\) 2025 Oliver Dressler/);
 	assert.match(notices, /Copyright \(c\) 2025 Lean 4 Theorem Proving Skill Contributors/);
 	assert.equal((notices.match(/Permission is hereby granted/g) ?? []).length, 2);
 	assert.ok(manifest.files.includes("THIRD_PARTY_NOTICES.md"));
 	for (const f of allMd) {
-		assert.match(readFileSync(f, "utf8"), /<!-- pi-lean4: (verbatim|adapted|condensed|derived) from /, rel(f));
 		assert.ok(notices.includes(`| ${rel(f)} |`), `${rel(f)} is missing from THIRD_PARTY_NOTICES.md`);
 	}
+	// Skills point at the notices from their frontmatter. Per-file comments are
+	// not required: the model reads these files verbatim, so the attribution
+	// lives once, in the shipped notices file, with its file map.
+	for (const f of skillFiles) assert.match(frontmatter(f).license ?? "", /THIRD_PARTY_NOTICES\.md/, rel(f));
 });
 
 test("SK11: templates: named lean-*, described, and $ only in placeholders", () => {

@@ -27,8 +27,13 @@ function executable(path: string): boolean {
 	}
 }
 
+/** The home directory, from the env given (so tests and callers can isolate it). */
+export function homeOf(env: NodeJS.ProcessEnv = process.env): string {
+	return env.HOME?.trim() || homedir();
+}
+
 export function elanHome(env: NodeJS.ProcessEnv = process.env): string {
-	return env.ELAN_HOME?.trim() || join(homedir(), ".elan");
+	return env.ELAN_HOME?.trim() || join(homeOf(env), ".elan");
 }
 
 export function locate(
@@ -48,18 +53,14 @@ export function locate(
 	}
 	const fallbacks =
 		name === "rg"
-			? [...(opts.extraDirs ?? []), join(homedir(), ".local", "bin")]
-			: [join(elanHome(env), "bin"), join(homedir(), ".elan", "bin")];
+			? [...(opts.extraDirs ?? []), join(homeOf(env), ".local", "bin")]
+			: [join(elanHome(env), "bin"), join(homeOf(env), ".elan", "bin")];
 	for (const dir of fallbacks) {
 		const p = join(dir, name);
 		if (executable(p)) return { path: p, source: dir };
 	}
 	return { path: null, source: "not found" };
 }
-
-export const INSTALL_HINT =
-	"Install Lean with elan (https://lean-lang.org/install/ — `curl https://elan.lean-lang.org/elan-init.sh -sSf | sh`), " +
-	"or point PI_LEAN_LAKE / the lean4.lake setting at a lake binary.";
 
 /** elan's directory name for a toolchain line: `leanprover/lean4:v4.34.1` → `leanprover--lean4---v4.34.1`. */
 export function toolchainDirName(toolchain: string): string {

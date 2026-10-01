@@ -20,7 +20,8 @@ import { LeanToolError } from "../errors.ts";
 import { findProjectRoot, resolveToolPath } from "../lean/project.ts";
 import { killGroup, spawnGroup } from "../lean/process.ts";
 import type { LeanRuntime } from "../lean/runtime.ts";
-import { INSTALL_HINT, locate } from "../lean/toolchain.ts";
+import { asError, lakeMissing } from "../lean/preflight.ts";
+import { locate } from "../lean/toolchain.ts";
 import type { OpContext, OpResult } from "./common.ts";
 
 const SKIP = new Set([".lake", ".git", "build", "node_modules", ".pi"]);
@@ -164,7 +165,7 @@ export async function buildOp(rt: LeanRuntime, input: BuildInput, oc: OpContext)
 		throw new LeanToolError("fetchCache downloads Mathlib's build cache, which offline mode forbids");
 	}
 	const lake = locate("lake", { explicit: oc.cfg.lake });
-	if (!lake.path) throw new LeanToolError(`cannot find lake (${lake.source}). ${INSTALL_HINT}`);
+	if (!lake.path) throw new LeanToolError(asError(lakeMissing(lake, oc.cfg)));
 	const before = fingerprints(root);
 	if (!input.clean && !input.fetchCache && !input.force && loadStamp(root) === before.all) {
 		return {

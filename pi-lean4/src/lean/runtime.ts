@@ -17,11 +17,13 @@
  *    `session_shutdown` calls it for every reason pi has.
  */
 
+import { DEFAULTS } from "../config.ts";
 import { AbortError, LeanToolError } from "../errors.ts";
 import { RwLock } from "../sync.ts";
 import { type ProjectInfo, projectInfo } from "./project.ts";
 import { LeanServer, type ServerOptions } from "./server.ts";
-import { INSTALL_HINT, capture, locate, toolchainInstalled } from "./toolchain.ts";
+import { asError, checkProject, lakeMissing, locateElan } from "./preflight.ts";
+import { capture, locate, toolchainInstalled } from "./toolchain.ts";
 
 export interface RuntimeConfig {
 	offline: boolean;
@@ -207,7 +209,7 @@ export class LeanRuntime {
 		let command = this.#opts.command?.(root);
 		if (!command) {
 			const lake = locate("lake", { explicit: cfg.lake, env });
-			if (!lake.path) throw new LeanToolError(`cannot find lake (${lake.source}). ${INSTALL_HINT}`);
+			if (!lake.path) throw new LeanToolError(asError(lakeMissing(lake, cfg, env)));
 			command = { cmd: lake.path, args: ["serve"] };
 			if (!this.#opts.skipPreflight) await this.#preflight(lake.path, project, cfg, env, o);
 		}
@@ -242,13 +244,14 @@ export class LeanRuntime {
 	 * start timeout; offline, it is refused — that download is a network call.
 	 */
 	async #preflight(lake: string, project: ProjectInfo, cfg: RuntimeConfig, env: NodeJS.ProcessEnv, o: UseOptions): Promise<void> {
+		// The same checks the session-start report runs; an error-level one
+		// (offline with something still to download) means the server must not
+		// start, and the error says how to fix it.
+		const blockers = checkProject(project.root, { ...DEFAULTS, ...cfg }, env, { path: lake, source: "runtime" }, locateElan(env)).filter(
+			(f) => f.severity === "error",
+		);
+		if (blockers.length) throw new LeanToolError(blockers.map(asError).join("\n"));
 		if (toolchainInstalled(project.toolchain, env)) return;
-		if (cfg.offline) {
-			throw new LeanToolError(
-				`${project.root} pins ${project.toolchain}, which elan has not installed, and offline mode forbids ` +
-					`downloading it. Install it first (elan toolchain install ${project.toolchain}) or turn offline mode off.`,
-			);
-		}
 		o.onProgress?.(`installing ${project.toolchain} with elan (first use of this toolchain)`);
 		const r = await capture(lake, ["--version"], {
 			cwd: project.root,

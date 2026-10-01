@@ -10,14 +10,14 @@ whose copyright and permission notices are reproduced below as their licences re
 
 ## What derives from what
 
-Every skill and reference file names its origin in an HTML comment at its top (after the
-frontmatter for SKILL.md). Kinds: **verbatim** (unchanged apart from that comment), **adapted**
+The table below is the record of origin for every skill and reference file. Kinds: **verbatim** (unchanged), **adapted**
 (tool names, links and sections rewritten for pi), **condensed** (shortened, same headings),
 **derived** (new text or code following the upstream design).
 
 | File | Kind | Upstream |
 |---|---|---|
 | skills/lean4/references/axiom-elimination.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/axiom-elimination.md |
+| skills/lean4/references/calc-patterns.md | verbatim | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/calc-patterns.md |
 | skills/lean4/references/compilation-errors.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/compilation-errors.md |
 | skills/lean4/references/compiler-guided-repair.md | condensed | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/compiler-guided-repair.md |
 | skills/lean4/references/cycle-engine.md | condensed | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/cycle-engine.md |
@@ -27,6 +27,7 @@ frontmatter for SKILL.md). Kinds: **verbatim** (unchanged apart from that commen
 | skills/lean4/references/mathlib-guide.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/mathlib-guide.md |
 | skills/lean4/references/mathlib-review-taxonomy.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/mathlib-review-taxonomy.md |
 | skills/lean4/references/mathlib-style.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/mathlib-style.md |
+| skills/lean4/references/measure-theory.md | verbatim | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/measure-theory.md |
 | skills/lean4/references/proof-golfing-patterns.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/proof-golfing-patterns.md |
 | skills/lean4/references/proof-golfing.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/proof-golfing.md |
 | skills/lean4/references/proof-simplification.md | adapted | cameronfreer/lean4-skills@b6243b85 plugins/lean4/skills/lean4/references/proof-simplification.md |

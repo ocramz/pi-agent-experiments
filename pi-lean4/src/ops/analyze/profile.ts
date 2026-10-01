@@ -14,7 +14,8 @@ import { join } from "node:path";
 import { LeanToolError } from "../../errors.ts";
 import { requireLeanFile, resolveToolPath, displayPath } from "../../lean/project.ts";
 import type { LeanRuntime } from "../../lean/runtime.ts";
-import { INSTALL_HINT, locate } from "../../lean/toolchain.ts";
+import { asError, lakeMissing } from "../../lean/preflight.ts";
+import { locate } from "../../lean/toolchain.ts";
 import { runGroup } from "../build.ts";
 import type { OpContext, OpResult } from "../common.ts";
 
@@ -121,7 +122,7 @@ export async function profileOp(
 ): Promise<OpResult> {
 	const { file, root } = requireLeanFile(resolveToolPath(input.path, oc.cwd));
 	const lake = locate("lake", { explicit: oc.cfg.lake });
-	if (!lake.path) throw new LeanToolError(`cannot find lake (${lake.source}). ${INSTALL_HINT}`);
+	if (!lake.path) throw new LeanToolError(asError(lakeMissing(lake, oc.cfg)));
 	const lines = readFileSync(file, "utf8").split("\n");
 	if (input.line < 1 || input.line > lines.length) throw new LeanToolError(`line ${input.line} is out of range (the file has ${lines.length} lines)`);
 	const { source, name, start, end } = extractTheorem(lines, input.line);

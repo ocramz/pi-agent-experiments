@@ -15,6 +15,7 @@
 import { join } from "node:path";
 import { type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { messageOf } from "../../src/errors.ts";
+import { formatForUser } from "../../src/lean/preflight.ts";
 import { findProjectRoot, projectInfo } from "../../src/lean/project.ts";
 import { liveGroups } from "../../src/lean/process.ts";
 import { locate, toolchainInstalled } from "../../src/lean/toolchain.ts";
@@ -24,7 +25,7 @@ import type { Autoprove } from "./autoprove.ts";
 import type { Instance } from "./instance.ts";
 
 const HELP = [
-	"/lean status — server, toolchain, configuration (starts nothing)",
+	"/lean status — server, toolchain, setup check with fixes, configuration (starts nothing)",
 	"/lean restart | /lean stop — replace or stop the Lean server",
 	"/lean build [--clean] [--fetch-cache] [--force] — lake build (skipped if nothing changed)",
 	"/lean autoprove <file> [--max-cycles=N] [--max-stuck=N] [--max-runtime=90m] — prove until done or out of budget",
@@ -33,7 +34,9 @@ const HELP = [
 	"/lean guardrails on|off — git guardrails for this session",
 ].join("\n");
 
-export function statusReport(inst: Instance, cwd: string, autoprove: Autoprove): string {
+export function statusReport(inst: Instance, ctx: ExtensionCommandContext, autoprove: Autoprove): string {
+	const cwd = ctx.cwd;
+	const setup = inst.checkSetup(ctx);
 	const cfg = inst.cfg;
 	const rt = inst.peek();
 	const s = rt?.status();
@@ -42,6 +45,7 @@ export function statusReport(inst: Instance, cwd: string, autoprove: Autoprove):
 	const rg = locate("rg", { explicit: cfg.rg, extraDirs: [join(getAgentDir(), "bin")] });
 	lines.push(`lake: ${lake.path ?? "NOT FOUND"} (${lake.source})`);
 	lines.push(`rg:   ${rg.path ?? "NOT FOUND — local search unavailable"} (${rg.source})`);
+	lines.push(formatForUser(setup));
 	const root = findProjectRoot(cwd);
 	if (root) {
 		const p = projectInfo(root);
@@ -95,7 +99,8 @@ export function registerCommand(inst: Instance, autoprove: Autoprove): void {
 			try {
 				switch (sub) {
 					case "status":
-						notify(statusReport(inst, ctx.cwd, autoprove));
+						notify(statusReport(inst, ctx, autoprove));
+						inst.refreshStatus(ctx);
 						return;
 					case "help":
 						notify(HELP);
