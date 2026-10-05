@@ -1,0 +1,6 @@
+{
+  "packages": [
+    "../pi-notebook-py",
+    "../pi-web-search"
+  ]
+}

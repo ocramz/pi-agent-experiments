@@ -10,6 +10,7 @@ extension, plus a `shared/` directory holding the build and test tooling they ha
 | [pi-notebook-py/](pi-notebook-py/) | A Jupyter-like Python kernel : an ordered list of cells over one namespace, with staleness hints, and image output for multimodal agents |
 | [pi-web-search/](pi-web-search/) | Web search as agent tools, one per backend, normalised into a shared result shape (first backend: Tavily) |
 | [pi-lean4/](pi-lean4/) | Lean 4 theorem proving: one managed Lean language server per session, goal/diagnostic/search/verification tools, proof-workflow skills, an autoprove loop and git guardrails |
+| [pi-logging-atif/](pi-logging-atif/) | Records sessions as ATIF trajectories (Harbor's Agent Trajectory Interchange Format): steps, tool calls, observations, tokens and cost |
 | [shared/](shared/) | Version pins, the tsconfig base, and the shell + pty test harnesses |
 
 # Development

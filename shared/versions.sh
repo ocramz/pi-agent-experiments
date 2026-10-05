@@ -45,3 +45,8 @@ export RUFF_VERSION="${RUFF_VERSION:-$DEFAULT_RUFF_VERSION}"
 export LEAN_TOOLCHAIN="${LEAN_TOOLCHAIN:-$DEFAULT_LEAN_TOOLCHAIN}"
 export ELAN_VERSION="${ELAN_VERSION:-$DEFAULT_ELAN_VERSION}"
 export RIPGREP_VERSION="${RIPGREP_VERSION:-$DEFAULT_RIPGREP_VERSION}"
+
+# pi-logging-atif's container tier: the Harbor release whose validator it runs,
+# and the pydantic it runs on (Harbor is installed --no-deps; see versions.env).
+export HARBOR_VERSION="${HARBOR_VERSION:-$DEFAULT_HARBOR_VERSION}"
+export PYDANTIC_VERSION="${PYDANTIC_VERSION:-$DEFAULT_PYDANTIC_VERSION}"

@@ -50,8 +50,8 @@ jobs:
       fail-fast: false
       # Adding an extension: one entry here, and one in PKGS in the Makefile.
       matrix:
-        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4]
-        pkg: [pi-notebook-py, pi-lean4] # to save CI minutes
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4, pi-logging-atif]
+        pkg: [pi-notebook-py, pi-lean4, pi-logging-atif] # to save CI minutes
         # pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
@@ -115,8 +115,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4]
-        pkg: [pi-notebook-py, pi-lean4] # to save CI minutes
+        # pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4, pi-logging-atif]
+        pkg: [pi-notebook-py, pi-lean4, pi-logging-atif] # to save CI minutes
         # pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
@@ -160,9 +160,9 @@ jobs:
     strategy:
       fail-fast: false
       # matrix:
-      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4]
+      #   pkg: [pi-issue-tracker, pi-incremental-py, pi-notebook-py, pi-web-search, pi-lean4, pi-logging-atif]
       matrix:
-        pkg: [pi-notebook-py, pi-lean4] # to save CI minutes
+        pkg: [pi-notebook-py, pi-lean4, pi-logging-atif] # to save CI minutes
         # pkg: [pi-issue-tracker] # to save CI minutes
     defaults:
       run:
@@ -180,10 +180,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: pull the pinned images
         working-directory: .
-        # PY_TEST_IMAGE is pi-incremental-py's second image (the pinned userland
-        # plus a Python). It is empty until first published, and its run.sh
-        # builds locally in that case, so a missing pin must not fail the job
-        # for the package that does not use it either.
+        # PY_TEST_IMAGE is the second image (the pinned userland plus a Python),
+        # used by pi-incremental-py and pi-logging-atif. It is empty until first
+        # published, and pi-incremental-py's run.sh builds locally in that case,
+        # so a missing pin must not fail the job for packages that do not use it.
         run: |
           SHARED_DIR=shared . shared/versions.sh
           podman pull "$IMAGE"
