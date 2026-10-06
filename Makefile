@@ -31,8 +31,8 @@ PI_REVIEW_MODEL    ?= $(DEFAULT_PI_REVIEW_MODEL)
 # Every extension in the repo. `make check` runs against all packages in this list;
 # PKG=... narrows any target to one. Adding an extension is a one-line edit here 
 # and one in .github/workflows/test.yml : see "Adding an extension" in the README.
-# PKGS        ?= pi-issue-tracker pi-incremental-py pi-notebook-py pi-web-search pi-lean4
-PKGS ?= pi-notebook-py pi-lean4 # to save CI minutes
+# PKGS        ?= pi-issue-tracker pi-incremental-py pi-notebook-py pi-web-search pi-lean4 pi-logging-atif
+PKGS ?= pi-notebook-py pi-lean4 pi-logging-atif # to save CI minutes
 # PKGS ?= pi-issue-tracker
 
 # What the test targets iterate over: PKG if it was given, otherwise all of them.
